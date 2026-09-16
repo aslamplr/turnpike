@@ -1,0 +1,70 @@
+# turnpike gateway configuration — see README.md
+# Client-facing model ids ([routes.<id>]) map to provider + upstream model.
+
+[server]
+listen = "127.0.0.1:8710"
+
+# OpenCode Zen — Anthropic-compatible upstream (https://opencode.ai/docs/zen).
+# Serves the Claude/Gemini/GPT catalog at /v1/messages.
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key_env = "OPENCODE_API_KEY"
+
+# OpenCode Go subscription — DeepSeek/GLM/Kimi/Qwen/MiniMax catalog. These
+# models speak the OpenAI spec at /go/v1/chat/completions, so the gateway
+# bridges Anthropic-spec clients automatically. turnpike appends /v1/..., so
+# base_url carries no /v1. A stable x-opencode-session header enables
+# routing/prompt-caching optimizations (Claude Code's native session header
+# is recognized by Go already; this covers other clients).
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+api_key_env = "OPENCODE_API_KEY"
+
+[providers.zen-go.extra_headers]
+"x-opencode-session" = "turnpike-stable-session"
+
+# Any OpenAI-compatible provider:
+# [providers.openrouter]
+# spec = "openai"
+# base_url = "https://openrouter.ai/api"
+# api_key_env = "OPENROUTER_API_KEY"
+
+[routes."claude-sonnet-5"]
+provider = "zen-go"
+model = "deepseek-v4-flash"
+display_name = "Sonnet 5 (via Zen)"
+family = "sonnet"
+max_tokens = 64000
+
+[routes."claude-opus-5"]
+provider = "zen-go"
+model = "deepseek-v4-flash"
+display_name = "Opus 5 (via Zen)"
+family = "opus"
+max_tokens = 64000
+
+[routes."claude-haiku-4-5"]
+provider = "zen-go"
+model = "deepseek-v4-flash"
+display_name = "Haiku 5 (via Zen)"
+family = "haiku"
+max_tokens = 64000
+
+# Agentic middleware: turnpike executes web_search server-side (Ollama-style
+# loop) instead of forwarding the tool to the client. Providers are swapped
+# via the `provider` field; implementations live in src/search/.
+#
+# SearxNG — self-hosted metasearch, no API key (see searxng/ for the Docker
+# setup). JSON output must be enabled in settings.yml.
+[search]
+provider = "searxng"
+base_url = "http://127.0.0.1:8080"
+max_loops = 5
+
+# Exa — hosted search API. Needs EXA_API_KEY (or inline api_key = "...").
+# [search]
+# provider = "exa"
+# api_key_env = "EXA_API_KEY"
+# max_loops = 5

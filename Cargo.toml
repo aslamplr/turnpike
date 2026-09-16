@@ -1,0 +1,29 @@
+[package]
+name = "turnpike"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal local gateway that proxies Claude/Anthropic and OpenAI-spec clients to any OpenAI- or Anthropic-compatible LLM provider, with model remapping and one-command launch integrations for Claude Code and Claude Desktop."
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["http1"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2", "charset", "gzip", "deflate", "brotli"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+home = "0.5"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+async-stream = "0.3"
+async-trait = "0.1"
+
+[profile.release]
+strip = true
+lto = true

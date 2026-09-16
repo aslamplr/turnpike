@@ -1,0 +1,4 @@
+/target
+build-verify.log
+config.toml
+.DS_Store

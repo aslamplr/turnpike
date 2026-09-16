@@ -1,0 +1,31 @@
+# Minimal SearXNG config for use as turnpike's local search provider.
+# This instance is private (loopback + single user): JSON API for turnpike,
+# HTML search UI for you. Engines can be tweaked under [engines] if needed.
+# Generate a secret_key with:  openssl rand -hex 32
+
+use_default_settings: true
+
+server:
+  secret_key: "CHANGE_ME_openssl_rand_hex_32"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
+
+# Turnpike reads format=json from this instance; keep engines that work without
+# JS. DuckDuckGo + Wikipedia + Brave (no key) cover most queries; enable more
+# if some engines get rate-limited.
+engines:
+  - name: duckduckgo
+    disabled: true   # DDG often rate-limits datacenter/VPN IPs; commonly replaced by Brave
+  - name: brave
+    disabled: false
+    base_url: https://search.brave.com/
+  - name: wikipedia
+    disabled: false
+  - name: wikidata
+    disabled: false
