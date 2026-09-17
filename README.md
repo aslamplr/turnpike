@@ -12,6 +12,32 @@ Full design documentation — architecture, configuration reference, the
 gateway, the spec bridge, search middleware, and the launchers — lives in
 [docs/](docs/).
 
+## Install
+
+macOS (Apple Silicon):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aslamplr/turnpike/main/install.sh | bash
+```
+
+Windows (x86_64), in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/aslamplr/turnpike/main/install.ps1 | iex
+```
+
+Each script downloads the newest release, verifies it against the release's
+`SHA256SUMS`, and puts `turnpike` on your PATH:
+
+| Artifact | Platform | Installs to |
+| --- | --- | --- |
+| `turnpike-aarch64-apple-darwin.tar.gz` | macOS arm64 | `~/.local/bin/turnpike` |
+| `turnpike-x86_64-pc-windows-msvc.zip` | Windows x86_64 | `%LOCALAPPDATA%\turnpike\bin\turnpike.exe` |
+
+Pin a version with `TURNPIKE_VERSION=v0.1.0`; skip the checksum with
+`TURNPIKE_SKIP_SHA256=1`. Other platforms build from source:
+`cargo build --release` → `target/release/turnpike`.
+
 ## What it does
 
 1. **Gateway with reverse proxy + model remap** — `turnpike serve` starts a
@@ -41,21 +67,19 @@ gateway, the spec bridge, search middleware, and the launchers — lives in
 ## Quick start
 
 ```shell
-cargo build --release
-
 # 1. Start the gateway (writes a starter config on first run)
-cargo run -- serve --init
+turnpike serve --init
 
 # 2. Set your provider key (OpenCode Zen by default)
 export OPENCODE_API_KEY=...
 
 # 3. Point Claude Code at the gateway and launch it
-cargo run -- launch claude-code --model claude-sonnet-5
+turnpike launch claude-code --model claude-sonnet-5
 
 # --model also accepts an upstream model id or provider/model — the launcher
 # resolves all three the same way the gateway does:
-cargo run -- launch claude-code --model deepseek-v4-flash   # Go subscription model
-cargo run -- launch claude-code --model zen-go/deepseek-v4-flash
+turnpike launch claude-code --model deepseek-v4-flash   # Go subscription model
+turnpike launch claude-code --model zen-go/deepseek-v4-flash
 
 # Omitting --model defaults to the sonnet-family route (fallback: first route).
 ```
@@ -68,9 +92,9 @@ or `$TURNPIKE_CONFIG`). For models Claude Code doesn't have in its catalog, add
 Or configure Claude Desktop to use the gateway (quit it first):
 
 ```shell
-cargo run -- launch claude-desktop
+turnpike launch claude-desktop
 # ...and undo it later:
-cargo run -- launch claude-desktop --restore
+turnpike launch claude-desktop --restore
 ```
 
 ## Configuration

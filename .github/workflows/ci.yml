@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # NOTE: no `cargo fmt --check` gate — the codebase is not rustfmt-clean
+      # today, so a fmt gate would fail on the first push. Run `cargo fmt`
+      # repo-wide in its own change if that's wanted.
+      - run: cargo test --locked
+      - run: cargo build --locked
