@@ -3,64 +3,153 @@ name: release
 # CD only runs on an explicit release cut: publishing a release (which carries
 # its version tag) fires this. A PR merge or a plain branch push produces no
 # binaries; a bare `git tag` push does not trigger it either.
+#
+# The two platforms are separate jobs on purpose. They run in parallel and each
+# uploads its own asset as soon as it is built, so one platform failing no
+# longer costs the other its release — on the v0.1.0 run the single-job version
+# died in `Cross-build Windows x64` and the already-built, already-packaged
+# macOS tarball was discarded with it. SHA256SUMS runs afterwards regardless
+# (`if: always()`), derived from whatever actually got attached.
 on:
   release:
     types: [published]
+  # Recovery hatch: publishing a release fires the `release` event exactly once,
+  # and "re-run jobs" on an old run replays that run's old workflow file. To
+  # (re)build the artifacts of an existing release, dispatch against its tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: existing release tag to build and upload artifacts for
+        required: true
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  macos:
+    name: macOS aarch64
     runs-on: ubuntu-latest
     env:
-      VERSION: ${{ github.event.release.tag_name }}
+      # A release event carries the tag; a manual dispatch is given one.
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
     steps:
+      # Build the tagged source, not the branch tip: a release event checks out
+      # the tag's commit anyway, but a dispatch would otherwise build whatever
+      # ref was picked in the UI, and the artifacts would not match the release.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
-      - name: Show release being built
-        run: echo "building turnpike $VERSION (tag ${{ github.event.release.tag_name }})"
+      - run: rustup target add aarch64-apple-darwin
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild,cargo-xwin
-      - run: rustup target add aarch64-apple-darwin x86_64-pc-windows-msvc
+          tool: cargo-zigbuild
 
-      # macOS aarch64 — cross-compiled with Zig as the linker. turnpike is a
-      # pure-Rust crate (rustls, no native-tls / security-framework), so no
-      # Darwin frameworks are linked and SDKROOT is not needed. If a future
-      # dependency does link frameworks, download the SDK and export SDKROOT
-      # (see rust-cross/cargo-zigbuild's CI):
+      # turnpike is NOT a pure-Rust crate: rustls pulls in ring, whose C and
+      # perlasm assembly are compiled through the CC path on every build (ring's
+      # build script runs under CC_aarch64_apple_darwin = zig cc, and the ios64
+      # objects land in libring_core_0_17_14_.a). No SDKROOT is needed because
+      # Zig bundles the macOS libc headers and a libSystem.tbd stub
+      # (lib/zig/libc/include/any-macos-any, lib/zig/libc/darwin/), and ring
+      # links no Darwin frameworks.
+      #
+      # Depending on the cargo-zigbuild version installed, one warning may show
+      # up here: it probes for an Apple SDK (`xcrun --sdk macosx --show-sdk-path`
+      # — no such command on a Linux runner) and reports that it cannot find
+      # MacOSX.sdk, noting that an SDK is what the linker would use to resolve
+      # system libraries. In the current cargo-zigbuild source that probe is
+      # gated to macOS hosts, so it can stop appearing on its own. Either way it
+      # is a note, not a failure: the link proceeds against Zig's bundled
+      # libSystem stub — the SDK-free path we want — and the artifact is a
+      # normal Mach-O arm64 binary. The v0.1.0 run built and packaged macOS with
+      # this exact warning, and an SDK-less build of the same source (verified
+      # locally, with `xcrun` made to fail) runs fine.
+      # If a future dependency does link Darwin frameworks, that changes: fetch
+      # the SDK and export SDKROOT instead (see rust-cross/cargo-zigbuild's CI).
       #   curl -sqL https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz | tar -Jx -C .
       #   export SDKROOT=$PWD/MacOSX11.3.sdk
       - name: Cross-build macOS aarch64
         run: cargo zigbuild --release --locked --target aarch64-apple-darwin
-      - name: Package macOS tar.gz
+      - name: Package tar.gz
         run: |
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/turnpike dist/turnpike
           tar -czf dist/turnpike-aarch64-apple-darwin.tar.gz -C dist turnpike
+      # `gh release upload` rather than action-gh-release: two jobs publish to
+      # one release concurrently, and this only ever touches this job's own
+      # asset (no release metadata read-modify-write to race on).
+      - name: Publish to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" dist/turnpike-aarch64-apple-darwin.tar.gz --clobber --repo "$GITHUB_REPOSITORY"
 
-      # Windows amd64 — cargo-xwin fetches the MSVC CRT/SDK itself.
+  windows:
+    name: Windows x86_64
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      # llvm-tools provides llvm-ar, which cargo-xwin shims to llvm-lib. xwin
+      # fetches the MSVC CRT/SDK itself but no LLVM: it drives clang-cl and
+      # resolves lld-link and llvm-lib by shimming the toolchain's rust-lld and
+      # llvm-ar. rust-lld ships with rustc; llvm-ar does not.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+      - run: rustup target add x86_64-pc-windows-msvc
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      # ring's x86_64 assembly needs neither nasm nor Perl here — a packaged
+      # (non-git) ring build links the pre-assembled win64 objects committed
+      # under pregenerated/ instead of running the assembler.
       - name: Cross-build Windows x64
         run: cargo xwin build --release --locked --target x86_64-pc-windows-msvc
-      - name: Package Windows zip
+      - name: Package zip
         shell: bash
         run: |
           mkdir -p dist
           cp target/x86_64-pc-windows-msvc/release/turnpike.exe dist/turnpike.exe
           (cd dist && zip -9 turnpike-x86_64-pc-windows-msvc.zip turnpike.exe)
+      - name: Publish to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" dist/turnpike-x86_64-pc-windows-msvc.zip --clobber --repo "$GITHUB_REPOSITORY"
 
-      - name: Generate SHA256SUMS
+  sums:
+    name: SHA256SUMS
+    needs: [macos, windows]
+    # Publish the manifest even when a platform failed: whatever did reach the
+    # release still has to be installable, since both installers verify against
+    # this file. A cancelled run publishes nothing.
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+    steps:
+      - name: Derive the manifest from the release and publish it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd dist
-          sha256sum turnpike-aarch64-apple-darwin.tar.gz \
-                    turnpike-x86_64-pc-windows-msvc.zip > SHA256SUMS
-
-      - name: Attach artifacts to the release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: dist/*
+          mkdir -p dist && cd dist
+          # Hash the assets actually attached to the release, never the local
+          # build tree, so the manifest cannot name a file that isn't there.
+          # A failing platform leaves no asset, so it leaves no line either.
+          gh release download "$TAG" --pattern 'turnpike-*' --clobber --repo "$GITHUB_REPOSITORY" || true
+          sha256sum turnpike-* > fresh.txt
+          # A manifest from an earlier partial upload may already exist: keep
+          # its lines for assets this run did not rebuild, letting the freshly
+          # computed line win for any asset in both.
+          gh release download "$TAG" --pattern SHA256SUMS -O previous.txt --clobber --repo "$GITHUB_REPOSITORY" || true
+          [ -f previous.txt ] || : > previous.txt
+          awk '{ lines[$2] = $0 } END { for (a in lines) print lines[a] }' \
+            previous.txt fresh.txt | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
