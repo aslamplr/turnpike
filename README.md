@@ -34,7 +34,7 @@ Each script downloads the newest release, verifies it against the release's
 | `turnpike-aarch64-apple-darwin.tar.gz` | macOS arm64 | `~/.local/bin/turnpike` |
 | `turnpike-x86_64-pc-windows-msvc.zip` | Windows x86_64 | `%LOCALAPPDATA%\turnpike\bin\turnpike.exe` |
 
-Pin a version with `TURNPIKE_VERSION=v0.1.0`; skip the checksum with
+Pin a version with `TURNPIKE_VERSION=v0.1.1`; skip the checksum with
 `TURNPIKE_SKIP_SHA256=1`. Other platforms build from source:
 `cargo build --release` → `target/release/turnpike`.
 
