@@ -23,7 +23,16 @@ home = "0.5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-stream = "0.3"
 async-trait = "0.1"
+ring = "0.17"
+zeroize = "1"
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 
 [profile.release]
 strip = true
 lto = true
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_Console"] }

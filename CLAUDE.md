@@ -18,8 +18,11 @@ The design documentation lives in `docs/` (see the module map entry for `src/pro
 ## Commands
 
 ```bash
-# Run the gateway (writes a default config on first run)
-turnpike serve --init
+# Configure: providers, routes, keys (keys can be stored encrypted)
+turnpike setup
+
+# Run the gateway (writes a default config on first run with --init)
+turnpike serve
 
 # Launch Claude Code pinned to a route id (all model tiers → that route)
 turnpike launch claude-code --model claude-sonnet-5
@@ -31,6 +34,9 @@ turnpike launch claude-desktop --restore
 # List configured routes
 turnpike routes
 
+# What is wrong, and how to fix it (--json for scripting, --live to probe providers)
+turnpike doctor
+
 # Build / test (end users install the prebuilt binary — see install.sh / install.ps1)
 cargo build --release
 cargo test        # inline #[cfg(test)] modules per file
@@ -38,7 +44,7 @@ cargo test        # inline #[cfg(test)] modules per file
 
 ## Module map
 
-- `src/main.rs` — CLI surface (`serve`, `launch`, `routes`); tracing setup (env-filter, default `info`).
+- `src/main.rs` — CLI surface (`serve`, `launch`, `routes`, `setup`, `doctor`); tracing setup (env-filter, `info` default, `warn` for `setup`/`doctor`; **logs go to stderr**).
 - `src/config.rs` — config load/validate; `Spec` (Anthropic/Openai), `Family` + `family_for_path()`, model `resolve()`; default config writer.
 - `src/proxy.rs` — the HTTP server. **The one place everything meets: `forward()`** builds the request pipeline; `bridge()` runs the agentic search middleware.
 - `src/translate/mod.rs` — Anthropic↔OpenAI request/response translation (edges only: system↔system, thinking↔reasoning_content, tool_use↔tool_calls, tool_result↔role:"tool", images↔image_url, `tool_choice` mapping).
@@ -46,6 +52,11 @@ cargo test        # inline #[cfg(test)] modules per file
 - `src/search/mod.rs` — `SearchProvider` trait + `ExaSearch` / `SearxSearch` implementations; `SearchManager::from_config` (exa needs an API key, searxng/searx keyless).
 - `src/launch/claude_code.rs` — finds/installs the `claude` binary, spawns it with env vars routing every model tier to one route id.
 - `src/launch/claude_desktop.rs` — writes a third-party inference-gateway profile (`00000000-0000-5000-9000-000000000128.json`) into Claude Desktop's configLibrary, with backup/restore and a running-app safety check.
+- `src/secrets/` — encrypted key store (`~/.turnpike/`): `Secret`/`StoreCtx`, the pure `resolve_chain` precedence function, `open`/`hydrate`; `file.rs` is the AES-256-GCM `FileStore` (one master key, one `secrets.toml`, one namespace per config path); `memory.rs` is the test fake.
+- `src/setup/edit.rs` — comment-preserving `toml_edit` mutations. The whole reason `toml_edit` is a dependency: the document is mutated **in place** and never round-tripped through `Config`/`toml::Value`, or every comment dies on first use.
+- `src/setup/mod.rs` — the wizard: menu, staged `Plan`, `commit()`.
+- `src/setup/prompt.rs` — **the only module that writes to stdout for input.** If you add a prompt anywhere else, you have broken the stdout/stderr split.
+- `src/doctor.rs` — the check list (`CHECK_IDS`) and its human + `--json` renderers. Read-only, non-fatal.
 
 ## Key design invariants
 
@@ -68,6 +79,17 @@ cargo test        # inline #[cfg(test)] modules per file
 - **Model resolution** (`Config::resolve()`): exact route id → route whose upstream model matches
   (ids containing `/` or `:` resolve here, before the provider split) → `provider/model` or
   `provider:model`.
+- **Key precedence is env > store > inline**, implemented once as the *pure* `secrets::resolve_chain`
+  (no env reads, no I/O — that is what makes it testable without mutating the environment). An
+  unreadable store never errors a lookup; it degrades to env/inline with a warning, because a
+  gateway that refuses to start over a secrets file is worse than one that starts without it.
+  `serve`/`launch`/`routes` degrade; `setup`/`doctor` fail hard.
+- **stdout is program output; stderr is diagnostics.** Prompts go through `setup::prompt` only,
+  everything else through `tracing`. A prompt sharing a descriptor with an `INFO` is how a wizard
+  becomes unusable under `RUST_LOG=debug`.
+- **`Fail` vs `Warn` in `doctor`**: `Fail` means the gateway cannot serve the config at all — the two
+  `config::validate` rules and nothing more. Everything else is a lint → `Warn`. Do not widen
+  `validate` to cover a lint; it breaks working configs.
 
 ## Documentation
 
@@ -78,10 +100,22 @@ So when behavior changes, update the relevant `docs/*.md` too.
 
 ## Config conventions
 
-- Location: `$TURNPIKE_CONFIG`, else `~/.config/turnpike/config.toml`, else `--config`.
+- Location: `--config`, else `$TURNPIKE_CONFIG`, else `~/.config/turnpike/config.toml`.
 - The `config.toml` at the repo root is **gitignored local state** — it maps active routes to
   upstream providers and references API-key env vars (`OPENCODE_API_KEY`, `EXA_API_KEY`); keys
-  themselves live in env vars, never in the repo. `config.example.toml` is the committed sample.
+  themselves never go in the repo. `config.example.toml` is the committed sample.
+- **Keys have three homes, in precedence order: env var → encrypted store → inline `api_key`.**
+  The store lives at `~/.turnpike/` (`$TURNPIKE_HOME` overrides it — that is the test hook, never
+  mutate `HOME` in tests): a 0600 `master.key` and a 0600 `secrets.toml` of AES-256-GCM records,
+  one namespace per canonicalized config path. `turnpike setup` writes them; `turnpike doctor`
+  audits them. Layout, crypto and the failure modes are in `docs/secrets.md`.
+- **Encryption at rest is not a privilege boundary** and must not be described as one. It protects
+  the *ciphertext* — `secrets.toml` is safe to back up, sync or paste — not the plaintext against
+  another process running as the same user, which can read `master.key` just as easily as it could
+  read a plaintext key file.
+- Secrets are resolved **once at startup** by `secrets::hydrate`, into `#[serde(skip)]` fields on
+  `ProviderCfg`/`SearchCfg`. `Config::resolve()` clones the provider config, so they ride along to
+  the proxy and `Gateway::new`/`SearchManager::from_config` need no knowledge of the store.
 - OpenCode notes: `zen` is Anthropic-spec (`opencode.ai/zen`); `zen-go` is OpenAI-spec
   (`opencode.ai/zen/go`) and needs the extra header `x-opencode-session`. Routing a client to
   `zen-go` means the request is bridged (chat-completions upstream, translated back).
@@ -90,6 +124,11 @@ So when behavior changes, update the relevant `docs/*.md` too.
 
 - Inline `#[cfg(test)] mod tests` per file — unit tests exercise translation, stream grammar,
   config resolution, and launcher env/profile shape.
+- **No env mutation in tests.** `TURNPIKE_HOME` points at `temp_root(tag)` instead of mutating
+  `HOME`; `resolve_chain` is pure for the same reason.
+- Mock injection **by construction**, not by global: `MemoryStore` for the secret store,
+  `ScriptedPrompt` for the wizard (which takes `&mut dyn Prompter`), `SearchManager::new` for the
+  search middleware.
 - Router-level tests use axum `tower::ServiceExt::oneshot` against a stub upstream bound to
   `127.0.0.1:0` under tokio. A mock `SearchProvider` is injected via `SearchManager::new` for
   the search middleware loop test.

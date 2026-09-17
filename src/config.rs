@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::secrets::{resolve_chain, KeyError, KeyOutcome, Secret, StoreStatus};
+
 /// Wire spec a provider speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -62,36 +64,56 @@ pub struct ProviderCfg {
     /// Base URL without the spec path, e.g. "https://opencode.ai/zen" or
     /// "https://openrouter.ai/api". Request paths are appended verbatim.
     pub base_url: String,
-    /// Inline API key (prefer api_key_env so keys stay out of the config).
+    /// Inline API key, in cleartext in the config file. Supported for
+    /// compatibility, but it is the **last** tier consulted: prefer
+    /// `api_key_env`, or `turnpike setup` to store one encrypted.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Name of the environment variable holding the API key.
     #[serde(default)]
     pub api_key_env: Option<String>,
     /// Extra static headers sent with every request to this provider, e.g.
-    /// `x-opencode-session` for OpenCode Go subscriptions.
+    /// `x-opencode_session` for OpenCode Go subscriptions.
     #[serde(default)]
     pub extra_headers: BTreeMap<String, String>,
+
+    /// The `[providers.<id>]` key. Set by `secrets::hydrate`, never parsed.
+    #[serde(skip)]
+    pub(crate) id: String,
+    /// Decrypted key from the store, held in memory only. Set by
+    /// `secrets::hydrate`; because `Config::resolve()` clones this struct, the
+    /// value rides along to the proxy without anything downstream changing.
+    #[serde(skip)]
+    pub(crate) resolved_key: Option<Secret>,
+    /// How opening the store went, so the precedence chain can explain itself
+    /// accurately instead of guessing.
+    #[serde(skip)]
+    pub(crate) store_status: StoreStatus,
 }
 
 impl ProviderCfg {
     pub fn api_key(&self) -> Result<String> {
-        if let Some(k) = self.api_key.as_deref() {
-            let k = k.trim();
-            if !k.is_empty() {
-                return Ok(k.to_string());
-            }
-        }
-        if let Some(var) = self.api_key_env.as_deref() {
-            if let Ok(v) = std::env::var(var) {
-                let v = v.trim();
-                if !v.is_empty() {
-                    return Ok(v.to_string());
-                }
-            }
-            anyhow::bail!("provider api key env var {var} is not set")
-        }
-        anyhow::bail!("provider has no api_key or api_key_env configured")
+        Ok(self.resolved_api_key_detailed()?.value)
+    }
+
+    /// Same lookup as [`ProviderCfg::api_key`], but reporting which tier
+    /// answered — what `doctor` renders, and what `setup` needs in order to
+    /// notice a shadowed inline key.
+    pub fn resolved_api_key_detailed(&self) -> std::result::Result<KeyOutcome, KeyError> {
+        let label = if self.id.is_empty() {
+            "provider".to_string()
+        } else {
+            format!("provider {:?}", self.id)
+        };
+        let env_value = self.api_key_env.as_deref().and_then(|v| std::env::var(v).ok());
+        resolve_chain(
+            &label,
+            self.api_key_env.as_deref(),
+            env_value.as_deref(),
+            self.resolved_key.as_ref().map(|s| s.expose()),
+            self.api_key.as_deref(),
+            &self.store_status,
+        )
     }
 
     /// Extra headers as (name, value) pairs in deterministic order.
@@ -131,8 +153,9 @@ pub struct SearchCfg {
     /// Which SearchProvider implementation to use: "exa" | "searxng".
     #[serde(default = "default_search_provider")]
     pub provider: String,
-    /// Inline API key (prefer api_key_env so keys stay out of the config).
-    /// Only used by providers that need one (exa); searxng is localhost-only.
+    /// Inline API key, in cleartext. Last tier consulted; prefer `api_key_env`
+    /// or `turnpike setup`. Only providers that need one (exa) use it —
+    /// searxng is localhost-only.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Name of the environment variable holding the API key (e.g. EXA_API_KEY).
@@ -145,6 +168,13 @@ pub struct SearchCfg {
     /// Maximum middleware loop iterations per request.
     #[serde(default = "default_search_loops")]
     pub max_loops: usize,
+
+    /// Decrypted key from the store. Set by `secrets::hydrate`.
+    #[serde(skip)]
+    pub(crate) resolved_key: Option<Secret>,
+    /// How opening the store went. Set by `secrets::hydrate`.
+    #[serde(skip)]
+    pub(crate) store_status: StoreStatus,
 }
 
 impl Default for SearchCfg {
@@ -155,6 +185,8 @@ impl Default for SearchCfg {
             api_key_env: None,
             base_url: None,
             max_loops: default_search_loops(),
+            resolved_key: None,
+            store_status: StoreStatus::default(),
         }
     }
 }
@@ -163,22 +195,25 @@ impl SearchCfg {
     /// Resolve the provider key; empty when no key is configured, which
     /// disables the middleware (server tools are then dropped from bridged
     /// requests, restoring the old behavior).
+    ///
+    /// Deliberately infallible: a missing search key degrades the middleware
+    /// rather than failing the request. [`SearchCfg::resolved_api_key_detailed`]
+    /// carries the error for `setup` and `doctor`, which must explain it.
     pub fn resolved_api_key(&self) -> Option<String> {
-        if let Some(k) = self.api_key.as_deref() {
-            let k = k.trim();
-            if !k.is_empty() {
-                return Some(k.to_string());
-            }
-        }
-        if let Some(var) = self.api_key_env.as_deref() {
-            if let Ok(v) = std::env::var(var) {
-                let v = v.trim();
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-        None
+        self.resolved_api_key_detailed().ok().map(|o| o.value)
+    }
+
+    pub fn resolved_api_key_detailed(&self) -> std::result::Result<KeyOutcome, KeyError> {
+        let label = format!("search provider {:?}", self.provider);
+        let env_value = self.api_key_env.as_deref().and_then(|v| std::env::var(v).ok());
+        resolve_chain(
+            &label,
+            self.api_key_env.as_deref(),
+            env_value.as_deref(),
+            self.resolved_key.as_ref().map(|s| s.expose()),
+            self.api_key.as_deref(),
+            &self.store_status,
+        )
     }
 }
 
@@ -360,7 +395,23 @@ pub fn load(path: &PathBuf) -> Result<Config> {
     Ok(cfg)
 }
 
-fn validate(cfg: &Config) -> Result<()> {
+/// Parse and validate a config from a string.
+///
+/// Used by the `setup` wizard so it validates exactly the document it is about
+/// to write, without touching disk first.
+pub fn load_from_str(raw: &str) -> Result<Config> {
+    let cfg: Config = toml::from_str(raw).context("parsing config")?;
+    validate(&cfg)?;
+    Ok(cfg)
+}
+
+/// The rules that make a config unusable, as opposed to merely unwise.
+///
+/// Deliberately just these two. Everything else `doctor` could object to
+/// (unknown family tiers, odd token counts, a `/v1` suffix on an anthropic
+/// base_url) is a lint, and raising it here would break configs that work
+/// today — a worse outcome than a warning.
+pub(crate) fn validate(cfg: &Config) -> Result<()> {
     if cfg.providers.is_empty() {
         anyhow::bail!("config defines no [providers.*]");
     }
@@ -448,6 +499,7 @@ pub fn write_default_config(path: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::{KeySource, MemoryStore, StoreCtx};
 
     fn test_config() -> Config {
         toml::from_str(
@@ -612,5 +664,163 @@ api_key = "k"
             vec![("x-opencode-session".to_string(), "turnpike-stable-session".to_string())]
         );
         assert!(cfg.providers["b"].extra_headers.is_empty());
+    }
+
+    #[test]
+    fn load_from_str_reports_missing_providers() {
+        // A document with no [providers.*] table at all fails to deserialize.
+        // `{:#}` renders the whole anyhow chain; plain Display would show only
+        // the "parsing config" context.
+        let err = load_from_str("[server]\nlisten = \"127.0.0.1:9000\"\n").unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("providers"), "{err}");
+
+        // An empty [providers] table parses but fails validation. This is the
+        // path the wizard depends on: it validates the rendered document before
+        // anything is written, so what is checked is what lands on disk.
+        let err = load_from_str("[providers]\n").unwrap_err().to_string();
+        assert!(err.contains("no [providers"), "{err}");
+
+        // Malformed TOML is an error, not a panic.
+        assert!(load_from_str("not toml [").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_route_with_unknown_provider() {
+        // `validate` had no test at all before the wizard existed; the wizard is
+        // what made it load-bearing.
+        let bad = r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes."claude-sonnet-5"]
+provider = "ghost"
+model = "claude-sonnet-4-5"
+"#;
+        let err = load_from_str(bad).unwrap_err().to_string();
+        assert!(err.contains("claude-sonnet-5"), "{err}");
+        assert!(err.contains("ghost"), "{err}");
+
+        // The same document with a provider that exists validates.
+        let good = bad.replace("ghost", "zen");
+        assert!(load_from_str(&good).is_ok());
+    }
+
+    #[test]
+    fn api_key_falls_back_to_inline_when_nothing_is_hydrated() {
+        // No `api_key_env` on purpose: the lookup then never reads the
+        // environment, which is what keeps this test independent of it.
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.a]
+spec = "anthropic"
+base_url = "https://x.example"
+api_key = "inline-key"
+"#,
+        )
+        .unwrap();
+        let p = &cfg.providers["a"];
+        assert!(p.resolved_key.is_none());
+        assert_eq!(p.api_key().unwrap(), "inline-key");
+        assert_eq!(p.resolved_api_key_detailed().unwrap().source, KeySource::Inline);
+    }
+
+    #[test]
+    fn api_key_prefers_store_over_inline() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+[providers.a]
+spec = "anthropic"
+base_url = "https://x.example"
+api_key = "inline-key"
+"#,
+        )
+        .unwrap();
+        cfg.providers.get_mut("a").unwrap().resolved_key = Some(Secret::new("stored-key"));
+
+        let p = &cfg.providers["a"];
+        assert_eq!(p.api_key().unwrap(), "stored-key");
+        assert_eq!(p.resolved_api_key_detailed().unwrap().source, KeySource::Store);
+    }
+
+    #[test]
+    fn api_key_error_names_the_provider() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key_env = "TURNPIKE_TEST_KEY_THAT_IS_NEVER_SET"
+"#,
+        )
+        .unwrap();
+        // `id` is set by hydration; without it the message would be generic.
+        cfg.providers.get_mut("zen").unwrap().id = "zen".into();
+
+        let err = cfg.providers["zen"].api_key().unwrap_err().to_string();
+        assert!(err.contains("zen"), "{err}");
+        assert!(err.contains("turnpike setup"), "{err}");
+    }
+
+    #[test]
+    fn hydrate_fills_ids_and_keys_from_the_store() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[providers.openrouter]
+spec = "openai"
+base_url = "https://openrouter.ai/api"
+api_key = "or-inline"
+"#,
+        )
+        .unwrap();
+
+        let store = MemoryStore::new("fake").with_secret("provider.zen", "sk-from-store");
+        let ctx = StoreCtx::with_store("ns", PathBuf::from("/tmp/turnpike-test"), Box::new(store));
+        crate::secrets::hydrate(&mut cfg, &ctx);
+
+        let zen = &cfg.providers["zen"];
+        assert_eq!(zen.id, "zen");
+        assert_eq!(zen.api_key().unwrap(), "sk-from-store");
+        assert_eq!(zen.resolved_api_key_detailed().unwrap().source, KeySource::Store);
+
+        // A provider with no stored record still hydrates: the id is set and
+        // the inline key remains the last resort.
+        let or = &cfg.providers["openrouter"];
+        assert_eq!(or.id, "openrouter");
+        assert!(or.resolved_key.is_none());
+        assert_eq!(or.api_key().unwrap(), "or-inline");
+        assert_eq!(or.resolved_api_key_detailed().unwrap().source, KeySource::Inline);
+    }
+
+    #[test]
+    fn hydrate_with_a_broken_store_degrades_to_inline() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+[providers.a]
+spec = "anthropic"
+base_url = "https://x.example"
+api_key = "inline-key"
+"#,
+        )
+        .unwrap();
+
+        let ctx = StoreCtx::broken(
+            StoreStatus::Unavailable("boom".into()),
+            PathBuf::from("/tmp/turnpike-test"),
+        );
+        crate::secrets::hydrate(&mut cfg, &ctx);
+
+        // Degrading must not fail the lookup — but the reason has to survive so
+        // the caller can warn about it.
+        let p = &cfg.providers["a"];
+        let out = p.resolved_api_key_detailed().unwrap();
+        assert_eq!(out.value, "inline-key");
+        assert_eq!(out.source, KeySource::Inline);
+        assert_eq!(out.store_status.reason(), Some("boom"));
     }
 }

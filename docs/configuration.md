@@ -1,23 +1,36 @@
 # Configuration
 
-turnpike is configured with a single TOML file. On first run, when no config
-exists at the configured path, `serve`/`launch` writes the starter config and
-exits, telling you to export your provider keys and re-run. Keys are resolved
-per request, not at startup: a request whose provider key can't be resolved
-(inline `api_key` or `api_key_env` missing) gets a 401 rather than forwarding a
-placeholder credential upstream.
+turnpike is configured with a single TOML file. `turnpike setup` walks through
+creating or editing it — providers, routes, and keys — and can store keys
+encrypted instead of leaving them in your shell environment (see
+[secrets.md](secrets.md)). If no config exists at the configured path,
+`serve`/`launch` writes the starter config and tells you what to do next; see
+[where the config lives](#where-the-config-lives) for the exact behavior, which
+differs by command.
 
 ## Where the config lives
 
 The config path is, in order:
 
-1. the value of the `TURNPIKE_CONFIG` env var, if set and non-empty,
-2. otherwise `~/.config/turnpike/config.toml`.
+1. `--config <path>`, if given,
+2. otherwise the value of the `TURNPIKE_CONFIG` env var, if set and non-empty,
+3. otherwise `~/.config/turnpike/config.toml`.
 
-`serve` and `launch` both honor it. If no config exists at that path, turnpike
-writes `default_config_text()` there (OpenCode Zen as the upstream, three
-Claude-spec route ids) and keeps going — so a brand-new machine gets a
-gateway that can start as soon as `OPENCODE_API_KEY` is exported.
+`serve`, `launch` and `routes` all honor it, as do `setup` and `doctor`.
+
+What happens when **no config exists at that path** depends on the command —
+this is a deliberate difference, not an inconsistency:
+
+| Command | Behavior with no config |
+| --- | --- |
+| `turnpike serve --init` | Writes `default_config_text()` and exits 0. The scripted/CI contract. |
+| `turnpike serve` | Writes the starter and exits 0, pointing you at `turnpike setup`. |
+| `turnpike launch`, `turnpike routes` | Writes the starter and **exits non-zero** — a starter nobody filled in is not a useful thing to succeed on. |
+| `turnpike setup`, `turnpike doctor` | Never write a starter to disk. They start from the starter text *in memory*. |
+
+`launch` and `routes` used to exit 0 here, which made a fresh machine look
+configured when it was not; that is the bug the non-zero exit fixes.
+
 
 ## The four top-level tables
 
@@ -40,13 +53,28 @@ gateway that can start as soon as `OPENCODE_API_KEY` is exported.
 | --- | --- | --- |
 | `spec` | — (required) | Wire spec the upstream speaks: `"anthropic"`, `"openai"`, or the alias `"openai-compatible"`. |
 | `base_url` | — (required) | Base URL **without** the spec path. turnpike appends `/v1/messages` for Anthropic-spec and `/v1/chat/completions` for OpenAI-spec providers. |
-| `api_key` | none | Inline API key. Prefer `api_key_env` so keys stay out of the config. |
+| `api_key` | none | Inline API key. **Least preferred** — it is plaintext in the file. `turnpike setup` offers to move it into the encrypted store. |
 | `api_key_env` | none | Env var holding the API key, e.g. `OPENCODE_API_KEY`. |
 | `extra_headers` | `{}` | Static headers sent with every request to this provider, e.g. `"x-opencode-session" = "turnpike-stable-session"` for OpenCode Go subscriptions. |
 
 A provider's `spec` must match the wire format its upstream actually speaks — a
 mismatch produces 400s either way, never silent corruption, because the bridge
 only knows the one direction (see [bridge.md](bridge.md)).
+
+Keys are resolved **per request**, not at startup, from three tiers in this
+order:
+
+1. **env** — the value of `api_key_env`, when set and non-empty,
+2. **store** — an encrypted key entered through `turnpike setup`
+   (`~/.turnpike/`; see [secrets.md](secrets.md)),
+3. **inline** — the literal `api_key` above.
+
+A request whose provider has no key at any tier gets a 401 rather than
+forwarding a placeholder credential upstream. Note that this order is
+**env > store > inline** — inline is the last resort, not the first. An empty
+string is not a value at any tier. `doctor`'s `precedence-shadow` check warns
+when an env var and a stored key both exist, since the stored one is then
+silently shadowed.
 
 ### `[routes.<id>]`
 
@@ -73,7 +101,7 @@ loop instead of forwarding the tool call to the client. See [search.md](search.m
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `provider` | `"exa"` | Which `SearchProvider` implementation: `"exa"` or `"searxng"` (alias `"searx"`). |
-| `api_key` | none | Inline key; only Exa needs one. |
+| `api_key` | none | Inline key; only Exa needs one. Same three-tier precedence as above, and same advice: prefer the store. |
 | `api_key_env` | none | Env var holding the key, e.g. `EXA_API_KEY`. |
 | `base_url` | `http://127.0.0.1:8080` | Base URL for providers without a cloud API (SearXNG). |
 | `max_loops` | `5` | Maximum middleware iterations per request. |
@@ -81,8 +109,8 @@ loop instead of forwarding the tool call to the client. See [search.md](search.m
 If `provider` is set but the key can't be resolved (Exa), the middleware is
 disabled with a warning — server tools are then **dropped** from bridged
 requests, restoring the pass-through behavior. Key resolution is identical to
-the provider rule: inline first, then env var; SearXNG needs neither and
-defaults to loopback.
+the provider rule: env > store > inline; SearXNG needs none of them and defaults
+to loopback.
 
 ## Model resolution
 
@@ -126,10 +154,34 @@ implemented; see [bridge.md](bridge.md)).
 
 ## Validation
 
-Loading a config fails fast on:
+`config::validate` has exactly **two** rules, and loading a config fails fast on
+either:
 
 - no `[providers.*]` at all,
 - a route referencing a provider that isn't defined.
+
+Nothing else refuses to start. Everything else that might be wrong — an unset
+env var, a wildcard `listen`, a `base_url` with a stray `/v1`, an inline key
+sitting in a world-readable file — is a lint, and lints live in `turnpike
+doctor` as `Warn`, never as a load failure. Widening `validate` would break
+configs that work today, which is strictly worse than a warning. See
+[setup-and-doctor.md](setup-and-doctor.md#where-the-failwarn-line-is-drawn).
+
+## Secrets in the config vs. in the store
+
+There are two places a key can live, and they are not equivalent:
+
+| | `api_key` in `config.toml` | The encrypted store (`~/.turnpike/`) |
+| --- | --- | --- |
+| On disk | Plaintext, in a file you might sync or commit | AES-256-GCM ciphertext under a 0600 master key |
+| Entered by | Hand-editing | `turnpike setup` → Keys |
+| Precedence | Last | Middle (above inline, below env) |
+| Safe to share the file | **No** | Yes — the ciphertext alone is inert |
+
+The docs recommend the store; the config keeps `api_key` support because
+existing configs use it and because it is genuinely the simplest thing for a
+throwaway setup. `doctor`'s `providers-key-inline` check lists every literal key
+it finds and points at `turnpike setup`, which offers to migrate them.
 
 ## The default config
 

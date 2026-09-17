@@ -9,8 +9,8 @@ OpenAI or Anthropic wire spec — initially OpenCode Zen — by proxying request
 byte-for-byte while rewriting only the `model` field.
 
 Full design documentation — architecture, configuration reference, the
-gateway, the spec bridge, search middleware, and the launchers — lives in
-[docs/](docs/).
+gateway, the spec bridge, search middleware, the secret store, and the
+launchers — lives in [docs/](docs/).
 
 ## Install
 
@@ -67,11 +67,12 @@ Pin a version with `TURNPIKE_VERSION=v0.1.1`; skip the checksum with
 ## Quick start
 
 ```shell
-# 1. Start the gateway (writes a starter config on first run)
-turnpike serve --init
+# 1. Configure: providers, routes, keys. Keys can be pasted into the wizard and
+#    are stored encrypted under ~/.turnpike/ — no per-shell exports needed.
+turnpike setup
 
-# 2. Set your provider key (OpenCode Zen by default)
-export OPENCODE_API_KEY=...
+# 2. Start the gateway
+turnpike serve
 
 # 3. Point Claude Code at the gateway and launch it
 turnpike launch claude-code --model claude-sonnet-5
@@ -84,10 +85,20 @@ turnpike launch claude-code --model zen-go/deepseek-v4-flash
 # Omitting --model defaults to the sonnet-family route (fallback: first route).
 ```
 
-The launcher reads the same config as the gateway (`~/.config/turnpike/config.toml`
-or `$TURNPIKE_CONFIG`). For models Claude Code doesn't have in its catalog, add
-`context_tokens = <real window>` to the route so the launcher can set
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS` and Claude Code stops assuming 200k.
+Already have a config and keys in your environment? `turnpike serve` starts the
+gateway directly. If no config exists, `launch`/`routes` now write the starter
+and **fail** instead of exiting 0 — a fresh machine should not look configured.
+
+Stuck? `turnpike doctor` reports what is wrong and how to fix it;
+`turnpike doctor --json` is machine-readable. See
+[docs/setup-and-doctor.md](docs/setup-and-doctor.md) and
+[docs/secrets.md](docs/secrets.md).
+
+The launcher reads the same config as the gateway (`--config`,
+`~/.config/turnpike/config.toml`, or `$TURNPIKE_CONFIG`). For models Claude Code
+doesn't have in its catalog, add `context_tokens = <real window>` to the route so
+the launcher can set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and Claude Code stops
+assuming 200k.
 
 Or configure Claude Desktop to use the gateway (quit it first):
 
@@ -223,9 +234,14 @@ src/proxy.rs                  axum server, remap + forwarding, bridge wiring
 src/translate/mod.rs          request/response translation (the bridge)
 src/translate/stream.rs       streaming SSE converter (OpenAI → Anthropic events)
 src/search/                   search providers (Exa, SearXNG) behind SearchProvider
+src/secrets/                  encrypted key store: AES-256-GCM, precedence chain
+src/setup/edit.rs             comment-preserving toml_edit mutations
+src/setup/mod.rs              the wizard: menu, staged Plan, commit()
+src/setup/prompt.rs           the only stdout prompt module (+ Prompter trait)
+src/doctor.rs                 the check list and its human/--json renderers
 src/launch/claude_code.rs     env-var launcher + claude installer
 src/launch/claude_desktop.rs  configLibrary gateway profile writer (backup/restore)
-src/main.rs                   CLI: serve / launch / routes
+src/main.rs                   CLI: serve / launch / routes / setup / doctor
 ```
 
 `docs/` holds the design documentation (one page per module above).

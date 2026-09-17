@@ -1,0 +1,352 @@
+# `setup` and `doctor`: configuring and auditing turnpike
+
+Two commands, one shared concern. `turnpike setup` writes a config and its
+secrets; `turnpike doctor` reads them back and says what is wrong. They share
+the prompt module (`src/setup/prompt.rs`) and the discipline that goes with it —
+so they share a page.
+
+```text
+turnpike setup  [--config <path>]
+turnpike doctor [--config <path>] [--json] [--live] [--no-live]
+```
+
+Neither takes a `--storage` or `--no-validate` flag. There is one secret store
+(encrypted, in `~/.turnpike/` — see [secrets.md](secrets.md)) and no way to
+select a different one at the command line.
+
+## `turnpike setup`
+
+An interactive wizard over the config file. It exists because the alternative —
+hand-editing `~/.config/turnpike/config.toml` and exporting API keys per shell —
+is where a first run goes to die.
+
+### Non-tty contract
+
+If stdin is not a terminal, `setup` **refuses** rather than plodding through:
+
+```text
+turnpike setup needs an interactive terminal — use `turnpike serve --init` to
+write a starter config non-interactively, then edit it
+```
+
+A prompt read from a pipe returns `""` immediately, so an unattended run would
+answer "no" to every question and then save an unchanged file — a wizard that
+looks like it did something and did nothing. Refusing up front is the only
+honest behavior, and it is what `setup < /dev/null` exercises in CI-adjacent
+manual checks. Exit code 1.
+
+### Staged, then committed
+
+Every edit accumulates in one in-memory `toml_edit::DocumentMut` plus a
+`Plan { secret_writes, secret_deletes }`. **Nothing touches disk until "Save &
+exit."** That is what makes "quit without saving" real rather than aspirational,
+gives the whole run a single write point, and reduces partial-failure recovery
+to a question of ordering.
+
+### The menu
+
+```text
+turnpike setup — ~/.config/turnpike/config.toml  (~/.turnpike, encrypted)
+
+  1) Providers   3 configured
+  2) Routes      5 configured
+  3) Keys        2 stored
+  4) Validate    live
+  5) Doctor
+  6) Save & exit
+  7) Quit without saving
+```
+
+The header line names the config being edited and the store it will write to,
+with the store's status: `encrypted`, `no store yet — a key entered now creates
+it`, or the reason it is unusable.
+
+Quit is row 7 of the same menu rather than a separate `Continue?` prompt: one
+prompt per loop instead of two, `choose` re-asks on anything out of range so `7`
+is always reachable, and quitting is discoverable rather than hidden behind a
+second question.
+
+- **Providers** — list / add / edit / remove. Add asks the wire spec
+  (`anthropic` / `openai`), the id, and the base URL. Remove refuses while routes
+  still reference the id, **naming them** — the same rule `config::validate`
+  enforces, surfaced early instead of at save time.
+- **Routes** — list / add / edit / remove over the route fields. `family` is a
+  menu whose first entry is `(infer from upstream model)`, so the common path is
+  one keystroke. Optional fields are asked one at a time and an empty answer
+  **omits** the key rather than writing `key = ""`.
+- **Keys** — per provider: paste a value (encrypted into the store), name an env
+  var (writes `api_key_env`), or leave it unset. The paste path uses
+  `ask_secret`, which turns terminal echo off and **never logs or echoes the
+  value**.
+
+  A provider whose key already resolves is confirmed before being re-keyed
+  (`Replace the key for zen? [y/N]`). That question is not friction — a provider
+  can resolve from a tier the user is moving off, and this is the only place to
+  change it.
+
+- **Validate** — renders the document, reparses it through `config::load`, and
+  prints the tier each provider's key currently resolves from
+  (`zen -> env OPENCODE_API_KEY`). Reporting the *source* is the point: it is
+  the thing users most often get wrong.
+- **Doctor** — a signpost, not a runner. It prints that `turnpike doctor` runs
+  the full check list, rather than re-implementing that list inside the wizard
+  where it would become a second copy to keep in sync.
+
+### Comment preservation
+
+`config.toml` is roughly 40% comments by volume, and most are load-bearing: they
+explain the `/zen` → `/zen/go` split, why an Anthropic-spec `base_url` carries no
+path, and how to uncomment the OpenCode Go block. The wizard is built on
+`toml_edit` and mutates the document **in place** — it is never round-tripped
+through `Config` or `toml::Value` for writing, which is precisely the operation
+that deletes every comment on first use.
+
+Two rules make the diff a pure addition or a pure value swap:
+
+- new tables are **appended at the end** (`Table::set_position(Some(isize::MAX))`;
+  a table with no position of its own inherits its parent's, which renders it
+  mid-file);
+- an edited scalar is rebuilt with the old decor cloned across, so a trailing
+  `# comment` on that line survives.
+
+### The inline-key migration
+
+Moving a plaintext `api_key` into the store is the one operation that can lose
+data, so its ordering is not negotiable:
+
+```text
+Move the plaintext key for provider `zen` into the encrypted store? [Y/n]
+```
+
+**The value is staged in memory first, and the inline key is stripped in the
+same step; the store write happens at commit.** A run that migrates three of
+four providers is a success, not a rollback — but a run that strips a key it
+failed to store has destroyed a credential, and no error message makes that
+acceptable. On failure the document is left byte-identical and the wizard
+reports which provider did not migrate.
+
+### Commit sequence
+
+Ordered so any failure is recoverable. `commit()` runs after the validation
+gate, which renders the document and reparses it — so what is saved is what was
+checked.
+
+1. **Back up** the current config to `~/.turnpike/backups/<ns>-config.toml`,
+   write-once per namespace, and deliberately *outside* the directory being
+   written. The earliest snapshot is the pre-turnpike state; a second `setup`
+   does not overwrite it with a wizard-written file.
+2. **Write secrets** — create `master.key` on first write, then stage and save
+   `secrets.toml`.
+3. **Write `config.toml` atomically** — temp file in the same directory, then
+   `fs::rename`.
+
+A crash between 2 and 3 leaves secrets with an unchanged config: orphaned but
+harmless. Step 3 is the only critical one, and `rename` makes it all-or-nothing.
+The rename changes the inode, which breaks hardlinks and any editor holding the
+file open; crash safety is worth more, and nothing here promises otherwise.
+
+### End of run
+
+```text
+Saved ~/.config/turnpike/config.toml.
+Next: `turnpike serve`, then `turnpike launch claude-code`.
+```
+
+The handoff **prints** commands. A wizard that silently becomes a server is a
+wizard nobody trusts.
+
+## `turnpike doctor`
+
+One question: *what is wrong with this installation, and what is the fix?* It is
+deliberately **read-only** and **non-fatal** — every check reports, nothing
+repairs, and the process exits 0 unless a check came back `Fail`.
+
+### Where the `Fail`/`Warn` line is drawn
+
+`Fail` means **the gateway cannot serve this config at all** — exactly the two
+rules `config::validate` enforces:
+
+- no `[providers.*]` at all,
+- a route referencing a provider that is not defined.
+
+Everything else is a lint, and lints are `Warn`. Widening `validate` to cover a
+lint would break configs that work today, which is strictly worse than a
+warning — so the two sets stay deliberately separate. `validate` decides whether
+turnpike runs; doctor decides whether it *should*.
+
+A `Fail` therefore always has a matching `config-parse` or `validate` check that
+explains it. The rest of the list is advice.
+
+### The check list
+
+The 20 checks, in the order they run — from "is there even a config" to "does
+the upstream answer":
+
+| # | Check | Reports |
+| --- | --- | --- |
+| 1 | `config-found` | Which path was resolved, and whether it exists. |
+| 2 | `config-parse` | A TOML syntax error, with toml's own line number. |
+| 3 | `validate` | The two hard rules above. |
+| 4 | `providers-key-env` | Whether each `api_key_env` is set and non-empty. |
+| 5 | `providers-key-inline` | One warning per literal `api_key`, pointing at `turnpike setup`. |
+| 6 | `secrets-store` | Whether `~/.turnpike/` is present and `master.key` is mode 0600, with the exact `chmod` in `fix`. |
+| 7 | `secrets-decrypt` | Whether each stored record decrypts. A failure means a restored-from-backup `secrets.toml` with the wrong key, or a tampered record. |
+| 8 | `key-resolvable` | Runs the precedence chain per provider and for `[search]`, and reports **which tier answered**: `provider.zen → env OPENCODE_API_KEY`, `search.exa → inline (plaintext)`, `provider.x → none`. |
+| 9 | `precedence-shadow` | Warns when an env var and a stored key both exist: "env wins; the stored copy for `zen` is shadowed". |
+| 10 | `store-location` | Warns when `~/.turnpike/` or the config sits under a sync root — a synced `master.key` beside a synced `secrets.toml` makes the encryption decorative. |
+| 11 | `listen-addr` | `SocketAddr::parse` plus a loopback check. Binding a wildcard address is not fatal — the Host guard still rejects off-host requests — but it widens exposure, so it warns. |
+| 12 | `search-config` | The configured search provider and loop bound. |
+| 13 | `routes-shape` | Non-empty, known `family`, sane token counts, duplicate `(provider, model)` pairs. |
+| 14 | `base-url-shape` | Parses with `reqwest::Url`; warns when an Anthropic-spec `base_url` ends in `/v1`, since turnpike appends the spec path itself. |
+| 15 | `config-perms` | Warns if an inline key is present and `mode & 0o077 != 0`. |
+| 16 | `backups` | Whether a config backup exists yet. |
+| 17 | `launchers` | Claude Code on `PATH` / installed, and whether the Claude Desktop gateway profile is applied. |
+| 18 | `gateway-detected` | `GET /_health` on the configured gateway address, expecting 204 + `x-turnpike-gateway: 1`. |
+| 19 | `gateway-shadows-config` | Compares the running gateway's `/v1/models` route ids against this config and warns on divergence. |
+| 20 | `provider-reach` | Live-only. `GET` the cheap endpoint per provider with injected auth and an 8s timeout. Any HTTP response means reachable; **only** a 401/403 escalates, and then doctor asks before a billed call. |
+
+### Local probe vs live checks
+
+`gateway-detected` and `gateway-shadows-config` are **not** live checks in the
+billable sense: they probe `127.0.0.1`, which is where the user's own gateway
+lives, costs nothing, and catches the most confusing real-world failure there is
+— a gateway already running with a *different* config, so requests succeed
+against routes the user is not looking at:
+
+```text
+[warn] gateway-shadows-config   a gateway is already running with 3 route(s); this config has 1
+         on the running gateway only: claude-haiku-4-5, claude-opus-5
+```
+
+`--live` is the only thing that opens a connection to a *provider*. Without it,
+`provider-reach` reports `Skip`. The one step that can cost money is
+`provider-reach`'s escalation, and it asks first:
+
+```text
+Send one minimal POST /v1/messages (max_tokens: 1) to `zen`? This may cost money. [y/N]
+```
+
+**One confirmation total**, against the cheapest configured route — not one per
+provider.
+
+`--json` implies no prompting, so `--json --live` is the scripting combination;
+`--no-live` skips the network checks without being asked. Interactively, doctor
+offers them.
+
+### Output shapes
+
+Human, on stdout:
+
+```text
+turnpike doctor
+
+[ok  ] config-found             config at /Users/aslam/.config/turnpike/config.toml
+[warn] providers-key-env        OPENCODE_API_KEY is not set
+         fix: export it, or store the key with `turnpike setup`
+...
+15 ok, 3 warning(s), 0 failure(s), 2 skipped
+```
+
+Machine-readable, `--json`:
+
+```json
+{
+  "checks": [
+    {
+      "id": "key-resolvable",
+      "status": "warn",
+      "summary": "3 key(s) do not resolve from any tier",
+      "detail": "provider.zen → none\nprovider.zen-go → none\nsearch.exa → none",
+      "fix": "run `turnpike setup` → Keys, or export the env var shown below"
+    }
+  ],
+  "summary": { "warnings": 3, "failures": 0, "total": 20 }
+}
+```
+
+`status` is one of `ok`, `warn`, `fail`, `skip`. `detail` and `fix` are omitted
+when absent, so a consumer does not have to distinguish `null` from "no fix".
+`fix` is only ever set alongside `warn` or `fail` — a check that tells you to
+act when nothing is wrong is noise.
+
+`--json` parses with `jq`; exit code is 0 unless `failures > 0`.
+
+### Doctor builds its own client
+
+Doctor constructs its own `reqwest::Client` (5s connect / 15s overall) and does
+**not** go through `Gateway::new`, which would build a `SearchManager` for no
+reason. The health probe uses a 750ms timeout — it is a diagnostic, and a doctor
+that hangs is worse than one that reports "could not reach it".
+
+### Async, end to end
+
+`run`, `diagnose`, `probe_checks`, `probe_gateway` and `live_provider_check` are
+all `async fn` and the probes `.await` on the caller's runtime. There is no
+`block_on`, no private current-thread runtime, and no `thread::scope` — and none
+should be added. `main` is already `#[tokio::main]`, so a nested runtime defends
+against nothing, and a thread hop severs the runtime that owns a loopback
+listener (which is exactly how three probe tests once failed against a server
+that was demonstrably listening).
+
+Tests are `#[tokio::test]` throughout, so reintroducing a sync shim is a compile
+error rather than a silent regression.
+
+**File reads stay `std::fs`**, deliberately. `tokio::fs` is `spawn_blocking`
+underneath — a thread hop, the shape just removed. `diagnose` runs its checks
+strictly in sequence, so a sync read blocks nothing, and converting would add
+`.await` at 16 call sites for zero parallelism. The async-ness that earns its
+keep is the network probe.
+
+## stdout vs `tracing`
+
+Two descriptors, two jobs, enforced in `main::init_tracing`:
+
+- **stdout is program output** — the route table, `doctor`'s report, and every
+  wizard prompt.
+- **stderr is diagnostics** — all `tracing` output, unconditionally
+  (`.with_writer(std::io::stderr)`).
+
+Sharing one descriptor means an `INFO` from `SearchManager` lands mid-prompt, and
+`RUST_LOG=debug` makes the wizard unusable. This also makes `turnpike routes | jq`
+work, and it is why `serve` and `launch` messages appear on stderr.
+
+Each command picks a default filter, and `RUST_LOG` still overrides both:
+
+| Command | Default |
+| --- | --- |
+| `setup`, `doctor` | `warn` |
+| `serve`, `launch`, `routes` | `info` |
+
+### The prompt discipline
+
+`src/setup/prompt.rs` is the **only** module in turnpike that writes to stdout
+for input. `ask`, `ask_default`, `confirm`, `choose` and `ask_secret` all
+`print!` → `flush()` → read. The flush is load-bearing, not hygiene: stdout is
+line-buffered when it is a tty and `print!` emits no newline, so without it the
+question sits in the buffer while the process blocks on the read — the classic
+prompt-that-never-appears.
+
+`launch::claude_code::confirm` is deliberately *not* part of this: it neither
+flushes nor retries, and that is `launch`'s UX, not the wizard's.
+
+`ask_secret` turns terminal echo off via `libc::tcgetattr`/`tcsetattr` on Unix,
+restoring it on `Drop`. When the terminal cannot be switched — a redirected
+stdin, a `TERM=dumb` pty, Windows without a console handle — it falls back to
+echoed input with a one-line notice, because refusing to accept a key at all is
+a worse outcome than a visible paste. **The value is never logged**: it goes
+straight into the caller's `Secret`, and that function has no `tracing` calls.
+
+### Testing the wizard
+
+The wizard takes `&mut dyn Prompter`, so tests drive it without a tty and without
+mutating the environment (a repo convention — `TURNPIKE_HOME` is the test hook,
+never a mutated `HOME`). `ScriptedPrompt` queues answers and records everything
+**asked**, so a test can assert the wizard asked the right question, not merely
+that it produced the right file.
+
+## See also
+
+- [secrets.md](secrets.md) — the store both commands read and write.
+- [configuration.md](configuration.md) — the config file itself.
+- [launchers.md](launchers.md) — `turnpike launch`, invoked at the end of the
+  setup handoff.

@@ -7,9 +7,12 @@
 //! Desktop (configLibrary gateway profile) to use the gateway.
 
 mod config;
+mod doctor;
 mod launch;
 mod proxy;
 mod search;
+mod secrets;
+mod setup;
 mod translate;
 
 use std::path::PathBuf;
@@ -19,6 +22,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use config::Config;
+use secrets::StoreCtx;
 
 #[derive(Parser)]
 #[command(name = "turnpike", version, about = "Local gateway for Claude/Anthropic and OpenAI-spec clients, with model remapping")]
@@ -45,6 +49,9 @@ enum Commands {
     Launch {
         /// Target: claude-code | claude-desktop
         target: String,
+        /// Path to config.toml (default: $TURNPIKE_CONFIG or ~/.config/turnpike/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Client-facing route id (defaults to the first route in config).
         #[arg(short, long)]
         model: Option<String>,
@@ -69,51 +76,162 @@ enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Walk through creating or editing the config, including encrypted key storage.
+    Setup(SetupArgs),
+    /// Check the config, the secret store, and (with --live) the providers.
+    Doctor(DoctorArgs),
+}
+
+#[derive(clap::Args)]
+pub struct SetupArgs {
+    /// Path to config.toml (default: $TURNPIKE_CONFIG or ~/.config/turnpike/config.toml).
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+pub struct DoctorArgs {
+    /// Path to config.toml (default: $TURNPIKE_CONFIG or ~/.config/turnpike/config.toml).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Machine-readable output; never prompts.
+    #[arg(long)]
+    json: bool,
+    /// Run the live network checks without asking.
+    #[arg(long)]
+    live: bool,
+    /// Skip the live network checks without asking.
+    #[arg(long)]
+    no_live: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parsed before tracing starts: the command decides the default log filter,
+    // and the wizard needs to know it owns stdout.
+    let cli = Cli::parse();
+    init_tracing(&cli.command);
+
+    match cli.command {
+        Commands::Serve { config, listen, init } => serve(config, listen, init).await,
+        Commands::Launch {
+            target,
+            config,
+            model,
+            restore,
+            force,
+            no_auto_mode,
+            install,
+            args,
+        } => launch(config, &target, model, restore, force, no_auto_mode, install, &args),
+        Commands::Routes { config } => routes(config),
+        // Both take their config path straight through rather than going via
+        // `resolve_config`: with no config they start from the starter text in
+        // memory, which is the opposite of what `ConfigMode` exists to decide.
+        Commands::Setup(args) => setup::run(setup::SetupOptions {
+            config: args.config,
+            no_validate: false,
+        }),
+        Commands::Doctor(args) => {
+            doctor::run(doctor::DoctorOptions {
+                config: args.config,
+                json: args.json,
+                live: args.live,
+                no_live: args.no_live,
+            })
+            .await
+        }
+    }
+}
+
+/// Logs go to **stderr**, on purpose: stdout is program output — the route
+/// table, and every wizard prompt. Sharing one descriptor means an `INFO` from
+/// the search manager lands mid-prompt, and `RUST_LOG=debug` makes the wizard
+/// unusable.
+fn init_tracing(command: &Commands) {
+    let default = default_log_filter(command);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
         )
+        .with_writer(std::io::stderr)
         .init();
+}
 
-    match Cli::parse().command {
-        Commands::Serve { config, listen, init } => serve(config, listen, init).await,
-        Commands::Launch { target, model, restore, force, no_auto_mode, install, args } => {
-            launch(&target, model, restore, force, no_auto_mode, install, &args)
-        }
-        Commands::Routes { config } => routes(config),
+/// `warn` for the two commands that own stdout: a wizard sharing its descriptor
+/// with an `INFO` from the search manager is a wizard that looks broken, and
+/// `doctor`'s report is the output, not the log. `RUST_LOG` still overrides both.
+fn default_log_filter(command: &Commands) -> &'static str {
+    match command {
+        Commands::Setup(_) | Commands::Doctor(_) => "warn",
+        Commands::Serve { .. } | Commands::Launch { .. } | Commands::Routes { .. } => "info",
     }
 }
 
-fn resolve_config(path: Option<PathBuf>) -> Result<Config> {
-    let path = path.or_else(config::default_config_path);
-    let path = match path {
-        Some(p) if p.exists() => p,
-        Some(p) => {
-            config::write_default_config(&p)?;
-            println!("Wrote starter config to {} — set your API key env vars, then re-run.", p.display());
-            std::process::exit(0);
-        }
+/// A loaded config together with the secret store that belongs to it.
+///
+/// The store is opened here and nowhere else, so every command sees the same
+/// view of where keys come from.
+pub(crate) struct Loaded {
+    pub path: PathBuf,
+    pub cfg: Config,
+    pub store: StoreCtx,
+}
+
+/// What to do when the config does not exist yet.
+enum ConfigMode {
+    /// `serve --init`: write a starter and exit 0. This is the scripted/CI
+    /// contract and has always printed exactly one line.
+    InitOnly,
+    /// `serve`: the same, but worded to point at `setup`.
+    ServeInteractive,
+    /// `launch` and `routes`: a starter config that nobody filled in is not a
+    /// useful thing to exit 0 on, so say so and fail.
+    Required,
+}
+
+fn resolve_config(path: Option<PathBuf>, mode: ConfigMode) -> Result<Loaded> {
+    let path = match path.or_else(config::default_config_path) {
+        Some(p) => p,
         None => anyhow::bail!("no config path available"),
     };
-    config::load(&path)
+
+    if !path.exists() {
+        config::write_default_config(&path)?;
+        match mode {
+            ConfigMode::InitOnly => {
+                println!("Wrote starter config to {}", path.display());
+                std::process::exit(0);
+            }
+            ConfigMode::ServeInteractive => {
+                println!(
+                    "Wrote starter config to {} — set your API key env vars, then re-run.",
+                    path.display()
+                );
+                std::process::exit(0);
+            }
+            // The bug this mode exists to fix: `launch` on a fresh machine used
+            // to write a starter config and exit 0 without launching anything.
+            ConfigMode::Required => anyhow::bail!(
+                "wrote a starter config to {} — set your API key env vars, then \
+                 re-run (`turnpike setup` walks through this)",
+                path.display()
+            ),
+        }
+    }
+
+    let mut cfg = config::load(&path)?;
+    // Open once, hydrate once. `Config::resolve()` clones the provider config,
+    // so the keys ride along to the proxy with nothing downstream changed.
+    let store = secrets::open(&path);
+    secrets::hydrate(&mut cfg, &store);
+    Ok(Loaded { path, cfg, store })
 }
 
 async fn serve(config_path: Option<PathBuf>, listen: Option<String>, init: bool) -> Result<()> {
-    let path = config_path.clone().or_else(config::default_config_path);
-    if init {
-        if let Some(p) = &path {
-            if !p.exists() {
-                config::write_default_config(p)?;
-                println!("Wrote starter config to {}", p.display());
-            }
-        }
-    }
-    let mut cfg = resolve_config(config_path)?;
+    let mode = if init { ConfigMode::InitOnly } else { ConfigMode::ServeInteractive };
+    let mut cfg = resolve_config(config_path, mode)?.cfg;
     if let Some(l) = listen {
         cfg.server.listen = l;
     }
@@ -147,8 +265,17 @@ async fn serve(config_path: Option<PathBuf>, listen: Option<String>, init: bool)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch(target: &str, model: Option<String>, restore: bool, force: bool, no_auto_mode: bool, install: bool, args: &[String]) -> Result<()> {
-    let cfg = resolve_config(None)?;
+fn launch(
+    config_path: Option<PathBuf>,
+    target: &str,
+    model: Option<String>,
+    restore: bool,
+    force: bool,
+    no_auto_mode: bool,
+    install: bool,
+    args: &[String],
+) -> Result<()> {
+    let cfg = resolve_config(config_path, ConfigMode::Required)?.cfg;
     match target {
         "claude-code" | "claude_code" | "claudecode" => {
             let model = match model {
@@ -167,12 +294,14 @@ fn launch(target: &str, model: Option<String>, restore: bool, force: bool, no_au
             let _ = model; // model selection for desktop routes is future work
             launch::claude_desktop::configure(&cfg, "turnpike", force, !no_auto_mode)
         }
-        other => anyhow::bail!("unknown launch target {other:?} (expected claude-code or claude-desktop)"),
+        other => anyhow::bail!(
+            "unknown launch target {other:?} (expected claude-code or claude-desktop)"
+        ),
     }
 }
 
 fn routes(config_path: Option<PathBuf>) -> Result<()> {
-    let cfg = resolve_config(config_path)?;
+    let cfg = resolve_config(config_path, ConfigMode::Required)?.cfg;
     let header = "upstream model";
     println!("{:<32} {:<12} {header}", "client id", "provider");
     for (id, r) in &cfg.routes {

@@ -313,10 +313,7 @@ mod tests {
     fn from_config_picks_searxng_without_any_key() {
         let cfg = crate::config::SearchCfg {
             provider: "searxng".into(),
-            api_key: None,
-            api_key_env: None,
-            base_url: None,
-            max_loops: 5,
+            ..Default::default()
         };
         // No key required for searxng.
         assert!(SearchManager::from_config(&cfg).is_some());
@@ -326,10 +323,7 @@ mod tests {
     fn from_config_requires_key_for_exa() {
         let cfg = crate::config::SearchCfg {
             provider: "exa".into(),
-            api_key: None,
-            api_key_env: None,
-            base_url: None,
-            max_loops: 5,
+            ..Default::default()
         };
         assert!(SearchManager::from_config(&cfg).is_none());
         let cfg2 = crate::config::SearchCfg {
@@ -343,10 +337,7 @@ mod tests {
     fn unknown_provider_disables_middleware() {
         let cfg = crate::config::SearchCfg {
             provider: "nope".into(),
-            api_key: None,
-            api_key_env: None,
-            base_url: None,
-            max_loops: 5,
+            ..Default::default()
         };
         assert!(SearchManager::from_config(&cfg).is_none());
     }

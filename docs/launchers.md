@@ -6,9 +6,15 @@ subcommand. There are two launchers, chosen by target — `claude-code`, which
 needs nothing but environment variables, and `claude-desktop`, which needs a
 gateway *profile* written into Claude Desktop's config library.
 
-The launcher reads the same config as the gateway (`$TURNPIKE_CONFIG`, else
-`~/.config/turnpike/config.toml`, else `--config`) and shares its resolution
-logic; a model id that works for the gateway works for the launcher.
+The launcher reads the same config as the gateway (`--config`, else
+`$TURNPIKE_CONFIG`, else `~/.config/turnpike/config.toml`) and shares its
+resolution logic; a model id that works for the gateway works for the launcher.
+
+**If no config exists**, `launch` writes the starter and then **fails** rather
+than exiting 0 without launching anything. That was the old behavior, and it is
+the worst possible failure shape for a script: a fresh machine looked
+configured. Set up first (`turnpike setup`, or `turnpike serve --init` plus an
+edit), then launch.
 
 ## CLI surface
 
@@ -16,6 +22,7 @@ logic; a model id that works for the gateway works for the launcher.
 
 | Flag | Applies to | Meaning |
 | --- | --- | --- |
+| `--config <path>` | both | Config to read. Overrides `$TURNPIKE_CONFIG` and the default path. |
 | `--model/-m <id>` | claude-code | Client-facing route id (or any launcher-resolvable form, below). Defaults to the sonnet-family route, else the first route. |
 | `--restore` | claude-desktop | Restore the pre-turnpike backup instead of configuring. |
 | `--force` | claude-desktop | Configure even while Claude Desktop is running. |
@@ -61,6 +68,11 @@ resolution.
 `src/launch/claude_code.rs` holds no proxy configuration because Claude Code
 needs none — it is fully configurable via environment. The flow is: find the
 binary (installing if needed), compute the env, spawn attached.
+
+`confirm()` in this module does **not** flush stdout and does **not** re-ask on
+unrecognized input. That is deliberate and out of scope to change: prompts that
+flush and retry are the wizard's, and they live in `setup::prompt`
+(see [setup-and-doctor.md](setup-and-doctor.md#the-prompt-discipline)).
 
 **Find or install.** `find_path()` scans `PATH` for `claude` (`claude.exe` on
 Windows), then checks the well-known install fallbacks
