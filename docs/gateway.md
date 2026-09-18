@@ -84,10 +84,14 @@ Every POST handler funnels into `forward(gw, path, family, headers, body)`:
 6. **Family check.** `family_for_path(path)` must agree with the handler's
    claimed family; a disagreement is a `500` (defensive — it can't happen via
    the router).
-7. **Key.** `provider_cfg.api_key()` resolves the provider credential (inline
+7. **Select.** For a strategy route, `Gateway::select_target()` picks one
+   candidate from the route's target chain — round-robin for `load-balance`,
+   target 0 for `static` and `failover`. Resolution itself stays pure and always
+   means target 0; see [routing.md](routing.md).
+8. **Key.** `provider_cfg.api_key()` resolves the provider credential (inline
    `api_key` first, then `api_key_env`). Failure → `401`. The **client's**
    credential is never used here.
-8. **Spec decision.** Compare `provider.spec` to the path family:
+9. **Spec decision.** Compare `provider.spec` to the path family:
 
    - **Equal specs → passthrough.** The `model` field is rewritten to the
      upstream id (the *only* mutation in this path), the provider key and

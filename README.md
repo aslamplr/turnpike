@@ -138,7 +138,43 @@ max_tokens = 64000
 ```
 
 Model resolution order for an incoming `model` field: exact route id → any
-route whose upstream model matches → `provider/model` (explicit routing).
+route whose upstream model matches (this scans a route's whole target chain,
+not just its flat `model`) → `provider/model` (explicit routing).
+
+### Routing: one route, several upstreams
+
+A route's `provider`/`model` is **target 0**. `[[routes.<id>.target]]` blocks add
+targets 1..N, and `strategy` picks between them — so a request survives the
+provider it was not written for:
+
+```toml
+[routes."claude-sonnet-5"]
+provider = "zen-go"               # target 0
+model = "deepseek-v4-flash"
+family = "sonnet"
+strategy = "failover"             # static (default) | load-balance | failover
+
+[[routes."claude-sonnet-5".target]]
+provider = "ollama-local"
+model = "deepseek-v4-flash"
+
+[[routes."claude-sonnet-5".target]]
+provider = "lm-studio"
+model = "qwen3.8"
+```
+
+| `strategy` | Behavior |
+| --- | --- |
+| `static` | Target 0, every request. **The default**, and what a route with no `strategy` key means. |
+| `load-balance` | Round-robin across the targets, one per request. |
+| `failover` | Targets in order; on a retryable failure, move to the next. |
+
+`failover` moves on a transport error, a `429`, or a `5xx` — failures that are a
+property of the *target*. A `400` is not retried, because every target would
+fail identically. Once the first byte reaches the client the response is
+committed, so there is no mid-stream failover. An unknown `strategy` value is a
+parse error, not a silent fallback. The full story, including the context-window
+rule, is in [docs/routing.md](docs/routing.md).
 
 ### OpenCode Go subscription
 

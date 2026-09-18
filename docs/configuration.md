@@ -78,6 +78,13 @@ silently shadowed.
 
 ### `[routes.<id>]`
 
+A route is a client-facing model id mapped onto a `provider`/`model` pair. It
+may also declare **additional** candidate upstreams and a `strategy` for
+choosing among them (`static`, `load-balance`, `failover`) — a route with no
+`strategy` and no `target` behaves exactly as it always has. The full story,
+including the retryable-failure rule and the context-window order, is in
+[routing.md](routing.md).
+
 Each route is one client-facing model id. The id is the only thing a client
 picks that affects routing; everything else (provider choice, upstream model,
 credentials) is decided here.
@@ -112,6 +119,24 @@ requests, restoring the pass-through behavior. Key resolution is identical to
 the provider rule: env > store > inline; SearXNG needs none of them and defaults
 to loopback.
 
+### `[[routes.<id>.target]]`
+
+Additional candidate upstreams for a route. The route's own `provider`/`model`
+is **target 0**; these are targets 1..N. `target` defaults to empty, so the key
+is purely additive.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `provider` | — (required) | A `[providers.<id>]` id. An unknown one is a `validate` failure. |
+| `model` | — (required) | Upstream model id. |
+| `display_name` | none | Label for logs and `doctor` reports only. |
+| `context_tokens` | none | This target's window; feeds the route-level minimum. |
+
+`strategy` belongs to the route, not the target: `static` (default),
+`load-balance` (round-robin), `failover` (try in order). An unknown value is a
+parse error, not a silent fallback — a typo'd `"failoverr"` must not quietly
+turn failover off.
+
 ## Model resolution
 
 `Config::resolve()` maps a client-requested model to a `{ provider, provider_cfg,
@@ -119,7 +144,9 @@ upstream_model }`. Matching happens in this order:
 
 1. **Exact route id** — `"claude-sonnet-5"` matches a `[routes."claude-sonnet-5"]`.
 2. **Route target match** — requesting the upstream model id directly works if
-   any route targets it. Checked *before* provider/model splitting so ids that
+   any route targets it. This scans the whole target chain, not just the route's
+   flat `model`, so a request for a target's upstream id still resolves under a
+   strategy. Checked *before* provider/model splitting so ids that
    themselves contain `/` or `:` (e.g. `"openai/gpt-5"`)
    still resolve.
 3. **Explicit `provider/model` or `provider:model`** — `"zen-go/deepseek-v4-flash"`
@@ -154,11 +181,12 @@ implemented; see [bridge.md](bridge.md)).
 
 ## Validation
 
-`config::validate` has exactly **two** rules, and loading a config fails fast on
-either:
+`config::validate` has exactly **three** rules, and loading a config fails fast
+on any of them:
 
 - no `[providers.*]` at all,
-- a route referencing a provider that isn't defined.
+- a route referencing a provider that isn't defined,
+- a route **target** referencing a provider that isn't defined.
 
 Nothing else refuses to start. Everything else that might be wrong — an unset
 env var, a wildcard `listen`, a `base_url` with a stray `/v1`, an inline key

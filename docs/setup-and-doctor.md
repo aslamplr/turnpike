@@ -163,11 +163,12 @@ repairs, and the process exits 0 unless a check came back `Fail`.
 
 ### Where the `Fail`/`Warn` line is drawn
 
-`Fail` means **the gateway cannot serve this config at all** — exactly the two
+`Fail` means **the gateway cannot serve this config at all** — exactly the three
 rules `config::validate` enforces:
 
 - no `[providers.*]` at all,
-- a route referencing a provider that is not defined.
+- a route referencing a provider that is not defined,
+- a route target referencing a provider that is not defined.
 
 Everything else is a lint, and lints are `Warn`. Widening `validate` to cover a
 lint would break configs that work today, which is strictly worse than a
@@ -179,14 +180,14 @@ explains it. The rest of the list is advice.
 
 ### The check list
 
-The 20 checks, in the order they run — from "is there even a config" to "does
+The 26 checks, in the order they run — from "is there even a config" to "does
 the upstream answer":
 
 | # | Check | Reports |
 | --- | --- | --- |
 | 1 | `config-found` | Which path was resolved, and whether it exists. |
 | 2 | `config-parse` | A TOML syntax error, with toml's own line number. |
-| 3 | `validate` | The two hard rules above. |
+| 3 | `validate` | The three hard rules above. |
 | 4 | `providers-key-env` | Whether each `api_key_env` is set and non-empty. |
 | 5 | `providers-key-inline` | One warning per literal `api_key`, pointing at `turnpike setup`. |
 | 6 | `secrets-store` | Whether `~/.turnpike/` is present and `master.key` is mode 0600, with the exact `chmod` in `fix`. |
@@ -197,13 +198,19 @@ the upstream answer":
 | 11 | `listen-addr` | `SocketAddr::parse` plus a loopback check. Binding a wildcard address is not fatal — the Host guard still rejects off-host requests — but it widens exposure, so it warns. |
 | 12 | `search-config` | The configured search provider and loop bound. |
 | 13 | `routes-shape` | Non-empty, known `family`, sane token counts, duplicate `(provider, model)` pairs. |
-| 14 | `base-url-shape` | Parses with `reqwest::Url`; warns when an Anthropic-spec `base_url` ends in `/v1`, since turnpike appends the spec path itself. |
-| 15 | `config-perms` | Warns if an inline key is present and `mode & 0o077 != 0`. |
-| 16 | `backups` | Whether a config backup exists yet. |
-| 17 | `launchers` | Claude Code on `PATH` / installed, and whether the Claude Desktop gateway profile is applied. |
-| 18 | `gateway-detected` | `GET /_health` on the configured gateway address, expecting 204 + `x-turnpike-gateway: 1`. |
-| 19 | `gateway-shadows-config` | Compares the running gateway's `/v1/models` route ids against this config and warns on divergence. |
-| 20 | `provider-reach` | Live-only. `GET` the cheap endpoint per provider with injected auth and an 8s timeout. Any HTTP response means reachable; **only** a 401/403 escalates, and then doctor asks before a billed call. |
+| 14 | `routes-target-provider` | A target names a provider that isn't in `[providers.*]`. The one `Fail` in this group — it is the third `config::validate` rule, so the gateway cannot serve the config at all. |
+| 15 | `routes-strategy` | `load-balance` / `failover` with fewer than 2 targets, which is indistinguishable from `static`. |
+| 16 | `routes-target-duplicate` | The same `(provider, model)` twice in one route's target chain, reported by position. |
+| 17 | `routes-mixed-spec` | A route mixing anthropic- and openai-spec targets; the translation path is chosen per attempt. |
+| 18 | `routes-context-mixed` | A strategy route where some targets declare `context_tokens` and others don't — the route minimum then ignores the silent ones. |
+| 19 | `routes-failover-single-provider` | A `failover` chain whose targets are all one provider, so a provider-wide outage still takes the route down. |
+| 20 | `base-url-shape` | Parses with `reqwest::Url`; warns when an Anthropic-spec `base_url` ends in `/v1`, since turnpike appends the spec path itself. |
+| 21 | `config-perms` | Warns if an inline key is present and `mode & 0o077 != 0`. |
+| 22 | `backups` | Whether a config backup exists yet. |
+| 23 | `launchers` | Claude Code on `PATH` / installed, and whether the Claude Desktop gateway profile is applied. |
+| 24 | `gateway-detected` | `GET /_health` on the configured gateway address, expecting 204 + `x-turnpike-gateway: 1`. |
+| 25 | `gateway-shadows-config` | Compares the running gateway's `/v1/models` route ids against this config and warns on divergence. |
+| 26 | `provider-reach` | Live-only. `GET` the cheap endpoint per provider with injected auth and an 8s timeout. Any HTTP response means reachable; **only** a 401/403 escalates, and then doctor asks before a billed call. |
 
 ### Local probe vs live checks
 
@@ -260,7 +267,7 @@ Machine-readable, `--json`:
       "fix": "run `turnpike setup` → Keys, or export the env var shown below"
     }
   ],
-  "summary": { "warnings": 3, "failures": 0, "total": 20 }
+  "summary": { "warnings": 3, "failures": 0, "total": 26 }
 }
 ```
 

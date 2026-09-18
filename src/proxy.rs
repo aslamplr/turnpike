@@ -33,6 +33,16 @@ pub struct Gateway {
     pub search: Option<Arc<crate::search::SearchManager>>,
     /// Middleware loop budget (from `[search] max_loops`).
     pub search_max_loops: usize,
+    /// Round-robin cursors for `load-balance` routes, one entry per route id.
+    ///
+    /// Keyed by route id rather than by index because `routes` is a
+    /// `BTreeMap`: iteration is alphabetical, not declaration order, so an
+    /// index-keyed cursor would silently reshuffle when a route is renamed or
+    /// added. Built once in [`Gateway::new`] and only ever incremented — a
+    /// per-request map would reset every cursor to 0 and degenerate
+    /// round-robin into "always target 0", a bug that passes a single-request
+    /// test and fails the moment anything is concurrent.
+    round_robin: std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl Gateway {
@@ -52,9 +62,42 @@ impl Gateway {
         }
         Self {
             search_max_loops: config.search.max_loops.max(1),
+            round_robin: std::sync::Mutex::new(std::collections::HashMap::new()),
             config,
             http,
             search,
+        }
+    }
+
+    /// Which target serves this request.
+    ///
+    /// The only stateful half of routing, and the only reason this lives on
+    /// `Gateway` rather than in `Config::resolve_route` — see that method's
+    /// doc comment for why the two are separate. `static` and `failover` both
+    /// answer target 0 (for `failover` the *ordering of attempts* is the
+    /// policy, so choosing among them is not a decision); `load-balance`
+    /// advances a per-route cursor.
+    fn select_target(&self, res: &crate::config::RouteResolution) -> crate::config::Resolved {
+        use crate::config::Strategy;
+        let first = || {
+            res.targets
+                .first()
+                .cloned()
+                .expect("a RouteResolution always carries at least one target")
+        };
+        match res.strategy {
+            Strategy::Static | Strategy::Failover => first(),
+            Strategy::LoadBalance if res.targets.len() < 2 => first(),
+            Strategy::LoadBalance => {
+                let n = {
+                    let mut cursors = self.round_robin.lock().unwrap();
+                    let slot = cursors.entry(res.route_id.clone()).or_insert(0);
+                    let n = *slot % res.targets.len();
+                    *slot = slot.wrapping_add(1);
+                    n
+                };
+                res.targets[n].clone()
+            }
         }
     }
 }
@@ -95,6 +138,17 @@ async fn models(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
     }
     let mut data = Vec::new();
     for (id, route) in &gw.config.routes {
+        // A strategy route serves several upstream models behind one id; name
+        // them in `detail` so the catalog is honest about what it will route to,
+        // without inventing synthetic per-target ids (which would change what
+        // Claude Desktop's picker lists).
+        let targets = route.targets();
+        let detail = if targets.len() > 1 {
+            let models: Vec<&str> = targets.iter().map(|t| t.model.as_str()).collect();
+            models.join(", ")
+        } else {
+            route.model.clone()
+        };
         data.push(json!({
             "type": "model",
             "id": id,
@@ -103,6 +157,7 @@ async fn models(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
             "max_tokens": route.max_tokens.unwrap_or(64_000),
             "anthropic_family_tier": route.family,
             "is_family_default": true,
+            "detail": detail,
         }));
     }
     let first = data.first().and_then(|m| m.get("id")).cloned();
@@ -114,6 +169,108 @@ async fn models(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
         "has_more": false,
     }))
     .into_response()
+}
+
+/// Whether a failed attempt against one target should fall over to the next.
+///
+/// v1 is **429, any 5xx, and transport errors**. The distinction being drawn
+/// is between a failure that is a property of the *target* — this provider is
+/// busy, this provider is down, this host is unreachable — and one that is a
+/// property of the *request*, which every target would fail identically.
+/// `400` and `422` are the request class and never retry: a bad request against
+/// a three-target route would cost three round-trips to return the same error.
+///
+/// The broader "this target is misconfigured" class (401/402/403/404/408) is a
+/// deliberate later decision rather than an oversight: adding it changes what
+/// a failover chain *means*. Today `failover` says "my provider is busy, use
+/// another"; adding 401 makes it say "my provider is misconfigured, quietly
+/// use another" — which is how a rotated key never gets noticed. `doctor`'s
+/// `key-resolvable` check is the honest place to catch that class.
+///
+/// Keeping the trigger set in one predicate is the point: widening it later is
+/// one function, not a refactor.
+fn is_retryable(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// One attempt's outcome, before it is either committed to the client or
+/// retried against the next target.
+enum Attempt {
+    /// The attempt produced the client's response. For a spec match this is
+    /// the raw upstream response, still holding its body; for a bridged target
+    /// it is the already-converted `Response`, because `bridge` owns its own
+    /// streaming rendition and cannot hand back a body to convert later.
+    Responded(Response),
+    /// The attempt failed and the status, when there was one, is retryable.
+    /// Carries the client-facing error so the *first* target's message can be
+    /// returned if every target fails.
+    Retry(Response),
+    /// The attempt failed in a way no other target would help with. Returned
+    /// to the client as-is.
+    Fatal(Response),
+}
+
+/// Classify one response, calling `is_retryable` on the *raw* response.
+///
+/// This has to happen before anything converts a non-2xx into a client error:
+/// `upstream_error_response` returns an already-built `Response`, whose status
+/// has been remapped and whose body has been consumed, so a check made after
+/// it would see every failure as alike and 5xx failover would silently become
+/// a no-op.
+async fn classify(upstream: reqwest::Response, provider: &str) -> Attempt {
+    let status = upstream.status();
+    if status.is_success() || !is_retryable(status) {
+        return Attempt::Responded(turnpike_response(upstream).await);
+    }
+    Attempt::Retry(spec_error_of(status, provider, upstream).await)
+}
+
+/// A transport failure — refused, DNS, TLS, connect timeout — provably never
+/// reached the model, so a retry costs nothing and is the safest case there is.
+fn transport_attempt<E: std::fmt::Display>(e: E, provider: &str) -> Attempt {
+    tracing::warn!(error = %e, provider, "upstream unreachable; trying the next target");
+    Attempt::Retry(anthropic_error(
+        StatusCode::BAD_GATEWAY,
+        format!("upstream {provider} unavailable: {e}"),
+    ))
+}
+
+/// Read a retryable upstream failure into a client-facing error, keeping the
+/// upstream's own message.
+///
+/// A retryable response is never sent to the client — it is either superseded
+/// by a later target's answer or, if every target fails, this is the message
+/// that gets returned. So reading the body here costs nothing and is the only
+/// read it gets. The extraction mirrors `upstream_error_response` so that a
+/// passthrough route and a bridged one describe the same failure the same way;
+/// without that, which message a user sees would depend on whether their
+/// primary happens to be Anthropic-spec.
+///
+/// `provider` is only used to say *who* failed when the upstream says nothing
+/// useful — the status alone does not identify the target in a failover chain.
+async fn spec_error_of(
+    status: StatusCode,
+    provider: &str,
+    upstream: reqwest::Response,
+) -> Response {
+    let text = upstream.text().await.unwrap_or_default();
+    tracing::warn!(
+        %status,
+        provider,
+        body = %text.chars().take(300).collect::<String>(),
+        "upstream error"
+    );
+    let msg = crate::translate::error_to_anthropic(&text)
+        .map(|(m, _)| m)
+        .unwrap_or_else(|| {
+            if text.is_empty() {
+                format!("upstream {provider} returned {status}")
+            } else {
+                text.chars().take(500).collect()
+            }
+        });
+    let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    anthropic_error(code, msg)
 }
 
 /// Local heuristic token estimate — no upstream call, mirroring Ollama's
@@ -198,7 +355,7 @@ async fn forward(
         );
     }
 
-    let mut payload: Value = match serde_json::from_slice(&body) {
+    let payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return spec_error(
@@ -218,7 +375,7 @@ async fn forward(
         return spec_error(family, StatusCode::BAD_REQUEST, "model is required");
     }
 
-    let resolved = match gw.config.resolve(&requested) {
+    let route = match gw.config.resolve_route(&requested) {
         Ok(r) => r,
         Err(e) => return resolve_error(StatusCode::NOT_FOUND, &e, family),
     };
@@ -230,89 +387,173 @@ async fn forward(
             "unsupported path",
         );
     }
-    let provider_spec = spec_of(resolved.provider_cfg.spec);
+
+    // The attempt loop. `static` and `load-balance` make exactly one attempt
+    // (selection already answered); `failover` walks the chain in order until
+    // one target answers or the budget runs out. The budget is the target
+    // count: every target gets exactly one try, so a 3-target chain cannot
+    // retry a flaky primary three times and starve the tertiary.
+    let attempts: Vec<crate::config::Resolved> = match route.strategy {
+        crate::config::Strategy::Failover => route.targets.clone(),
+        _ => vec![gw.select_target(&route)],
+    };
+    let budget = attempts.len();
+    let mut first_error: Option<Response> = None;
+
+    for (i, target) in attempts.into_iter().enumerate() {
+        let attempt = attempt_target(&gw, path, family, &headers, &payload, &target).await;
+        match attempt {
+            // A response was produced, whichever path made it. For a spec
+            // match, a non-2xx lands here too: relaying the provider's status
+            // unchanged *is* the passthrough contract, and the retryable ones
+            // were already peeled off in `classify`.
+            Attempt::Responded(response) => {
+                if i > 0 {
+                    tracing::warn!(
+                        target = %target.provider,
+                        upstream_model = %target.upstream_model,
+                        attempt = i + 1,
+                        "failover: request served by a fallback target"
+                    );
+                }
+                return response;
+            }
+            Attempt::Retry(res) => {
+                // Keep the *first* target's error. When every target fails, the
+                // client gets the primary's message — the one the user
+                // configured, and the most likely to explain the real problem.
+                // The last target's error would surface e.g. a tertiary's 429
+                // for a route whose primary has an unreachable host.
+                if first_error.is_none() {
+                    first_error = Some(res);
+                }
+                if i + 1 == budget {
+                    break;
+                }
+            }
+            // Per-request failure: retrying would multiply latency to return
+            // the same error, so it commits immediately.
+            Attempt::Fatal(res) => return res,
+        }
+    }
+
+    first_error.unwrap_or_else(|| {
+        spec_error(
+            family,
+            StatusCode::BAD_GATEWAY,
+            format!("all {budget} target(s) for {requested:?} failed"),
+        )
+    })
+}
+
+/// One attempt against one target, up to the first byte of the response.
+///
+/// The first-byte boundary is what governs this whole feature: once the first
+/// upstream byte is in hand, the client's SSE stream is committed and there is
+/// nothing left to fall over to. Nothing here buffers — the boundary is
+/// exactly where `bridge` takes the response and starts streaming.
+async fn attempt_target(
+    gw: &Arc<Gateway>,
+    path: &'static str,
+    family: Family,
+    headers: &HeaderMap,
+    payload: &Value,
+    target: &crate::config::Resolved,
+) -> Attempt {
+    let provider_spec = spec_of(target.provider_cfg.spec);
     tracing::info!(
         %path,
-        client_model = %requested,
-        provider = %resolved.provider,
-        upstream_model = %resolved.upstream_model,
+        provider = %target.provider,
+        upstream_model = %target.upstream_model,
         ?family,
-        upstream_spec = resolved.provider_cfg.spec.as_str(),
-        "request resolved"
+        upstream_spec = target.provider_cfg.spec.as_str(),
+        "attempting target"
     );
 
-    let key = match resolved.provider_cfg.api_key() {
+    let key = match target.provider_cfg.api_key() {
         Ok(k) => k,
-        Err(e) => return spec_error(family, StatusCode::UNAUTHORIZED, format!("{e}")),
+        Err(e) => {
+            // A key that cannot be resolved here is a *config* failure, not an
+            // upstream one — the same 401 for every target sharing that
+            // provider, so retrying is pointless. Note the consequence under
+            // `failover`: an unresolvable key on the primary no longer fails
+            // loudly at request time, which is exactly why `doctor`'s
+            // `key-resolvable` check exists.
+            return Attempt::Fatal(spec_error(family, StatusCode::UNAUTHORIZED, format!("{e}")));
+        }
     };
 
     if provider_spec == family {
         // Spec match: passthrough with only the model field rewritten.
-        payload["model"] = Value::String(resolved.upstream_model.clone());
+        let mut payload = payload.clone();
+        payload["model"] = Value::String(target.upstream_model.clone());
         let rewritten = match serde_json::to_vec(&payload) {
             Ok(v) => v,
             Err(e) => {
-                return spec_error(
+                return Attempt::Fatal(spec_error(
                     family,
                     StatusCode::BAD_REQUEST,
                     format!("encode request body: {e}"),
-                )
+                ))
             }
         };
 
         let url = format!(
             "{}/{}",
-            resolved.provider_cfg.base_url.trim_end_matches('/'),
+            target.provider_cfg.base_url.trim_end_matches('/'),
             path.trim_start_matches('/')
         );
 
         let mut req = gw.http.request(Method::POST, &url);
-        for (name, value) in filtered_request_headers(&headers) {
+        for (name, value) in filtered_request_headers(headers) {
             req = req.header(name, value);
         }
-        req = inject_auth(req, resolved.provider_cfg.spec, &key);
-        for (name, value) in provider_extra_headers(&resolved.provider_cfg) {
+        req = inject_auth(req, target.provider_cfg.spec, &key);
+        for (name, value) in provider_extra_headers(&target.provider_cfg) {
             req = req.header(name, value);
         }
         req = req.body(rewritten);
 
-        let upstream = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(%path, error = %e, "upstream request failed");
-                return spec_error(
-                    family,
-                    StatusCode::BAD_GATEWAY,
-                    format!("upstream {} unavailable: {e}", resolved.provider),
-                );
-            }
+        return match req.send().await {
+            Ok(upstream) => classify(upstream, &target.provider).await,
+            Err(e) => transport_attempt(e, &target.provider),
         };
-
-        return turnpike_response(upstream).await;
     }
 
     // Spec mismatch: bridge Anthropic-spec clients to OpenAI-spec providers
     // (e.g. DeepSeek/GLM/Kimi via OpenCode Go). The reverse direction is not
     // bridged yet.
     if family == Family::Anthropic && provider_spec == Family::OpenAI {
-        return bridge(gw, resolved, key, headers, payload, requested).await;
+        // `bridge` owns its own response conversion (it must, to stream), so
+        // it hands back a finished `Response` rather than one to classify —
+        // which also means a bridged attempt has already passed the
+        // first-byte boundary by the time it returns.
+        return Attempt::Responded(
+            bridge(
+                gw.clone(),
+                target.clone(),
+                key,
+                headers.clone(),
+                payload.clone(),
+            )
+            .await,
+        );
     }
 
-    spec_error(
+    Attempt::Fatal(spec_error(
         family,
         StatusCode::BAD_REQUEST,
         format!(
-            "model {requested:?} routes to provider {:?} which speaks the {} spec; \
-             this endpoint requires the {} spec",
-            resolved.provider,
-            resolved.provider_cfg.spec,
+            "provider {:?} speaks the {} spec; this endpoint requires the {} spec",
+            target.provider,
+            target.provider_cfg.spec,
             if family == Family::Anthropic {
                 "anthropic"
             } else {
                 "openai"
             }
         ),
-    )
+    ))
 }
 
 /// Translate an Anthropic Messages request into an OpenAI chat-completions
@@ -330,9 +571,18 @@ async fn bridge(
     resolved: crate::config::Resolved,
     key: String,
     headers: HeaderMap,
-    mut payload: Value,
-    requested: String,
+    payload: Value,
 ) -> Response {
+    // The client's requested model id, taken from the payload rather than
+    // threaded through as its own argument: it is only ever used for
+    // daisy-chaining into `bridge` from the attempt loop, where the payload is
+    // already in hand. `bridge`'s one other caller passes them in lockstep.
+    let requested = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut payload = payload;
     let stream = payload
         .get("stream")
         .and_then(Value::as_bool)
@@ -1917,5 +2167,590 @@ model = "m"
         // server_tool_use input travels as input_json_delta (escaped JSON).
         assert!(sse.contains(r#"\"query\":\"q\""#));
         assert!(sse.contains("https://x"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-route targets: load-balance and failover
+    // -----------------------------------------------------------------------
+
+    /// A stub `POST /v1/messages` upstream that always answers `status`, and
+    /// counts how many requests it received.
+    ///
+    /// The counter is the assertion that matters for the exclusions: "exactly
+    /// one upstream request" is what distinguishes a committed failure from a
+    /// retry, and it cannot be read off the client's response alone.
+    async fn stub_upstream(
+        status: StatusCode,
+        body: Value,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let stub = axum::Router::new()
+            .route(
+                "/v1/messages",
+                post(move |_body: Bytes| {
+                    let counter = counter.clone();
+                    let body = body.clone();
+                    async move {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (status, Json(body))
+                    }
+                }),
+            )
+            .into_make_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// A healthy Anthropic-shaped reply, tagged so the caller can tell which
+    /// target served the request.
+    fn ok_reply(tag: &str) -> Value {
+        json!({"id":"msg_1","type":"message","role":"assistant",
+               "content":[{"type":"text","text":tag}],
+               "model":"claude-sonnet-4-5","stop_reason":"end_turn",
+               "usage":{"input_tokens":1,"output_tokens":1}})
+    }
+
+    /// Send one Anthropic request through the router and hand back the reply.
+    async fn send(gw: Arc<Gateway>, model: &str) -> Response {
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("host", "127.0.0.1:8710")
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::from(format!(
+                r#"{{"model":"{model}","max_tokens":16,"messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}]}}"#
+            )))
+            .unwrap();
+        tower::ServiceExt::oneshot(router(gw), req).await.unwrap()
+    }
+
+    /// The text of the first content block, for identifying which target
+    /// answered.
+    async fn reply_text(res: Response) -> String {
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        v["content"][0]["text"].as_str().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn is_retryable_is_429_and_5xx_only() {
+        // The per-target class: this provider is busy or this host is down.
+        assert!(is_retryable(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable(StatusCode::GATEWAY_TIMEOUT));
+        // The per-request class: every target fails identically, so retrying
+        // multiplies latency to return the same error.
+        assert!(!is_retryable(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable(StatusCode::UNPROCESSABLE_ENTITY));
+        assert!(!is_retryable(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable(StatusCode::FORBIDDEN));
+        assert!(!is_retryable(StatusCode::NOT_FOUND));
+        assert!(!is_retryable(StatusCode::REQUEST_TIMEOUT));
+        // A success is never a retry, however it is spelled.
+        assert!(!is_retryable(StatusCode::OK));
+    }
+
+    #[tokio::test]
+    async fn round_robin_cycles_in_order() {
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "anthropic"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+strategy = "load-balance"
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+"#
+        );
+        let gw = Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )));
+
+        // Four requests → a, b, a, b. Order is the assertion: a cursor that is
+        // rebuilt per request would give a, a, a, a.
+        let seen: Vec<String> = {
+            let mut out = Vec::new();
+            for _ in 0..4 {
+                out.push(reply_text(send(gw.clone(), "claude-sonnet-5").await).await);
+            }
+            out
+        };
+        assert_eq!(seen, vec!["from-a", "from-b", "from-a", "from-b"]);
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn round_robin_counter_is_per_route() {
+        // Two load-balance routes over the same two stubs. If the cursor were
+        // keyed by target index rather than route id, the two routes would
+        // share one cursor and this would desynchronize.
+        let (a, _) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, _) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "anthropic"
+base_url = "{b}"
+api_key = "k"
+
+[routes."r-one"]
+provider = "a"
+model = "m-a"
+strategy = "load-balance"
+
+[[routes."r-one".target]]
+provider = "b"
+model = "m-b"
+
+[routes."r-two"]
+provider = "a"
+model = "m-a"
+strategy = "load-balance"
+
+[[routes."r-two".target]]
+provider = "b"
+model = "m-b"
+"#
+        );
+        let gw = Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )));
+
+        // Interleave the two routes. Each has its own cursor, so each sees its
+        // own a,b,a,b.
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(reply_text(send(gw.clone(), "r-one").await).await);
+            seen.push(reply_text(send(gw.clone(), "r-two").await).await);
+        }
+        assert_eq!(
+            seen,
+            vec!["from-a", "from-a", "from-b", "from-b", "from-a", "from-a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn static_route_ignores_round_robin() {
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "anthropic"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+# no strategy: the default, and today's behavior exactly
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+"#
+        );
+        let gw = Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )));
+
+        // Declaring targets under `static` is inert: the route is still target
+        // 0 on every request. This is the compatibility guarantee.
+        for _ in 0..3 {
+            assert_eq!(
+                reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+                "from-a"
+            );
+        }
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A failover route: primary `a`, secondary `b`. Returns the gateway and
+    /// both hit counters.
+    async fn failover_gateway(
+        primary_status: StatusCode,
+        primary_body: Value,
+        secondary_status: StatusCode,
+    ) -> (
+        Arc<Gateway>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (a, a_hits) = stub_upstream(primary_status, primary_body).await;
+        let (b, b_hits) = stub_upstream(secondary_status, ok_reply("from-b")).await;
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "anthropic"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+strategy = "failover"
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+"#
+        );
+        let gw = Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )));
+        (gw, a_hits, b_hits)
+    }
+
+    #[tokio::test]
+    async fn failover_moves_on_429() {
+        let (gw, a_hits, b_hits) = failover_gateway(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}),
+            StatusCode::OK,
+        )
+        .await;
+        let res = send(gw, "claude-sonnet-5").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(reply_text(res).await, "from-b");
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_moves_on_5xx() {
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let (gw, a_hits, b_hits) = failover_gateway(
+                status,
+                json!({"type":"error","error":{"type":"api_error","message":"upstream broke"}}),
+                StatusCode::OK,
+            )
+            .await;
+            let res = send(gw, "claude-sonnet-5").await;
+            assert_eq!(res.status(), StatusCode::OK, "{status} should fail over");
+            assert_eq!(reply_text(res).await, "from-b");
+            assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn failover_moves_on_transport_error() {
+        // A primary whose port nothing is listening on: the connection is
+        // refused, which is the third retryable trigger.
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.dead]
+spec = "anthropic"
+base_url = "http://127.0.0.1:1"
+api_key = "k"
+
+[providers.b]
+spec = "anthropic"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "dead"
+model = "m-a"
+strategy = "failover"
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+"#
+        );
+        let gw = Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )));
+        let res = send(gw, "claude-sonnet-5").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(reply_text(res).await, "from-b");
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_stops_on_400() {
+        // The exclusion, asserted as a request count: a malformed request
+        // would fail identically everywhere, so retrying only multiplies
+        // latency. Exactly one upstream hit.
+        let (gw, a_hits, b_hits) = failover_gateway(
+            StatusCode::BAD_REQUEST,
+            json!({"type":"error","error":{"type":"invalid_request_error","message":"bad param"}}),
+            StatusCode::OK,
+        )
+        .await;
+        let res = send(gw, "claude-sonnet-5").await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            b_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a per-request failure must not reach the secondary"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_stops_on_401() {
+        // 401 is deliberately outside v1's retryable set. A rotated key is a
+        // target-level problem, but retrying it silently is how a dead primary
+        // goes unnoticed — so it commits, and `doctor`'s `key-resolvable`
+        // check is what surfaces it.
+        let (gw, a_hits, b_hits) = failover_gateway(
+            StatusCode::UNAUTHORIZED,
+            json!({"type":"error","error":{"type":"authentication_error","message":"revoked"}}),
+            StatusCode::OK,
+        )
+        .await;
+        let res = send(gw, "claude-sonnet-5").await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failover_exhausted_returns_first_targets_error() {
+        // Both targets refuse. The client gets the *primary's* body — the one
+        // the user configured, and the likeliest to explain the real problem.
+        let (gw, a_hits, b_hits) = failover_gateway(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"type":"error","error":{"type":"rate_limit_error","message":"primary is busy"}}),
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .await;
+        let res = send(gw, "claude-sonnet-5").await;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["message"], "primary is busy");
+        // Budget is the target count: each target got exactly one try.
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_chain_stops_at_first_success() {
+        // A three-target chain where the secondary answers: the tertiary must
+        // never be contacted. (The budget is the target count, not a retry
+        // count — a flaky primary cannot walk the whole chain.)
+        let (a, a_hits) = stub_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"type":"error","error":{"type":"rate_limit_error","message":"busy"}}),
+        )
+        .await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let (c, c_hits) = stub_upstream(StatusCode::OK, ok_reply("from-c")).await;
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "anthropic"
+base_url = "{b}"
+api_key = "k"
+
+[providers.c]
+spec = "anthropic"
+base_url = "{c}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+strategy = "failover"
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+
+[[routes."claude-sonnet-5".target]]
+provider = "c"
+model = "m-c"
+"#
+        );
+        let gw = Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )));
+        let res = send(gw, "claude-sonnet-5").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(reply_text(res).await, "from-b");
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            c_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the chain stops at the first target that answers"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_across_provider_specs_uses_the_right_path() {
+        // Primary is Anthropic-spec and broken; secondary is OpenAI-spec, so
+        // the retry has to take the *bridge* branch. The translation path is
+        // chosen per attempt, which is what makes cross-spec failover work.
+        let (a, a_hits) = stub_upstream(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"type":"error","error":{"type":"api_error","message":"down"}}),
+        )
+        .await;
+        let stub = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    Json(json!({
+                        "id": "chatcmpl-1", "object": "chat.completion", "model": "m-b",
+                        "choices": [{"index": 0, "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "from-openai"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                    }))
+                }),
+            )
+            .into_make_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "openai"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+strategy = "failover"
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+"#
+        );
+        let gw = Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )));
+        let res = send(gw, "claude-sonnet-5").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(reply_text(res).await, "from-openai");
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn load_balance_single_target_is_target_zero() {
+        // `doctor` warns about a 1-target load-balance route because it is
+        // indistinguishable from `static`; the runtime agrees and is a no-op
+        // rather than a panic on `% 1`.
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "{a}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+strategy = "load-balance"
+"#
+        );
+        let gw = Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )));
+        for _ in 0..3 {
+            assert_eq!(
+                reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+                "from-a"
+            );
+        }
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn is_retryable_ignores_redirect_statuses() {
+        // 3xx is not a target-level failure and not a success; it lands in the
+        // non-retryable bucket, so it is relayed rather than retried.
+        assert!(!is_retryable(StatusCode::MOVED_PERMANENTLY));
+        assert!(!is_retryable(StatusCode::FOUND));
     }
 }

@@ -62,6 +62,211 @@ const SYNC_ROOTS: [&str; 5] = [
 /// Desktop simply will not show a tier badge for it.
 const KNOWN_FAMILIES: [&str; 4] = ["sonnet", "opus", "haiku", "other"];
 
+/// The strategy checks: a route that declares several candidate upstreams.
+///
+/// These are lints, all of them, and the one `Fail` in the set is
+/// `routes-target-provider` — which is not a lint at all, but the third
+/// `config::validate` rule surfacing in the report next to the other two. It is
+/// ordered first because a target naming a provider that does not exist makes
+/// every other finding on the route meaningless: there is nothing to balance
+/// across, and no upstream to name.
+///
+/// The interesting cases are the silent degradations. A `load-balance` route
+/// with one target is *spelled* as a strategy and behaves as `static`; a
+/// `failover` chain whose targets all share one provider survives every failure
+/// except the one it was written for. Neither is an error, and both are worth
+/// saying out loud.
+fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
+    let mut provider_problems = Vec::new();
+    let mut strategy_problems = Vec::new();
+    let mut duplicate_problems = Vec::new();
+    let mut spec_problems = Vec::new();
+    let mut context_problems = Vec::new();
+    let mut failover_problems = Vec::new();
+
+    for (id, route) in &cfg.routes {
+        let targets = route.targets();
+
+        // 1. Every target's provider must exist. `validate` already refuses to
+        // serve such a config, so this repeats its finding in the report the
+        // user actually reads — and it is the only `Fail` here.
+        for (i, t) in route.target.iter().enumerate() {
+            if !cfg.providers.contains_key(&t.provider) {
+                provider_problems.push(format!(
+                    "{id:?} target {i} uses {}/{} — no [providers.{}] block",
+                    t.provider, t.model, t.provider
+                ));
+            }
+        }
+
+        // 2. A strategy with fewer than two targets is indistinguishable from
+        // `static`: there is nothing to balance across and nothing to fail over
+        // to. Not an error — just a strategy that cannot do what it says.
+        if route.strategy != config::Strategy::Static && !route.has_multiple_targets() {
+            strategy_problems.push(format!(
+                "{id:?} is {:?} with 1 target, which behaves exactly like \"static\"",
+                route.strategy.as_str()
+            ));
+        }
+
+        // 3. The same upstream twice in one chain. Harmless under `static`,
+        // but under `load-balance` it silently skews the rotation and under
+        // `failover` a retry lands on the provider that just failed.
+        let mut seen = std::collections::BTreeMap::new();
+        for (i, t) in targets.iter().enumerate() {
+            if let Some(prev) = seen.insert((t.provider.clone(), t.model.clone()), i) {
+                duplicate_problems.push(format!(
+                    "{id:?} lists {}/{} at positions {prev} and {i}",
+                    t.provider, t.model
+                ));
+            }
+        }
+
+        // 4. A chain that mixes wire specs. Legal — the translation path is
+        // chosen per attempt from the target's own spec, which is exactly why
+        // failover across specs works — but it means the same route id streams
+        // through two different code paths depending on which target answered.
+        let mut specs: Vec<&'static str> = Vec::new();
+        for t in &targets {
+            if let Some(p) = cfg.providers.get(&t.provider) {
+                let s = p.spec.as_str();
+                if !specs.contains(&s) {
+                    specs.push(s);
+                }
+            }
+        }
+        if specs.len() > 1 {
+            let mut sorted = specs.clone();
+            sorted.sort_unstable();
+            spec_problems.push(format!("{id:?} mixes {} targets", sorted.join(" and ")));
+        }
+
+        // 5. Mixed context-window declaration under a strategy. `min()` runs
+        // over the targets that declare one, so a silent target is simply not
+        // counted — which is optimistic. The realistic silent target is a local
+        // `ollama-local` with a *larger* window, but that is a guess, and this
+        // warning is what stops it being a silent one.
+        if route.has_multiple_targets() && route.context_tokens.is_none() {
+            let declared = route
+                .target
+                .iter()
+                .filter(|t| t.context_tokens.is_some())
+                .count();
+            if declared != 0 && declared != route.target.len() {
+                context_problems.push(format!(
+                    "{id:?}: {declared} of {} targets declare context_tokens; the rest are \
+                     ignored when computing the advertised window",
+                    route.target.len()
+                ));
+            }
+        }
+
+        // 6. A `failover` chain that does not diversify. Every target behind
+        // one provider means a provider-wide outage — the case failover exists
+        // for — still takes the route down.
+        if route.strategy == config::Strategy::Failover && route.has_multiple_targets() {
+            let mut providers: Vec<&str> =
+                route.target.iter().map(|t| t.provider.as_str()).collect();
+            providers.push(route.provider.as_str());
+            providers.sort_unstable();
+            providers.dedup();
+            if providers.len() == 1 {
+                // Name the targets the way the user wrote them — the per-target
+                // `display_name` is the label that makes a log line or a report
+                // entry identifiable when several targets share a provider.
+                let named: Vec<String> = route
+                    .target
+                    .iter()
+                    .map(|t| match &t.display_name {
+                        Some(d) => format!("{} ({d})", t.model),
+                        None => t.model.clone(),
+                    })
+                    .collect();
+                failover_problems.push(format!(
+                    "{id:?}: all {} targets are on {:?} [{}], so a {0}-wide outage still \
+                     takes the route down",
+                    targets.len(),
+                    providers[0],
+                    named.join(", ")
+                ));
+            }
+        }
+    }
+
+    vec![
+        lint_or_ok(
+            "routes-target-provider",
+            &provider_problems,
+            "a target names a provider that has no `[providers.*]` block — `serve` \
+             refuses this config",
+            "add the missing `[providers.<id>]` block, or point the target at an \
+             existing one",
+            Status::Fail,
+        ),
+        lint_or_ok(
+            "routes-strategy",
+            &strategy_problems,
+            "a strategy route has fewer than 2 targets, so it behaves as `static`",
+            "add a second `[[routes.\"<id>\".target]]` block, or drop the `strategy` key",
+            Status::Warn,
+        ),
+        lint_or_ok(
+            "routes-target-duplicate",
+            &duplicate_problems,
+            "a route lists the same `provider/model` more than once",
+            "remove the duplicate target — under `failover` it retries the provider \
+             that just failed",
+            Status::Warn,
+        ),
+        lint_or_ok(
+            "routes-mixed-spec",
+            &spec_problems,
+            "a route mixes anthropic- and openai-spec targets, so the translation path \
+             changes per request",
+            "this works, but the same route id will stream through two code paths; \
+             keep a chain to one spec unless it is deliberate",
+            Status::Warn,
+        ),
+        lint_or_ok(
+            "routes-context-mixed",
+            &context_problems,
+            "some targets declare `context_tokens` and others do not, so the advertised \
+             window is the minimum over only the declared ones",
+            "declare `context_tokens` on every target, so the minimum is the real one",
+            Status::Warn,
+        ),
+        lint_or_ok(
+            "routes-failover-single-provider",
+            &failover_problems,
+            "a `failover` chain's targets all share one provider, so it does not \
+             diversify",
+            "add a target on a different provider — a provider-wide outage currently \
+             still takes the route down",
+            Status::Warn,
+        ),
+    ]
+}
+
+/// A check that is `Ok` when nothing was collected, and `status` with the
+/// collected lines as its detail when something was.
+///
+/// Every strategy lint has this shape: gather per-route complaints into a
+/// `Vec`, then either say nothing is wrong or report all of them at once. Six
+/// copies of that branch would be six places to get the detail formatting
+/// subtly different.
+fn lint_or_ok(id: &str, problems: &[String], summary: &str, fix: &str, status: Status) -> Check {
+    if problems.is_empty() {
+        return Check::ok(id, "nothing to flag");
+    }
+    let summary = format!("{} — {summary}", problems.len());
+    let mut check = match status {
+        Status::Fail => Check::fail(id, summary, fix),
+        _ => Check::warn(id, summary, fix),
+    };
+    check = check.with_detail(problems.join("\n"));
+    check
+}
+
 /// How a check came out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -165,7 +370,7 @@ pub struct DoctorOptions {
 /// build), and the constant is the thing it asserts against. `cargo build` sees
 /// no reader; the test profile does.
 #[allow(dead_code)]
-pub const CHECK_IDS: [&str; 20] = [
+pub const CHECK_IDS: [&str; 26] = [
     "config-found",
     "config-parse",
     "validate",
@@ -179,6 +384,12 @@ pub const CHECK_IDS: [&str; 20] = [
     "listen-addr",
     "search-config",
     "routes-shape",
+    "routes-target-provider",
+    "routes-strategy",
+    "routes-target-duplicate",
+    "routes-mixed-spec",
+    "routes-context-mixed",
+    "routes-failover-single-provider",
     "base-url-shape",
     "config-perms",
     "backups",
@@ -657,6 +868,12 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
             "listen-addr",
             "search-config",
             "routes-shape",
+            "routes-target-provider",
+            "routes-strategy",
+            "routes-target-duplicate",
+            "routes-mixed-spec",
+            "routes-context-mixed",
+            "routes-failover-single-provider",
             "base-url-shape",
         ] {
             checks.push(Check::skip(id, "skipped — the config did not parse"));
@@ -743,6 +960,8 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
             .with_detail(problems.join("\n")),
         );
     }
+
+    checks.extend(route_strategy_checks(cfg));
 
     // base_url: parseable, and an anthropic-spec one that ends in /v1 is almost
     // certainly a paste from an SDK snippet — turnpike appends the request path
@@ -1744,6 +1963,232 @@ model = "same"
             r.detail.as_deref().unwrap().contains("both point at"),
             "{r:?}"
         );
+    }
+
+    /// Two providers, so a chain can be built that does or does not diversify.
+    const TWO_PROVIDERS: &str = r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[providers.local]
+spec = "openai"
+base_url = "http://127.0.0.1:11434/v1"
+api_key = "k"
+"#;
+
+    fn strategy_route(strategy: &str, targets: &str) -> String {
+        format!(
+            r#"{TWO_PROVIDERS}
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "primary"
+strategy = "{strategy}"
+{targets}
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_target_on_an_unknown_provider_is_a_failure() {
+        // The third `config::validate` rule, surfacing in the report as a `Fail`
+        // rather than a `Warn`: the gateway cannot serve this config at all.
+        let raw = strategy_route(
+            "failover",
+            r#"
+[[routes."claude-sonnet-5".target]]
+provider = "ghost"
+model = "secondary"
+"#,
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-target-provider")
+            .unwrap();
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.as_deref().unwrap().contains("ghost"), "{c:?}");
+        // And `validate` independently refused it, so the two never disagree.
+        let v = checks.iter().find(|c| c.id == "validate").unwrap();
+        assert_eq!(v.status, Status::Fail);
+    }
+
+    #[tokio::test]
+    async fn a_strategy_with_one_target_warns() {
+        // `load-balance` spelled over a single target is indistinguishable from
+        // `static` — nothing to balance across.
+        let raw = strategy_route("load-balance", "");
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks.iter().find(|c| c.id == "routes-strategy").unwrap();
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.as_deref().unwrap().contains("1 target"), "{c:?}");
+    }
+
+    #[tokio::test]
+    async fn a_strategy_with_two_targets_does_not_warn() {
+        // The negative half: the same config with a real second target is fine,
+        // so the check is not simply always-on.
+        let raw = strategy_route(
+            "load-balance",
+            r#"
+[[routes."claude-sonnet-5".target]]
+provider = "local"
+model = "secondary"
+"#,
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks.iter().find(|c| c.id == "routes-strategy").unwrap();
+        assert_eq!(c.status, Status::Ok, "{c:?}");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_target_is_reported() {
+        // The route's own flat pair is target 0, so a `target` block repeating
+        // it is the duplicate — which the old `routes-shape` check cannot see,
+        // because it only ever compared distinct routes.
+        let raw = strategy_route(
+            "load-balance",
+            r#"
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "primary"
+"#,
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-target-duplicate")
+            .unwrap();
+        assert_eq!(c.status, Status::Warn);
+        let detail = c.detail.as_deref().unwrap();
+        assert!(detail.contains("positions 0 and 1"), "{c:?}");
+    }
+
+    #[tokio::test]
+    async fn a_chain_mixing_wire_specs_is_reported() {
+        // `zen` is anthropic-spec, `local` is openai-spec: legal, and the reason
+        // failover across specs works, but the route streams through two code
+        // paths. `routes-shape` says nothing about this.
+        let raw = strategy_route(
+            "failover",
+            r#"
+[[routes."claude-sonnet-5".target]]
+provider = "local"
+model = "secondary"
+"#,
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks.iter().find(|c| c.id == "routes-mixed-spec").unwrap();
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.detail
+                .as_deref()
+                .unwrap()
+                .contains("anthropic and openai"),
+            "{c:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partly_declared_context_window_is_reported() {
+        // The route itself declares nothing, one declared target and one silent
+        // target — so `effective_context_tokens` takes the minimum over the
+        // declared one only, ignoring the silent one entirely. The warning is
+        // what stops the silent target from being silently uncounted.
+        //
+        // The route field has to stay absent: setting it would make
+        // `effective_context_tokens` return it outright and short-circuit the
+        // whole computation (rule 1), which is exactly what this check is not
+        // about.
+        let raw = strategy_route(
+            "load-balance",
+            r#"
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "declared"
+context_tokens = 128000
+
+[[routes."claude-sonnet-5".target]]
+provider = "local"
+model = "silent"
+"#,
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-context-mixed")
+            .unwrap();
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.as_deref().unwrap().contains("1 of 2"), "{c:?}");
+
+        // And when every target declares one, the check goes quiet.
+        let raw = strategy_route(
+            "load-balance",
+            r#"
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "declared"
+context_tokens = 128000
+
+[[routes."claude-sonnet-5".target]]
+provider = "local"
+model = "also-declared"
+context_tokens = 64000
+"#,
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-context-mixed")
+            .unwrap();
+        assert_eq!(c.status, Status::Ok, "{c:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failover_chain_on_one_provider_is_reported() {
+        // Every target behind `zen`: a zen-wide outage still takes the route
+        // down, which is the one failure failover was written for.
+        let raw = strategy_route(
+            "failover",
+            r#"
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "secondary"
+"#,
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-failover-single-provider")
+            .unwrap();
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.as_deref().unwrap().contains("zen"), "{c:?}");
+
+        // A second provider is what silences it.
+        let raw = strategy_route(
+            "failover",
+            r#"
+[[routes."claude-sonnet-5".target]]
+provider = "local"
+model = "secondary"
+"#,
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-failover-single-provider")
+            .unwrap();
+        assert_eq!(c.status, Status::Ok, "{c:?}");
     }
 
     #[tokio::test]

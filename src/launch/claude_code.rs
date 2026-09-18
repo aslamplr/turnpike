@@ -96,17 +96,20 @@ impl ClaudeCode {
         // For cloud-backed models, auto-compaction should use the route's real
         // context budget when we know it. `model` may be a route id or an
         // upstream model id targeted by a route — find either.
-        if let Some(route) = config
-            .routes
-            .get(model)
-            .or_else(|| config.routes.values().find(|r| r.model == model))
-        {
+        if let Some(route) = config.routes.get(model).or_else(|| {
+            config
+                .routes
+                .values()
+                .find(|r| r.targets().iter().any(|t| t.model == model))
+        }) {
             if let Some(max) = route.max_tokens {
                 env.push(("CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(), max.to_string()));
             }
             // Non-catalog models make Claude Code guess a 200k window; hand
-            // over the real one when the route declares it.
-            if let Some(ctx) = route.context_tokens {
+            // over the real one — the route's own field, or the minimum over
+            // a strategy route's targets, whichever `effective_context_tokens`
+            // says the route actually advertises.
+            if let Some(ctx) = crate::config::effective_context_tokens(route) {
                 env.push(("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(), ctx.to_string()));
             }
         }

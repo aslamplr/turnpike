@@ -78,7 +78,34 @@ cargo test        # inline #[cfg(test)] modules per file
   choke point for Exa and SearXNG in `src/search/mod.rs`) — web content can carry prompt injection.
 - **Model resolution** (`Config::resolve()`): exact route id → route whose upstream model matches
   (ids containing `/` or `:` resolve here, before the provider split) → `provider/model` or
-  `provider:model`.
+  `provider:model`. **`resolve()` stays pure** — `&self`, no I/O, no state — and always answers
+  target 0. "Which target serves *this* request, right now?" is stateful and request-scoped, so it
+  lives on `Gateway` (`select_target`); folding the two would make the launcher and `/v1/models`
+  advance round-robin counters, and "what does this name mean" would stop being deterministic.
+- **Per-route targets** (`docs/routing.md`): a route's flat `provider`/`model` is **target 0**, and
+  `[[routes.<id>.target]]` adds 1..N behind a `strategy` — `static` (default), `load-balance`
+  (round-robin), `failover` (in order). `RouteCfg::targets()` is the single definition of "what can
+  serve this route", read by resolution, selection, the catalog detail, and `doctor`. Rule 2 of
+  resolution scans the **whole target chain**, not the flat `model`, or a request for a target's
+  upstream id would silently stop resolving. Round-robin counters are keyed by **route id, not
+  index** (`routes` is a `BTreeMap`, so iteration is alphabetical) and built **once** in
+  `Gateway::new` — a per-request map degenerates to "always target 0".
+- **Failover is pre-first-byte only.** Once the first SSE byte reaches the client the response is
+  committed; buffering to allow mid-stream failover would cost streaming latency on every request
+  to such a route. Failover covers the **first upstream contact** only — `bridge()` re-sends the
+  same target each loop iteration, so a mid-loop failure stays a hard error. It covers *fails*, not
+  *is slow* (no first-byte timeout).
+- **Retryable = a property of the target, not the request.** One predicate, `is_retryable`:
+  transport errors, `429`, and `5xx` retry; `400`/`422` never do, because retrying the request class
+  multiplies latency and returns the same error. `classify()` must call it on the **raw**
+  `reqwest::Response`, before anything converts a non-2xx into a client error, or 5xx failover
+  silently no-ops while a `429`-only test still passes. A `401` therefore does **not** fail over
+  today (the allowlist is deferred) — `doctor`'s `key-resolvable` is how a dead primary key still
+  gets noticed. When every target fails, the client gets the **first** target's error.
+- **Context window** (`effective_context_tokens()`): the route's own `context_tokens`, if set, wins
+  outright (the explicit static override); `static` routes advertise exactly that field, unchanged;
+  an active strategy takes `min()` over the targets that declare one, falling back to the route
+  field when none do.
 - **Key precedence is env > store > inline**, implemented once as the *pure* `secrets::resolve_chain`
   (no env reads, no I/O — that is what makes it testable without mutating the environment). An
   unreadable store never errors a lookup; it degrades to env/inline with a warning, because a
@@ -87,8 +114,8 @@ cargo test        # inline #[cfg(test)] modules per file
 - **stdout is program output; stderr is diagnostics.** Prompts go through `setup::prompt` only,
   everything else through `tracing`. A prompt sharing a descriptor with an `INFO` is how a wizard
   becomes unusable under `RUST_LOG=debug`.
-- **`Fail` vs `Warn` in `doctor`**: `Fail` means the gateway cannot serve the config at all — the two
-  `config::validate` rules and nothing more. Everything else is a lint → `Warn`. Do not widen
+- **`Fail` vs `Warn` in `doctor`**: `Fail` means the gateway cannot serve the config at all — the
+  three `config::validate` rules and nothing more. Everything else is a lint → `Warn`. Do not widen
   `validate` to cover a lint; it breaks working configs.
 
 ## Documentation

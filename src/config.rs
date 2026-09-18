@@ -130,6 +130,52 @@ impl ProviderCfg {
     }
 }
 
+/// One candidate upstream for a route.
+///
+/// A route with no `[[routes.<id>.target]]` array is a target list of length
+/// one — its own `provider`/`model` — so this type is only ever *written* by
+/// users who want more than one upstream. See [`RouteCfg::targets`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct TargetCfg {
+    pub provider: String,
+    /// Model id sent upstream after remapping.
+    pub model: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// This target's real context window, if known. Feeds the route-level
+    /// minimum under a strategy; see [`effective_context_tokens`].
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
+}
+
+/// How a route chooses among its targets, one per request.
+///
+/// An unknown value is a **parse error**, not a silent fallback to `Static`: a
+/// typo'd `strategy = "failoverr"` must not quietly turn failover off, because
+/// the config would then look correct and behave as if the feature were absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Strategy {
+    /// Target 0, every request. What a route with no `strategy` key means.
+    #[default]
+    Static,
+    /// Round-robin across targets, one per request.
+    LoadBalance,
+    /// Try targets in order; on a retryable failure, move to the next.
+    Failover,
+}
+
+impl Strategy {
+    /// Stable lowercase id, as `doctor` and `turnpike routes` render it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Strategy::Static => "static",
+            Strategy::LoadBalance => "load-balance",
+            Strategy::Failover => "failover",
+        }
+    }
+}
+
 /// One client-facing model route: `<id> -> provider/model`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouteCfg {
@@ -145,11 +191,77 @@ pub struct RouteCfg {
     /// Real context window of the upstream model in tokens, if known. The
     /// launcher surfaces it as CLAUDE_CODE_MAX_CONTEXT_TOKENS for models
     /// Claude Code doesn't have in its catalog.
+    ///
+    /// When set, this value wins outright over anything computed from targets —
+    /// it is the explicit static override, and a computed minimum that could
+    /// beat it would leave no way to force a window.
     #[serde(default)]
     pub context_tokens: Option<u64>,
     /// Optional Claude family tier shown in Claude Desktop's picker.
     #[serde(default)]
     pub family: Option<String>,
+    /// Selection policy across [`RouteCfg::targets`]. Defaults to `Static`.
+    #[serde(default)]
+    pub strategy: Strategy,
+    /// Extra candidate upstreams, in declaration order. Target 0 is always the
+    /// route's own `provider`/`model`; this array holds targets 1..n.
+    #[serde(default)]
+    pub target: Vec<TargetCfg>,
+}
+
+impl RouteCfg {
+    /// The route's candidate targets, in order: its own provider/model first,
+    /// then any declared `[[…target]]` blocks.
+    ///
+    /// The single definition of "what can serve this route", shared by
+    /// resolution, selection, the catalog detail, and the wizard's list view —
+    /// so a static route and an N-target route cannot drift apart.
+    pub fn targets(&self) -> Vec<TargetCfg> {
+        let mut out = Vec::with_capacity(1 + self.target.len());
+        out.push(TargetCfg {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            display_name: self.display_name.clone(),
+            context_tokens: self.context_tokens,
+        });
+        out.extend(self.target.iter().cloned());
+        out
+    }
+
+    /// True when the route declares more than one candidate upstream.
+    pub fn has_multiple_targets(&self) -> bool {
+        !self.target.is_empty()
+    }
+}
+
+/// The context window a route advertises to launchers.
+///
+/// Order of resolution, and the order is the design:
+///   1. the route's own `context_tokens`, if the user set one → wins outright;
+///   2. `static` → that same field, unchanged, so adding targets to a route
+///      cannot change what a static route advertises;
+///   3. a strategy is active → the minimum over targets that declare one,
+///      falling back to the route field when none do.
+///
+/// Mixed declaration (some targets declare a window, others don't) takes the
+/// minimum over the declared ones. That is optimistic — a silent target may
+/// have a smaller window than the advertised minimum — but the realistic silent
+/// target is a local `ollama-local`, which has a *larger* window, not a
+/// smaller. `doctor`'s `routes-context-mixed` check is what keeps the
+/// optimistic default from being a silent one.
+pub fn effective_context_tokens(route: &RouteCfg) -> Option<u64> {
+    if route.context_tokens.is_some() {
+        return route.context_tokens;
+    }
+    if route.strategy == Strategy::Static {
+        return None;
+    }
+    route
+        .target
+        .iter()
+        .filter_map(|t| t.context_tokens)
+        .min()
+        .or(route.context_tokens)
 }
 
 /// Agentic middleware: server-side execution of built-in tools (web search).
@@ -271,6 +383,20 @@ pub struct Resolved {
     pub upstream_model: String,
 }
 
+/// A route's full candidate list, before a target is chosen for a request.
+///
+/// Deliberately *not* what [`Config::resolve`] returns: `resolve` answers "what
+/// does this name mean", which the launcher and `/v1/models` need to stay
+/// deterministic; picking a target is request-scoped and stateful, and belongs
+/// to the gateway (`proxy::Gateway::select_target`).
+#[derive(Debug, Clone)]
+pub struct RouteResolution {
+    pub route_id: String,
+    /// Targets in order. Target 0 is always the route's flat `provider`/`model`.
+    pub targets: Vec<Resolved>,
+    pub strategy: Strategy,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
 pub enum ResolveError {
@@ -283,47 +409,52 @@ pub enum ResolveError {
 impl Config {
     /// Resolve a client-requested model to a provider + upstream model.
     ///
-    /// Matching rules, in order:
-    ///   1. exact route id        ("claude-sonnet-5")
-    ///   2. explicit provider/model ("zen/claude-sonnet-4-5")
-    ///   3. route target match    (requesting the upstream id directly works too)
+    /// Pure, and unchanged by routing strategies: always target 0 of whatever
+    /// [`Config::resolve_route`] finds, which for a static route is the only
+    /// target. Callers that need the candidate list or the policy want
+    /// `resolve_route`.
     pub fn resolve(&self, requested: &str) -> Result<Resolved, ResolveError> {
+        Ok(self
+            .resolve_route(requested)?
+            .targets
+            .into_iter()
+            .next()
+            .expect("resolve_route always yields at least one target"))
+    }
+
+    /// Resolve a client-requested model to its full candidate list and policy.
+    ///
+    /// Pure: `&self`, no I/O, no counters. Matching rules, in order:
+    ///   1. exact route id         ("claude-sonnet-5")
+    ///   2. any route targeting that upstream model id
+    ///   3. explicit provider/model ("zen/claude-sonnet-4-5")
+    ///
+    /// Rule 2 is why this must scan *targets* rather than the route's flat
+    /// `model`: a Claude Code env var pointing at `qwen3.8` addresses a real
+    /// target, and under a multi-target schema comparing the flat field alone
+    /// would silently stop resolving it.
+    pub fn resolve_route(&self, requested: &str) -> Result<RouteResolution, ResolveError> {
         let requested = requested.trim();
         if requested.is_empty() {
             return Err(ResolveError::Unknown(requested.to_string()));
         }
 
         if let Some(route) = self.routes.get(requested) {
-            let provider_cfg = self
-                .providers
-                .get(&route.provider)
-                .ok_or_else(|| ResolveError::UnknownProvider(route.provider.clone()))?;
-            return Ok(Resolved {
-                provider: route.provider.clone(),
-                provider_cfg: provider_cfg.clone(),
-                upstream_model: route.model.clone(),
-            });
+            return self.resolution_for(requested, route);
         }
 
-        // Allow addressing the upstream model id directly via any route that
+        // Allow addressing an upstream model id directly via any route that
         // targets it (useful for Claude Code env vars pointing at real ids).
         // Checked before provider/model splitting so ids that themselves
         // contain '/' or ':' (e.g. "openai/gpt-5") still resolve.
-        for route in self.routes.values() {
-            if route.model == requested {
-                let provider_cfg = self
-                    .providers
-                    .get(&route.provider)
-                    .ok_or_else(|| ResolveError::UnknownProvider(route.provider.clone()))?;
-                return Ok(Resolved {
-                    provider: route.provider.clone(),
-                    provider_cfg: provider_cfg.clone(),
-                    upstream_model: route.model.clone(),
-                });
+        for (id, route) in &self.routes {
+            if route.targets().iter().any(|t| t.model == requested) {
+                return self.resolution_for(id, route);
             }
         }
 
-        // provider/model (or provider:model) explicit routing
+        // provider/model (or provider:model) explicit routing: no route owns
+        // this name, so it is a single-target static resolution.
         let (prov, model) = if let Some((p, m)) = requested.split_once('/') {
             (p, m)
         } else if let Some((p, m)) = requested.split_once(':') {
@@ -333,16 +464,42 @@ impl Config {
         };
         if !prov.is_empty() {
             if let Some(provider_cfg) = self.providers.get(prov) {
-                return Ok(Resolved {
-                    provider: prov.to_string(),
-                    provider_cfg: provider_cfg.clone(),
-                    upstream_model: model.to_string(),
+                return Ok(RouteResolution {
+                    route_id: requested.to_string(),
+                    targets: vec![Resolved {
+                        provider: prov.to_string(),
+                        provider_cfg: provider_cfg.clone(),
+                        upstream_model: model.to_string(),
+                    }],
+                    strategy: Strategy::Static,
                 });
             }
             return Err(ResolveError::UnknownProvider(prov.to_string()));
         }
 
         Err(ResolveError::Unknown(requested.to_string()))
+    }
+
+    /// Expand one route into its candidate list, resolving each target's
+    /// provider config.
+    fn resolution_for(&self, id: &str, route: &RouteCfg) -> Result<RouteResolution, ResolveError> {
+        let mut targets = Vec::new();
+        for t in route.targets() {
+            let provider_cfg = self
+                .providers
+                .get(&t.provider)
+                .ok_or_else(|| ResolveError::UnknownProvider(t.provider.clone()))?;
+            targets.push(Resolved {
+                provider: t.provider.clone(),
+                provider_cfg: provider_cfg.clone(),
+                upstream_model: t.model.clone(),
+            });
+        }
+        Ok(RouteResolution {
+            route_id: id.to_string(),
+            targets,
+            strategy: route.strategy,
+        })
     }
 
     /// Route id launchers default to when no --model is given: the
@@ -419,10 +576,15 @@ pub fn load_from_str(raw: &str) -> Result<Config> {
 
 /// The rules that make a config unusable, as opposed to merely unwise.
 ///
-/// Deliberately just these two. Everything else `doctor` could object to
-/// (unknown family tiers, odd token counts, a `/v1` suffix on an anthropic
-/// base_url) is a lint, and raising it here would break configs that work
-/// today — a worse outcome than a warning.
+/// Deliberately just these: everything else `doctor` could object to (unknown
+/// family tiers, odd token counts, a `/v1` suffix on an anthropic base_url, a
+/// strategy route with one target) is a lint, and raising it here would break
+/// configs that work today — a worse outcome than a warning.
+///
+/// The target rule earns its place because it is the *same* impossibility as
+/// the route rule: `[providers]` is the only source of a spec and base_url, so
+/// a route — or a target within one — naming a provider that isn't there
+/// cannot be served at all, by any request.
 pub(crate) fn validate(cfg: &Config) -> Result<()> {
     if cfg.providers.is_empty() {
         anyhow::bail!("config defines no [providers.*]");
@@ -433,6 +595,14 @@ pub(crate) fn validate(cfg: &Config) -> Result<()> {
                 "route {id:?} references unknown provider {:?}",
                 route.provider
             );
+        }
+        for (i, target) in route.target.iter().enumerate() {
+            if !cfg.providers.contains_key(&target.provider) {
+                anyhow::bail!(
+                    "route {id:?} target {i} references unknown provider {:?}",
+                    target.provider
+                );
+            }
         }
     }
     Ok(())
@@ -613,6 +783,8 @@ model = "openai/gpt-5"
                 max_tokens: None,
                 context_tokens: None,
                 family: Some("opus".into()),
+                strategy: Strategy::Static,
+                target: Vec::new(),
             },
         );
         // Alphabetical order would pick claude-sonnet-5 here; add a haiku
@@ -627,6 +799,8 @@ model = "openai/gpt-5"
                 max_tokens: None,
                 context_tokens: None,
                 family: Some("haiku".into()),
+                strategy: Strategy::Static,
+                target: Vec::new(),
             },
         );
         // Give the sonnet route its family tier (test_config leaves it unset).
@@ -735,6 +909,370 @@ model = "claude-sonnet-4-5"
         // The same document with a provider that exists validates.
         let good = bad.replace("ghost", "zen");
         assert!(load_from_str(&good).is_ok());
+    }
+
+    // --- per-route targets -------------------------------------------------
+
+    fn multi_target_config() -> Config {
+        toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "test-key"
+
+[providers.ollama]
+spec = "openai"
+base_url = "http://127.0.0.1:11434"
+
+[providers.lms]
+spec = "openai"
+base_url = "http://127.0.0.1:1234"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "deepseek-v4-flash"
+strategy = "load-balance"
+context_tokens = 200000
+
+[[routes."claude-sonnet-5".target]]
+provider = "ollama"
+model = "qwen3.8"
+context_tokens = 32000
+
+[[routes."claude-sonnet-5".target]]
+provider = "lms"
+model = "gemma3:27b"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn route_with_no_target_is_a_single_implicit_target() {
+        // The compatibility guarantee, at the `targets()` level: a route that
+        // declares nothing is a list of one, and that one is the flat pair.
+        let cfg = test_config();
+        let route = &cfg.routes["claude-sonnet-5"];
+        let targets = route.targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].provider, "zen");
+        assert_eq!(targets[0].model, "claude-sonnet-4-5");
+        assert!(!route.has_multiple_targets());
+        assert_eq!(route.strategy, Strategy::Static);
+    }
+
+    #[test]
+    fn declare_nothing_parses_as_static() {
+        // No `strategy` key at all — the overwhelmingly common case, and the
+        // one that must keep meaning what it meant before this feature.
+        let cfg = test_config();
+        assert_eq!(cfg.routes["gpt"].strategy, Strategy::Static);
+        assert!(cfg.routes["gpt"].target.is_empty());
+    }
+
+    #[test]
+    fn route_targets_put_the_flat_pair_first() {
+        // Target 0 is synthesized, not declared: users write targets 1..n.
+        let cfg = multi_target_config();
+        let targets = cfg.routes["claude-sonnet-5"].targets();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].provider, "zen");
+        assert_eq!(targets[0].model, "deepseek-v4-flash");
+        assert_eq!(targets[1].provider, "ollama");
+        assert_eq!(targets[2].provider, "lms");
+    }
+
+    #[test]
+    fn resolve_route_returns_the_whole_chain_and_the_policy() {
+        let cfg = multi_target_config();
+        let res = cfg.resolve_route("claude-sonnet-5").unwrap();
+        assert_eq!(res.route_id, "claude-sonnet-5");
+        assert_eq!(res.strategy, Strategy::LoadBalance);
+        assert_eq!(res.targets.len(), 3);
+        assert_eq!(res.targets[2].provider, "lms");
+        assert_eq!(res.targets[2].upstream_model, "gemma3:27b");
+        // Provider configs are resolved per target, so a mid-chain provider
+        // that does not exist is caught at resolve time, not at send time.
+        assert_eq!(res.targets[1].provider_cfg.spec, Spec::Openai);
+    }
+
+    #[test]
+    fn resolve_still_returns_target_zero_for_static() {
+        // The other half of the compatibility guarantee: `resolve()`'s
+        // signature and answer are unchanged by any of this.
+        let cfg = multi_target_config();
+        let r = cfg.resolve("claude-sonnet-5").unwrap();
+        assert_eq!(r.provider, "zen");
+        assert_eq!(r.upstream_model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn resolve_route_scans_target_models() {
+        // The backward-compat trap. Rule 2 ("address an upstream model id
+        // directly") compared only the route's flat `model`; under a targets
+        // schema that would silently stop resolving `qwen3.8`, which is a real
+        // target of a real route.
+        let cfg = multi_target_config();
+        let res = cfg.resolve_route("qwen3.8").unwrap();
+        assert_eq!(res.route_id, "claude-sonnet-5");
+        assert_eq!(res.targets.len(), 3);
+        // ...and `resolve()` inherits the fix, answering target 0 as before.
+        assert_eq!(cfg.resolve("qwen3.8").unwrap().provider, "zen");
+
+        // A declared target id is reachable too — the scan runs over
+        // `targets()`, not the raw `target` array. And `resolve()` still
+        // answers target 0: which name *matched* is independent of which
+        // target *serves*, which is the whole reason the two are separate.
+        assert_eq!(cfg.resolve("gemma3:27b").unwrap().provider, "zen");
+        assert_eq!(
+            cfg.resolve("gemma3:27b").unwrap().upstream_model,
+            "deepseek-v4-flash"
+        );
+    }
+
+    #[test]
+    fn unknown_strategy_value_is_a_parse_error() {
+        // A typo'd strategy must not quietly mean `static`: the config would
+        // look correct and behave as if the feature were absent, which is the
+        // worst available failure mode here.
+        let bad = r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "claude-sonnet-4-5"
+strategy = "failoverr"
+"#;
+        let err = toml::from_str::<Config>(bad).unwrap_err().to_string();
+        assert!(
+            err.contains("failoverr") || err.contains("unknown variant"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn strategy_values_are_kebab_case() {
+        // Keys snake_case, values hyphenated — `load-balance`, not
+        // `load_balance`, matching every other value namespace in the file.
+        let doc = |s: &str| {
+            format!(
+                r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "claude-sonnet-4-5"
+strategy = "{s}"
+"#
+            )
+        };
+        assert_eq!(
+            toml::from_str::<Config>(&doc("load-balance"))
+                .unwrap()
+                .routes["claude-sonnet-5"]
+                .strategy,
+            Strategy::LoadBalance
+        );
+        assert_eq!(
+            toml::from_str::<Config>(&doc("failover")).unwrap().routes["claude-sonnet-5"].strategy,
+            Strategy::Failover
+        );
+        assert!(toml::from_str::<Config>(&doc("load_balance")).is_err());
+        assert_eq!(Strategy::default(), Strategy::Static);
+        assert_eq!(Strategy::LoadBalance.as_str(), "load-balance");
+    }
+
+    #[test]
+    fn validate_rejects_target_with_unknown_provider() {
+        // The third rule, and the only widening. A target naming a provider
+        // that is not in `[providers]` is a serve-time impossibility for every
+        // request, exactly like the route-level rule — so it belongs here
+        // rather than in `doctor`'s lints.
+        let bad = r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "claude-sonnet-4-5"
+
+[[routes."claude-sonnet-5".target]]
+provider = "ghost"
+model = "qwen3.8"
+"#;
+        let err = load_from_str(bad).unwrap_err().to_string();
+        // Names the route *and* the position, so an N-target chain is fixable
+        // without counting by hand.
+        assert!(err.contains("claude-sonnet-5"), "{err}");
+        assert!(err.contains("target 0"), "{err}");
+        assert!(err.contains("ghost"), "{err}");
+
+        let good = bad.replace("ghost", "zen");
+        assert!(load_from_str(&good).is_ok());
+    }
+
+    #[test]
+    fn effective_context_tokens_route_field_wins() {
+        // Step 1: the explicit override beats anything computed. If a computed
+        // minimum could win, there would be no way to force a window.
+        let cfg = multi_target_config();
+        let route = &cfg.routes["claude-sonnet-5"];
+        assert_eq!(route.context_tokens, Some(200_000));
+        assert_eq!(effective_context_tokens(route), Some(200_000));
+    }
+
+    #[test]
+    fn effective_context_tokens_is_none_for_a_static_route_without_one() {
+        // Step 2: `static` means today's behavior, exactly — an unset field
+        // stays unset, so the launcher sets no CLAUDE_CODE_MAX_CONTEXT_TOKENS.
+        let cfg = test_config();
+        assert_eq!(
+            effective_context_tokens(&cfg.routes["claude-sonnet-5"]),
+            None
+        );
+    }
+
+    #[test]
+    fn effective_context_tokens_is_min_over_declaring_targets() {
+        // Step 3, without the route-level override: 32000 wins over the 64000
+        // that `lms` declares, and the undeclared one is ignored.
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[providers.ollama]
+spec = "openai"
+base_url = "http://127.0.0.1:11434"
+
+[providers.lms]
+spec = "openai"
+base_url = "http://127.0.0.1:1234"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "deepseek-v4-flash"
+strategy = "failover"
+
+[[routes."claude-sonnet-5".target]]
+provider = "ollama"
+model = "qwen3.8"
+context_tokens = 32000
+
+[[routes."claude-sonnet-5".target]]
+provider = "lms"
+model = "gemma3:27b"
+context_tokens = 64000
+"#,
+        )
+        .unwrap();
+        let route = &cfg.routes["claude-sonnet-5"];
+        assert_eq!(route.context_tokens, None);
+        assert_eq!(effective_context_tokens(route), Some(32_000));
+    }
+
+    #[test]
+    fn effective_context_tokens_ignores_route_field_when_a_strategy_is_static() {
+        // The subtle one: under `static`, targets exist in the document but
+        // only target 0 can ever serve a request, so computing a minimum over
+        // the whole chain would advertise something no request can reach.
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[providers.ollama]
+spec = "openai"
+base_url = "http://127.0.0.1:11434"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "deepseek-v4-flash"
+strategy = "static"
+
+[[routes."claude-sonnet-5".target]]
+provider = "ollama"
+model = "qwen3.8"
+context_tokens = 32000
+"#,
+        )
+        .unwrap();
+        let route = &cfg.routes["claude-sonnet-5"];
+        assert_eq!(effective_context_tokens(route), None);
+    }
+
+    #[test]
+    fn effective_context_tokens_falls_back_when_no_target_declares_one() {
+        // Step 3's `else`: a strategy route where nothing declares a window
+        // advertises nothing, same as a static one.
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[providers.ollama]
+spec = "openai"
+base_url = "http://127.0.0.1:11434"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "deepseek-v4-flash"
+strategy = "failover"
+
+[[routes."claude-sonnet-5".target]]
+provider = "ollama"
+model = "qwen3.8"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            effective_context_tokens(&cfg.routes["claude-sonnet-5"]),
+            None
+        );
+    }
+
+    #[test]
+    fn effective_context_tokens_min_spans_chain_and_route_field() {
+        // Mixed declaration: the route field is *also* weight in the minimum,
+        // because target 0's window is the route field. So 160000 beats the
+        // 32000 that target 1 declares? No — min() takes the smaller, which
+        // makes the chain the binding constraint. Both directions asserted.
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[providers.ollama]
+spec = "openai"
+base_url = "http://127.0.0.1:11434"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "deepseek-v4-flash"
+strategy = "failover"
+context_tokens = 160000
+
+[[routes."claude-sonnet-5".target]]
+provider = "ollama"
+model = "qwen3.8"
+context_tokens = 32000
+"#,
+        )
+        .unwrap();
+        let route = &cfg.routes["claude-sonnet-5"];
+        // The route field is `Some`, so step 1 returns it outright — the
+        // override is unconditional, which is what makes it an override.
+        assert_eq!(effective_context_tokens(route), Some(160_000));
     }
 
     #[test]
