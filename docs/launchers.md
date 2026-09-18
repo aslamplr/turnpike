@@ -146,19 +146,44 @@ profile is picked up in place). Older turnpike builds wrote `turnpike.json`, whi
 Claude Desktop ignores — that file is **migrated out of configLibrary** on the
 next configure run.
 
-Config roots are discovered in platform order:
+Config roots come in two kinds, mirroring Ollama's `claudeDesktopTargets`:
 
-| Platform | Candidates (first existing wins) |
-| --- | --- |
-| macOS | `~/Library/Application Support/Claude-3p`, then `Claude` |
-| Windows | `%LOCALAPPDATA%` `Claude-3p`, `Claude Nest-3p`, `Claude`, `Claude Nest` |
+| Platform | Third-party roots | Normal roots |
+| --- | --- | --- |
+| macOS | `~/Library/Application Support/Claude-3p` | `~/Library/Application Support/Claude` |
+| Windows | `%LOCALAPPDATA%` `Claude-3p`, `Claude Nest-3p` | `%LOCALAPPDATA%` `Claude`, `Claude Nest` |
 
-If none exist (a fresh install), the *first* candidate is used so
-`--install`-style flows can create it; on unsupported platforms `supported()`
-is false and `configure` bails. The profile lives at
-`configLibrary/<uuid>.json`, with `_meta.json` beside it, and pre-turnpike
-snapshots go to `<root>/turnpike-backups/` — *outside* configLibrary, so
-Claude Desktop never scans the backups as profiles.
+A **third-party** root gets the gateway *profile* (`configLibrary/<uuid>.json`
+plus its `_meta.json` entry); a **normal** root does not. Both kinds get the
+`deploymentMode` flip below.
+
+The *profile* goes to the first candidate that exists, or the first candidate
+when none do, so `--install`-style flows can create it; on unsupported platforms
+`supported()` is false and `configure` bails. Pre-turnpike snapshots go to
+`<root>/turnpike-backups/` — *outside* configLibrary, so Claude Desktop never
+scans the backups as profiles.
+
+### `deploymentMode`: the profile alone does nothing
+
+Beside configLibrary (not inside it — it is *app state*, not a profile) sits
+`claude_desktop_config.json`, carrying **`deploymentMode`**: `"1p"` for Claude
+Desktop's first-party API, `"3p"` for a third-party inference provider. Claude
+Desktop ships on `"1p"`, and a gateway profile written while it stays there has
+**no effect at all** — the app never looks at configLibrary. This is the file
+Ollama's app flips, and it is the piece turnpike originally missed.
+
+So `configure` flips it to `"3p"` on **every** candidate root that exists, not
+only the one receiving the profile — the root Claude Desktop actually reads
+varies by build and by how the user enabled third-party inference, and a root
+left on `"1p"` silently wins if the app reads *it*. A root that is not installed
+is skipped: turnpike does not create an app-state file for an install that
+isn't there. The read-modify-write preserves unrelated app state, and each flip
+snapshots first (same skip rules as the profile), so `--restore` is a real undo.
+
+`deployment_mode()` returns `None` for an **absent** key, which is deliberately
+*not* the same as an explicit `"1p"`: `--restore` copies the snapshot back when
+one exists and otherwise resets the key to `"1p"`, rather than mistaking "never
+written" for "already first-party".
 
 ### Configure flow
 
@@ -171,10 +196,16 @@ Claude Desktop never scans the backups as profiles.
              (the earliest snapshot is the one `--restore` wants).
 4. Migrate — move turnpike.json and turnpike.json.turnpike-backup.json to
              turnpike-backups/ as legacy-* (copy-then-remove).
-5. Write   — read-modify-write the profile, preserving unrelated keys.
-6. Register— _meta.json gets appliedId=PROFILE_ID and an inflated entry list
+5. Deploy  — snapshot and flip deploymentMode to "3p" in
+             claude_desktop_config.json, on EVERY existing candidate root.
+6. Write   — read-modify-write the profile, preserving unrelated keys.
+7. Register— _meta.json gets appliedId=PROFILE_ID and an inflated entry list
              with turnpike's id dedup'd in.
 ```
+
+The success message names each root whose deployment mode was flipped and ends
+with `restart Claude Desktop to pick it up` — the flip is not visible to an
+already-running app.
 
 The profile keys written:
 
@@ -201,9 +232,15 @@ pre-turnpike state restored — and otherwise degrades gracefully: unregisters
 turnpike from `_meta.json` (re-pointing `appliedId` at the first remaining entry)
 and removes the profile file. `uses_turnpike_gateway()` (`is_turnpike_profile`,
 which just checks for `inferenceGatewayBaseUrl`) is what distinguishes
-turnpike-owned content from foreign JSON when deciding what to back up. Four
-unit tests pin the path layout, legacy migration, meta registration, and the
-backup skip-rules.
+turnpike-owned content from foreign JSON when deciding what to back up.
+
+The deployment mode is reversed on every root the flip touched, in the same
+snapshot-first order: the snapshot when one exists, else `deploymentMode` is
+reset to `"1p"` — never left pointing at a gateway that is gone.
+
+The module's unit tests pin the path layout, legacy migration, meta
+registration, the backup skip-rules, and the deployment-mode read/flip/reset
+behavior including the multi-root case.
 
 ## Why a launcher at all
 

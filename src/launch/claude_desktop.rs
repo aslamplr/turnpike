@@ -30,7 +30,23 @@ const LEGACY_BACKUP_SUFFIX: &str = ".turnpike-backup.json";
 /// scans them as profiles.
 const BACKUP_DIR_NAME: &str = "turnpike-backups";
 
+/// Claude Desktop's own app state file, beside configLibrary. It carries
+/// `deploymentMode`, which selects between the first-party API (`"1p"`) and a
+/// third-party inference provider (`"3p"`). Writing a gateway profile without
+/// flipping this has **no effect**: Claude Desktop stays on its first-party
+/// deployment no matter what configLibrary says. This is the file Ollama's app
+/// flips, and the one turnpike originally missed.
+const DESKTOP_CONFIG_NAME: &str = "claude_desktop_config.json";
+/// `deploymentMode` value that makes Claude Desktop use a third-party provider.
+const DEPLOYMENT_MODE_THIRD_PARTY: &str = "3p";
+/// `deploymentMode` value Claude Desktop ships with, restored on `--restore`.
+const DEPLOYMENT_MODE_FIRST_PARTY: &str = "1p";
+/// Key in the desktop config file that selects the deployment.
+const DEPLOYMENT_MODE_KEY: &str = "deploymentMode";
+
 pub struct ClaudeDesktopPaths {
+    /// <root>/claude_desktop_config.json — app state carrying `deploymentMode`.
+    desktop_config: PathBuf,
     /// configLibrary/<uuid>.json — the profile this tool owns.
     profile: PathBuf,
     /// configLibrary/_meta.json — profile registry Claude Desktop reads.
@@ -47,6 +63,7 @@ impl ClaudeDesktopPaths {
     fn new(root: PathBuf) -> Self {
         let library = root.join("configLibrary");
         Self {
+            desktop_config: root.join(DESKTOP_CONFIG_NAME),
             profile: library.join(format!("{PROFILE_ID}.json")),
             meta: library.join("_meta.json"),
             legacy_profile: library.join(format!("{LEGACY_PROFILE_ID}.json")),
@@ -59,41 +76,134 @@ impl ClaudeDesktopPaths {
 /// Resolve config roots. macOS and Windows are supported, mirroring the
 /// platform roots Ollama discovered (Claude / Claude-3p, Claude Nest variants).
 pub fn resolve_paths() -> Result<ClaudeDesktopPaths> {
-    for root in candidate_roots() {
-        if root.exists() {
-            return Ok(ClaudeDesktopPaths::new(root));
-        }
-    }
-    // Nothing installed yet: use the first candidate so --install flows work.
-    let root = candidate_roots()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("unsupported platform for Claude Desktop configuration"))?;
-    Ok(ClaudeDesktopPaths::new(root))
+    Ok(ClaudeDesktopPaths::new(resolve_root()?))
 }
 
+/// The single root `configure`/`restore` write a *profile* into: the first
+/// candidate that exists, else the first candidate so a fresh install has
+/// somewhere to land.
+fn resolve_root() -> Result<PathBuf> {
+    let roots = candidate_roots();
+    roots
+        .iter()
+        .find(|r| r.exists())
+        .or_else(|| roots.first())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unsupported platform for Claude Desktop configuration"))
+}
+
+/// Roots by kind, mirroring Ollama's `claudeDesktopTargets`: a *third-party*
+/// root (`Claude-3p`) gets the gateway profile **plus** the deployment flip,
+/// while a *normal* root gets the deployment flip only.
 fn candidate_roots() -> Vec<PathBuf> {
+    let mut roots = third_party_roots();
+    roots.extend(normal_roots());
+    roots
+}
+
+/// Third-party roots first: they are what a Claude Desktop build configured for
+/// a third-party inference provider actually reads (`Claude-3p`).
+fn third_party_roots() -> Vec<PathBuf> {
     if cfg!(target_os = "macos") {
         if let Some(home) = home::home_dir() {
             let base = home.join("Library").join("Application Support");
-            return vec![base.join("Claude-3p"), base.join("Claude")];
+            return vec![base.join("Claude-3p")];
         }
     }
     if cfg!(target_os = "windows") {
-        let local = std::env::var("LOCALAPPDATA")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| home::home_dir().map(|h| h.join("AppData").join("Local")));
-        if let Some(local) = local {
-            return vec![
-                local.join("Claude-3p"),
-                local.join("Claude Nest-3p"),
-                local.join("Claude"),
-                local.join("Claude Nest"),
-            ];
+        if let Some(local) = local_app_data() {
+            return vec![local.join("Claude-3p"), local.join("Claude Nest-3p")];
         }
     }
     Vec::new()
+}
+
+fn normal_roots() -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") {
+        if let Some(home) = home::home_dir() {
+            let base = home.join("Library").join("Application Support");
+            return vec![base.join("Claude")];
+        }
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(local) = local_app_data() {
+            return vec![local.join("Claude"), local.join("Claude Nest")];
+        }
+    }
+    Vec::new()
+}
+
+fn local_app_data() -> Option<PathBuf> {
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| home::home_dir().map(|h| h.join("AppData").join("Local")))
+}
+
+/// Flip `deploymentMode` to `"3p"` on **every** candidate root, not only the one
+/// that receives the profile.
+///
+/// This mirrors Ollama's `configureClaudeDesktopTargets`, which runs the flip
+/// over `normalConfigs` *and* each third-party target's `desktopConfig`. It is
+/// not a shot in the dark: Claude Desktop's own root varies by build and by
+/// how the user turned on third-party inference, and a root left on `"1p"`
+/// silently wins if the app reads it. A root that does not exist is skipped —
+/// turnpike does not create an app-state file for an install that isn't there.
+///
+/// Each flip snapshots first (same skip rules as the profile), so `--restore`
+/// is a real undo on every root it touched.
+fn flip_deployment_mode() -> Result<Vec<PathBuf>> {
+    let mut flipped = Vec::new();
+    for root in candidate_roots() {
+        if !root.is_dir() {
+            continue;
+        }
+        let paths = ClaudeDesktopPaths::new(root);
+        let existing = read_json_allow_missing(&paths.desktop_config);
+        backup_once(
+            &paths.desktop_config,
+            &paths.backup_dir,
+            DESKTOP_CONFIG_NAME,
+            deployment_mode(&existing) == Some(DEPLOYMENT_MODE_THIRD_PARTY),
+        )?;
+        let mut desktop = existing;
+        desktop[DEPLOYMENT_MODE_KEY] = json!(DEPLOYMENT_MODE_THIRD_PARTY);
+        write_json(&paths.desktop_config, &desktop)?;
+        flipped.push(paths.desktop_config);
+    }
+    Ok(flipped)
+}
+
+/// Put every root `flip_deployment_mode` touched back: the snapshot when one
+/// exists, else the first-party default Claude Desktop ships with — never a
+/// mode pointing at a gateway that is gone.
+fn reset_deployment_mode() -> Result<Vec<PathBuf>> {
+    let mut reset = Vec::new();
+    for root in candidate_roots() {
+        if !root.is_dir() {
+            continue;
+        }
+        let paths = ClaudeDesktopPaths::new(root);
+        if !paths.desktop_config.exists() {
+            continue;
+        }
+        let snapshot = paths.backup_dir.join(DESKTOP_CONFIG_NAME);
+        if snapshot.exists() {
+            std::fs::copy(&snapshot, &paths.desktop_config).with_context(|| {
+                format!(
+                    "restoring {} from {}",
+                    paths.desktop_config.display(),
+                    snapshot.display()
+                )
+            })?;
+        } else {
+            let mut desktop = read_json_allow_missing(&paths.desktop_config);
+            desktop[DEPLOYMENT_MODE_KEY] = json!(DEPLOYMENT_MODE_FIRST_PARTY);
+            write_json(&paths.desktop_config, &desktop)?;
+        }
+        reset.push(paths.desktop_config);
+    }
+    Ok(reset)
 }
 
 pub fn supported() -> bool {
@@ -160,6 +270,12 @@ pub fn configure(config: &Config, api_key: &str, force: bool, auto_mode: bool) -
     // its stray backup file move out of configLibrary.
     migrate_legacy(&paths)?;
 
+    // The profile alone does nothing: Claude Desktop reads `deploymentMode`
+    // from its own app state file to decide between first- and third-party
+    // deployments, and ships on `"1p"`. Ollama flips it across every root, not
+    // just the one holding the profile, so turnpike does the same.
+    let flipped = flip_deployment_mode()?;
+
     let mut cfg = existing_profile;
     cfg["inferenceProvider"] = json!("gateway");
     cfg["inferenceGatewayBaseUrl"] = json!(config.gateway_base_url());
@@ -178,10 +294,18 @@ pub fn configure(config: &Config, api_key: &str, force: bool, auto_mode: bool) -
 
     register_in_meta(&paths.meta)?;
     println!(
-        "Configured Claude Desktop profile at {}\n  gateway: {}\n  restart Claude Desktop to pick it up",
+        "Configured Claude Desktop profile at {}\n  gateway: {}",
         paths.profile.display(),
         config.gateway_base_url()
     );
+    for path in &flipped {
+        println!(
+            "  third-party deployment mode ({}) in {}",
+            DEPLOYMENT_MODE_THIRD_PARTY,
+            path.display()
+        );
+    }
+    println!("  restart Claude Desktop to pick it up");
     Ok(())
 }
 
@@ -226,6 +350,14 @@ pub fn restore() -> Result<()> {
     } else {
         println!("No turnpike profile found at {}", paths.profile.display());
     }
+
+    // Put the deployment mode back on every root Ollama-style turnpike flipped.
+    // A snapshot is the real pre-turnpike state; without one, restore the
+    // first-party default Claude Desktop ships with rather than leaving the app
+    // pointed at a provider that is gone.
+    for path in reset_deployment_mode()? {
+        println!("Restored deployment mode in {}", path.display());
+    }
     Ok(())
 }
 
@@ -239,6 +371,15 @@ pub fn uses_turnpike_gateway() -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// The `deploymentMode` a desktop config declares, if it declares one at all.
+///
+/// `None` means the key is absent — a config Claude Desktop has never written
+/// to, which is **not** the same as an explicit `"1p"`. `--restore` treats the
+/// two differently.
+fn deployment_mode(v: &Value) -> Option<&str> {
+    v.get(DEPLOYMENT_MODE_KEY).and_then(Value::as_str)
 }
 
 fn is_turnpike_profile(v: &Value) -> bool {
@@ -380,6 +521,246 @@ mod tests {
                 .join("turnpike.json.turnpike-backup.json")
         );
         assert_eq!(paths.backup_dir, root.join("turnpike-backups"));
+        // Beside configLibrary, not inside it — it is app state, not a profile.
+        assert_eq!(
+            paths.desktop_config,
+            root.join("claude_desktop_config.json")
+        );
+    }
+
+    #[test]
+    fn deployment_mode_is_read_absent_and_present() {
+        assert_eq!(deployment_mode(&json!({})), None);
+        assert_eq!(
+            deployment_mode(&json!({"deploymentMode": "1p"})),
+            Some("1p")
+        );
+        assert_eq!(
+            deployment_mode(&json!({"deploymentMode": "3p"})),
+            Some("3p")
+        );
+        // A non-string value is not a mode.
+        assert_eq!(deployment_mode(&json!({"deploymentMode": 3})), None);
+    }
+
+    /// The bug this whole change exists for: writing the profile without
+    /// flipping `deploymentMode` leaves Claude Desktop on its first-party
+    /// deployment, so the gateway never takes effect.
+    #[test]
+    fn configure_flips_deployment_mode_to_third_party() {
+        let dir = temp_root("deploymode");
+        let desktop = dir.join(DESKTOP_CONFIG_NAME);
+        std::fs::write(&desktop, r#"{"deploymentMode":"1p","preferences":{"x":1}}"#).unwrap();
+
+        let paths = ClaudeDesktopPaths::new(dir.clone());
+        let existing = read_json_allow_missing(&paths.desktop_config);
+        let mut cfg = existing;
+        cfg[DEPLOYMENT_MODE_KEY] = json!(DEPLOYMENT_MODE_THIRD_PARTY);
+        write_json(&paths.desktop_config, &cfg).unwrap();
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&desktop).unwrap()).unwrap();
+        assert_eq!(written[DEPLOYMENT_MODE_KEY], "3p");
+        // Unrelated app state survives — this is a shared file, not ours.
+        assert_eq!(written["preferences"]["x"], 1);
+    }
+
+    #[test]
+    fn configure_flips_mode_when_the_key_is_absent() {
+        let dir = temp_root("deploymode-absent");
+        let desktop = dir.join(DESKTOP_CONFIG_NAME);
+        std::fs::write(&desktop, r#"{}"#).unwrap();
+
+        let paths = ClaudeDesktopPaths::new(dir.clone());
+        assert_eq!(
+            deployment_mode(&read_json_allow_missing(&paths.desktop_config)),
+            None
+        );
+        let mut cfg = read_json_allow_missing(&paths.desktop_config);
+        cfg[DEPLOYMENT_MODE_KEY] = json!(DEPLOYMENT_MODE_THIRD_PARTY);
+        write_json(&paths.desktop_config, &cfg).unwrap();
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&desktop).unwrap()).unwrap();
+        assert_eq!(written[DEPLOYMENT_MODE_KEY], "3p");
+    }
+
+    /// A desktop config already on `"3p"` is not snapshotted — the same
+    /// already-ours rule the profile and meta use, so a second `configure`
+    /// does not overwrite the real pre-turnpike snapshot.
+    #[test]
+    fn backup_once_skips_a_desktop_config_already_on_third_party() {
+        let dir = temp_root("deploymode-backup");
+        let desktop = dir.join(DESKTOP_CONFIG_NAME);
+        let backup_dir = dir.join(BACKUP_DIR_NAME);
+
+        std::fs::write(&desktop, r#"{"deploymentMode":"3p"}"#).unwrap();
+        backup_once(
+            &desktop,
+            &backup_dir,
+            DESKTOP_CONFIG_NAME,
+            deployment_mode(&read_json_allow_missing(&desktop))
+                == Some(DEPLOYMENT_MODE_THIRD_PARTY),
+        )
+        .unwrap();
+        assert!(!backup_dir.join(DESKTOP_CONFIG_NAME).exists());
+
+        // A first-party config *is* snapshotted.
+        std::fs::write(&desktop, r#"{"deploymentMode":"1p"}"#).unwrap();
+        backup_once(
+            &desktop,
+            &backup_dir,
+            DESKTOP_CONFIG_NAME,
+            deployment_mode(&read_json_allow_missing(&desktop))
+                == Some(DEPLOYMENT_MODE_THIRD_PARTY),
+        )
+        .unwrap();
+        let snap = backup_dir.join(DESKTOP_CONFIG_NAME);
+        assert!(snap.exists());
+        let snap_v: Value = serde_json::from_str(&std::fs::read_to_string(&snap).unwrap()).unwrap();
+        assert_eq!(snap_v[DEPLOYMENT_MODE_KEY], "1p");
+    }
+
+    /// `--restore` with a snapshot puts the original mode back.
+    #[test]
+    fn restore_resets_mode_from_the_snapshot() {
+        let dir = temp_root("deploymode-restore");
+        let desktop = dir.join(DESKTOP_CONFIG_NAME);
+        let backup_dir = dir.join(BACKUP_DIR_NAME);
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        std::fs::write(&desktop, r#"{"deploymentMode":"3p"}"#).unwrap();
+        std::fs::write(
+            backup_dir.join(DESKTOP_CONFIG_NAME),
+            r#"{"deploymentMode":"1p"}"#,
+        )
+        .unwrap();
+
+        let backup = backup_dir.join(DESKTOP_CONFIG_NAME);
+        assert!(backup.exists());
+        std::fs::copy(&backup, &desktop).unwrap();
+
+        let restored: Value =
+            serde_json::from_str(&std::fs::read_to_string(&desktop).unwrap()).unwrap();
+        assert_eq!(restored[DEPLOYMENT_MODE_KEY], "1p");
+    }
+
+    /// The multi-root behaviour Ollama's `configureClaudeDesktopTargets` has
+    /// and the first version of this change missed: `Claude` *and* `Claude-3p`
+    /// both carry app state, and either can be the one the app reads, so both
+    /// get flipped. A root that is not installed is left alone.
+    #[test]
+    fn flip_and_reset_deployment_mode_cover_every_installed_root() {
+        let base = temp_root("multiroot");
+        let normal = base.join("Claude");
+        let third_party = base.join("Claude-3p");
+        for (root, mode) in [(&normal, "1p"), (&third_party, "1p")] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(
+                root.join(DESKTOP_CONFIG_NAME),
+                format!(r#"{{"deploymentMode":"{mode}"}}"#),
+            )
+            .unwrap();
+        }
+
+        // Both roots are constructed and flipped the way `configure` does it.
+        let mut flipped = Vec::new();
+        for root in [&normal, &third_party] {
+            let paths = ClaudeDesktopPaths::new(root.clone());
+            let existing = read_json_allow_missing(&paths.desktop_config);
+            backup_once(
+                &paths.desktop_config,
+                &paths.backup_dir,
+                DESKTOP_CONFIG_NAME,
+                deployment_mode(&existing) == Some(DEPLOYMENT_MODE_THIRD_PARTY),
+            )
+            .unwrap();
+            let mut desktop = existing;
+            desktop[DEPLOYMENT_MODE_KEY] = json!(DEPLOYMENT_MODE_THIRD_PARTY);
+            write_json(&paths.desktop_config, &desktop).unwrap();
+            flipped.push(paths);
+        }
+        assert_eq!(flipped.len(), 2);
+        for paths in &flipped {
+            let v: Value =
+                serde_json::from_str(&std::fs::read_to_string(&paths.desktop_config).unwrap())
+                    .unwrap();
+            assert_eq!(v[DEPLOYMENT_MODE_KEY], "3p");
+            assert!(paths.backup_dir.join(DESKTOP_CONFIG_NAME).exists());
+        }
+
+        // And restoring puts both back from their own snapshot.
+        for paths in &flipped {
+            let snap = paths.backup_dir.join(DESKTOP_CONFIG_NAME);
+            std::fs::copy(&snap, &paths.desktop_config).unwrap();
+            let v: Value =
+                serde_json::from_str(&std::fs::read_to_string(&paths.desktop_config).unwrap())
+                    .unwrap();
+            assert_eq!(v[DEPLOYMENT_MODE_KEY], "1p");
+        }
+    }
+
+    /// The candidate list is what makes the multi-root flip possible: normal
+    /// and third-party roots are both present, third-party first.
+    #[test]
+    fn candidate_roots_include_both_kinds() {
+        let mut all = third_party_roots();
+        let n_third_party = all.len();
+        all.extend(normal_roots());
+        assert_eq!(all, candidate_roots());
+        if cfg!(target_os = "macos") {
+            let base = home::home_dir()
+                .unwrap()
+                .join("Library/Application Support");
+            assert_eq!(n_third_party, 1);
+            assert_eq!(candidate_roots()[0], base.join("Claude-3p"));
+            assert_eq!(candidate_roots()[1], base.join("Claude"));
+        }
+    }
+
+    /// `--restore` with no snapshot must leave the app on the first-party
+    /// default, never pointing at a gateway that is gone.
+    #[test]
+    fn restore_without_a_snapshot_resets_mode_to_first_party() {
+        let dir = temp_root("deploymode-nosnapshot");
+        let desktop = dir.join(DESKTOP_CONFIG_NAME);
+        std::fs::write(&desktop, r#"{"deploymentMode":"3p","keep":true}"#).unwrap();
+
+        let paths = ClaudeDesktopPaths::new(dir.clone());
+        assert!(!paths.backup_dir.join(DESKTOP_CONFIG_NAME).exists());
+        let mut cfg = read_json_allow_missing(&paths.desktop_config);
+        cfg[DEPLOYMENT_MODE_KEY] = json!(DEPLOYMENT_MODE_FIRST_PARTY);
+        write_json(&paths.desktop_config, &cfg).unwrap();
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&desktop).unwrap()).unwrap();
+        assert_eq!(written[DEPLOYMENT_MODE_KEY], "1p");
+        assert_eq!(written["keep"], true);
+    }
+
+    /// The two root kinds, mirroring Ollama's `claudeDesktopTargets`: a normal
+    /// root (`Claude`) and a third-party root (`Claude-3p`) both exist, and
+    /// both carry app state. A root that is not installed is not returned.
+    #[test]
+    fn candidate_roots_are_ordered_third_party_first() {
+        let roots = candidate_roots();
+        if cfg!(target_os = "macos") {
+            let base = home::home_dir()
+                .unwrap()
+                .join("Library/Application Support");
+            assert_eq!(roots, vec![base.join("Claude-3p"), base.join("Claude")]);
+            assert_eq!(third_party_roots(), vec![base.join("Claude-3p")]);
+            assert_eq!(normal_roots(), vec![base.join("Claude")]);
+        }
+    }
+
+    /// `resolve_paths` still answers with the third-party root when both exist —
+    /// that is where the profile belongs, and the flip now covers both.
+    #[test]
+    fn resolve_root_prefers_an_existing_third_party_root() {
+        let roots = candidate_roots();
+        let chosen = roots.iter().find(|r| r.exists()).or_else(|| roots.first());
+        assert_eq!(chosen, roots.first(), "third-party root is checked first");
     }
 
     #[test]
