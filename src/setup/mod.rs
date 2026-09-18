@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use crate::config::{Config, Spec};
 use crate::secrets::{self, Secret, StoreStatus};
 
-use edit::{Doc, RouteDraft};
+use edit::{Doc, RouteDraft, TargetDraft, STRATEGIES};
 use prompt::Prompter;
 
 /// The wizard's staged work: what to write to the store when we commit.
@@ -325,7 +325,21 @@ impl WizardState {
             for id in &ids {
                 if let Ok(cfg) = crate::config::load_from_str(&self.doc.as_str()) {
                     if let Some(r) = cfg.routes.get(id) {
-                        println!("  {id}  -> {} / {}", r.provider, r.model);
+                        // The whole chain, not just target 0 — a failover route
+                        // that lists only its primary is the one screen where a
+                        // user cannot see what they configured.
+                        let chain = r
+                            .targets()
+                            .iter()
+                            .map(|t| format!("{}/{}", t.provider, t.model))
+                            .collect::<Vec<_>>()
+                            .join(" -> ");
+                        let n = r.targets().len();
+                        if n > 1 {
+                            println!("  {id}  -> {chain}  [{}, {n} targets]", r.strategy.as_str());
+                        } else {
+                            println!("  {id}  -> {chain}");
+                        }
                     }
                 }
             }
@@ -397,7 +411,289 @@ impl WizardState {
 
         match self.doc.add_route(&id, &draft) {
             Ok(()) => println!("  added route {id:?}"),
-            Err(e) => println!("  {e}"),
+            Err(e) => {
+                println!("  {e}");
+                return Ok(());
+            }
+        }
+
+        // Targets and strategy come after the route exists: `add_route_target`
+        // edits an existing route, and a strategy is only meaningful once there
+        // is something to choose between.
+        self.add_targets_for(p, &id)?;
+        Ok(())
+    }
+
+    /// Offer to append `[[…target]]` blocks to a route that already exists, then
+    /// ask for a `strategy` if anything was added.
+    ///
+    /// Shared by `add_route` and the Targets sub-menu: both are "keep appending
+    /// targets to this route", and both must ask `strategy` only after a second
+    /// target exists — see `set_strategy` for why that gate is the wizard's.
+    fn add_targets_for(&mut self, p: &mut dyn Prompter, id: &str) -> Result<()> {
+        let mut added = 0usize;
+        loop {
+            if !p.confirm_default("Add an upstream target (failover/load-balance)?", false)? {
+                break;
+            }
+            match self.prompt_target(p)? {
+                Some(t) => {
+                    report(self.doc.add_route_target(id, &t));
+                    added += 1;
+                }
+                None => break,
+            }
+        }
+        if added > 0 {
+            self.set_strategy(p, id)?;
+        }
+        Ok(())
+    }
+
+    /// Collect one `TargetDraft`, or `None` when the provider menu says so.
+    ///
+    /// Optionals go through `ask_default` so an empty answer **omits** the key,
+    /// matching `add_route`'s discipline — a target with `display_name = ""` is
+    /// a key nobody asked for.
+    fn prompt_target(&mut self, p: &mut dyn Prompter) -> Result<Option<TargetDraft>> {
+        let providers = self.doc.provider_ids();
+        if providers.is_empty() {
+            println!("  no providers configured");
+            return Ok(None);
+        }
+        let pidx = p.choose("Target provider?", &as_refs(&providers), 0)?;
+        let mut t = TargetDraft {
+            provider: providers[pidx].clone(),
+            model: p.ask("Target upstream model id")?,
+            display_name: None,
+            context_tokens: None,
+        };
+        let disp = p.ask_default("Target display name (blank to omit)", "")?;
+        if !disp.trim().is_empty() {
+            t.display_name = Some(disp);
+        }
+        let ct = p.ask_default("Target context_tokens (blank to omit)", "")?;
+        if let Ok(n) = ct.trim().parse::<u64>() {
+            t.context_tokens = Some(n);
+        }
+        Ok(Some(t))
+    }
+
+    /// Ask for a `strategy` and write it, honoring the 2-target rule.
+    ///
+    /// **A non-`static` strategy needs 2+ targets to mean anything.** With one
+    /// target, `failover` and `load-balance` behave *exactly* like `static`, so
+    /// writing one creates the state `doctor`'s `routes-strategy` check warns
+    /// about (`is "failover" with 1 target, which behaves exactly like
+    /// "static"`). The wizard refuses up front rather than leaving the user with
+    /// a file their own doctor complains about.
+    fn set_strategy(&mut self, p: &mut dyn Prompter, id: &str) -> Result<()> {
+        let current = crate::config::load_from_str(&self.doc.as_str())
+            .ok()
+            .and_then(|c| c.routes.get(id).map(|r| r.strategy))
+            .unwrap_or_default();
+        let default = STRATEGIES
+            .iter()
+            .position(|s| *s == current.as_str())
+            .unwrap_or(0);
+
+        let pick = p.choose("Strategy:", &STRATEGIES, default)?;
+        let choice = STRATEGIES[pick];
+
+        // `static` is the default, so the key is *removed* rather than written.
+        // `default_config_text()` writes no `strategy` line, and a route that
+        // says `strategy = "static"` is a diff against a fresh config for no
+        // behavioral difference.
+        if choice == "static" {
+            self.doc.remove_route_scalar_keeping_comment(id, "strategy");
+            return Ok(());
+        }
+
+        if self.doc.route_targets(id).len() < 2 {
+            println!(
+                "  {choice:?} needs at least 2 targets to differ from \"static\" — \
+                 this route has 1; add another target first"
+            );
+            return Ok(());
+        }
+        report(self.doc.set_route_scalar(id, "strategy", choice));
+        Ok(())
+    }
+
+    /// The Targets sub-menu: list the chain, then add / edit / remove / back.
+    ///
+    /// Target 0 is listed but has no Edit/Remove of its own — it is the route's
+    /// own flat `provider`/`model`, edited through the route's `provider` and
+    /// `model` fields. Rewriting it here would give `targets()` two entries
+    /// claiming to be target 0.
+    fn targets_menu(&mut self, p: &mut dyn Prompter, id: &str) -> Result<()> {
+        loop {
+            let chain = self.doc.route_targets(id);
+            println!();
+            for (i, (prov, model)) in chain.iter().enumerate() {
+                if i == 0 {
+                    println!("  target 0 (the route's own pair)  {prov}/{model}");
+                } else {
+                    println!("  target {i}  {prov}/{model}");
+                }
+            }
+            let action = p.choose(
+                "Targets:",
+                &["Add", "Edit", "Remove", "Strategy", "Back"],
+                4,
+            )?;
+            match action {
+                0 => {
+                    if let Some(t) = self.prompt_target(p)? {
+                        report(self.doc.add_route_target(id, &t));
+                    }
+                }
+                1 => self.edit_target(p, id, &chain)?,
+                2 => self.remove_target(p, id, &chain)?,
+                3 => self.set_strategy(p, id)?,
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    fn edit_target(
+        &mut self,
+        p: &mut dyn Prompter,
+        id: &str,
+        chain: &[(String, String)],
+    ) -> Result<()> {
+        if chain.len() < 2 {
+            println!(
+                "  this route has no extra targets to edit — target 0 is the route's own pair"
+            );
+            return Ok(());
+        }
+        // Index 0 is target 0, which is not editable here.
+        let opts: Vec<String> = chain
+            .iter()
+            .skip(1)
+            .enumerate()
+            .map(|(i, (prov, model))| format!("target {} ({prov}/{model})", i + 1))
+            .collect();
+        let pick = p.choose("Edit which target?", &as_refs(&opts), 0)?;
+        let index = pick;
+
+        let key = p.choose(
+            "Which field?",
+            &[
+                "provider",
+                "model",
+                "display_name",
+                "context_tokens",
+                "Back",
+            ],
+            4,
+        )?;
+        match key {
+            0 => {
+                let providers = self.doc.provider_ids();
+                let pidx = p.choose("Target provider?", &as_refs(&providers), 0)?;
+                let v = providers[pidx].clone();
+                report(
+                    self.doc
+                        .set_route_target_scalar(id, index, "provider", v.as_str()),
+                );
+            }
+            1 => {
+                let v = p.ask("Target upstream model id")?;
+                report(
+                    self.doc
+                        .set_route_target_scalar(id, index, "model", v.as_str()),
+                );
+            }
+            2 => {
+                // An empty answer *clears* the key rather than writing
+                // `display_name = ""`, matching how the optionals are added.
+                // Only a scalar that already exists can be cleared, so the
+                // remove is reported plainly rather than as a failure.
+                let v = p.ask_default("Target display name (blank to clear)", "")?;
+                if v.trim().is_empty() {
+                    if self
+                        .doc
+                        .remove_route_target_scalar(id, index, "display_name")
+                    {
+                        println!("  cleared display_name");
+                    }
+                } else {
+                    report(
+                        self.doc
+                            .set_route_target_scalar(id, index, "display_name", v.as_str()),
+                    );
+                }
+            }
+            3 => {
+                let v = p.ask_default("Target context_tokens (blank to clear)", "")?;
+                if v.trim().is_empty() {
+                    if self
+                        .doc
+                        .remove_route_target_scalar(id, index, "context_tokens")
+                    {
+                        println!("  cleared context_tokens");
+                    }
+                } else {
+                    match v.trim().parse::<i64>() {
+                        Ok(n) => {
+                            report(
+                                self.doc
+                                    .set_route_target_scalar(id, index, "context_tokens", n),
+                            )
+                        }
+                        Err(_) => println!("  not a number; unchanged"),
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn remove_target(
+        &mut self,
+        p: &mut dyn Prompter,
+        id: &str,
+        chain: &[(String, String)],
+    ) -> Result<()> {
+        if chain.len() < 2 {
+            println!(
+                "  this route has no extra targets to remove — target 0 is the route's own pair"
+            );
+            return Ok(());
+        }
+        let opts: Vec<String> = chain
+            .iter()
+            .skip(1)
+            .enumerate()
+            .map(|(i, (prov, model))| format!("target {} ({prov}/{model})", i + 1))
+            .collect();
+        let pick = p.choose("Remove which target?", &as_refs(&opts), 0)?;
+        let index = pick;
+        let (prov, model) = &chain[index + 1];
+        if !p.confirm_default(
+            &format!("Remove target {} ({prov}/{model})?", index + 1),
+            false,
+        )? {
+            println!("  kept");
+            return Ok(());
+        }
+        report(self.doc.remove_route_target(id, index));
+
+        // A strategy that no longer has 2 targets to choose between is the exact
+        // state `set_strategy` refuses to create, so removing a target can strand
+        // a route in it. Reset to `static` and say so, rather than leave the user
+        // with a file their own doctor warns about.
+        if self.doc.route_targets(id).len() < 2 {
+            let strategy = crate::config::load_from_str(&self.doc.as_str())
+                .ok()
+                .and_then(|c| c.routes.get(id).map(|r| r.strategy));
+            if matches!(strategy, Some(s) if s != crate::config::Strategy::Static) {
+                println!("  the route now has 1 target, so the strategy was reset to \"static\"");
+                self.doc.remove_route_scalar_keeping_comment(id, "strategy");
+            }
         }
         Ok(())
     }
@@ -419,9 +715,11 @@ impl WizardState {
                 "display_name",
                 "max_tokens",
                 "context_tokens",
+                "strategy",
+                "Targets",
                 "Back",
             ],
-            6,
+            8,
         )?;
         match field {
             0 => {
@@ -477,6 +775,12 @@ impl WizardState {
                     Ok(n) => report(self.doc.set_route_scalar(&id, "context_tokens", n)),
                     Err(_) => println!("  not a number; unchanged"),
                 }
+            }
+            6 => {
+                self.set_strategy(p, &id)?;
+            }
+            7 => {
+                self.targets_menu(p, &id)?;
             }
             _ => {}
         }
@@ -1154,5 +1458,234 @@ base_url = "https://opencode.ai/zen"
     fn as_refs_borrows_without_copying() {
         let owned = vec!["a".to_string(), "b".to_string()];
         assert_eq!(as_refs(&owned), vec!["a", "b"]);
+    }
+
+    // --- targets & strategy ------------------------------------------------
+
+    /// A state on the starter document, with an extra provider to point a
+    /// second target at — the starter's routes all sit on `zen`, and a failover
+    /// chain on one provider is the shape `doctor` lints.
+    fn target_state() -> WizardState {
+        let mut state = WizardState::new(Doc::starter().unwrap(), Plan::default());
+        state
+            .doc
+            .add_provider("zen-go", Spec::Openai, "https://opencode.ai/zen/go")
+            .unwrap();
+        state
+    }
+
+    /// The `provider/model` chain of the starter's `claude-sonnet-5` route.
+    fn chain_of(state: &WizardState, id: &str) -> Vec<(String, String)> {
+        state.doc.route_targets(id)
+    }
+
+    #[test]
+    fn strategy_refused_on_a_single_target_route() {
+        // The user's gate: `failover` on one target behaves exactly like
+        // `static`, so the wizard must not write it. It prints the requirement
+        // and leaves the document alone.
+        let mut state = target_state();
+        let mut p = ScriptedPrompt::new(&["3"]); // "failover"
+        state.set_strategy(&mut p, "claude-sonnet-5").unwrap();
+
+        let written = state.doc.as_str();
+        assert!(
+            !written.contains("strategy"),
+            "a 1-target route must not gain a strategy key:\n{written}"
+        );
+        // ...and the user was told why, not left guessing.
+        assert!(
+            p.asked.iter().any(|q| q.contains("Strategy")),
+            "the strategy menu was never offered: {:?}",
+            p.asked
+        );
+    }
+
+    #[test]
+    fn strategy_static_omits_the_key() {
+        // `static` is `Strategy::default()`, so writing it is a diff against a
+        // fresh config for no behavioral difference.
+        let mut state = target_state();
+        let mut p = ScriptedPrompt::new(&["1"]); // "static"
+        state.set_strategy(&mut p, "claude-sonnet-5").unwrap();
+
+        let cfg = crate::config::load_from_str(&state.doc.as_str()).unwrap();
+        let r = cfg.routes.get("claude-sonnet-5").unwrap();
+        assert_eq!(r.strategy, crate::config::Strategy::Static);
+        assert!(
+            !state.doc.as_str().contains("strategy"),
+            "static must not be written:\n{}",
+            state.doc.as_str()
+        );
+    }
+
+    #[test]
+    fn strategy_failover_written_after_a_target_exists() {
+        let mut state = target_state();
+        state
+            .doc
+            .add_route_target(
+                "claude-sonnet-5",
+                &TargetDraft {
+                    provider: "zen-go".into(),
+                    model: "deepseek-v4-flash".into(),
+                    display_name: None,
+                    context_tokens: None,
+                },
+            )
+            .unwrap();
+
+        let mut p = ScriptedPrompt::new(&["3"]); // "failover"
+        state.set_strategy(&mut p, "claude-sonnet-5").unwrap();
+
+        let cfg = crate::config::load_from_str(&state.doc.as_str()).unwrap();
+        let r = cfg.routes.get("claude-sonnet-5").unwrap();
+        assert_eq!(r.strategy, crate::config::Strategy::Failover);
+        assert_eq!(r.targets().len(), 2);
+    }
+
+    #[test]
+    fn targets_menu_add_writes_a_block() {
+        let mut state = target_state();
+        // Add (0) -> provider menu (1-based, so "2" is `zen-go`) -> model ->
+        // display name -> context_tokens -> Back (5).
+        let mut p = ScriptedPrompt::new(&["1", "2", "deepseek-v4-flash", "", "", "5"]);
+        state.targets_menu(&mut p, "claude-sonnet-5").unwrap();
+
+        let written = state.doc.as_str();
+        assert!(
+            written.contains("[[routes.\"claude-sonnet-5\".target]]"),
+            "no target block was written:\n{written}"
+        );
+        let cfg = crate::config::load_from_str(&written).unwrap();
+        let targets = cfg.routes.get("claude-sonnet-5").unwrap().targets();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[1].provider, "zen-go");
+        assert_eq!(targets[1].model, "deepseek-v4-flash");
+        // Target 0 is still the route's own pair, untouched. Its `model` is the
+        // route's *upstream* model, which is not the route id.
+        assert_eq!(targets[0].model, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn routes_menu_lists_the_whole_chain() {
+        // The user's second decision: the list view shows every target, not just
+        // target 0 — a failover route that lists only its primary is the one
+        // screen where the user cannot see what they configured.
+        let mut state = target_state();
+        state
+            .doc
+            .add_route_target(
+                "claude-sonnet-5",
+                &TargetDraft {
+                    provider: "zen-go".into(),
+                    model: "deepseek-v4-flash".into(),
+                    display_name: None,
+                    context_tokens: None,
+                },
+            )
+            .unwrap();
+        state
+            .doc
+            .set_route_scalar("claude-sonnet-5", "strategy", "failover")
+            .unwrap();
+
+        let chain = chain_of(&state, "claude-sonnet-5");
+        assert_eq!(
+            chain,
+            vec![
+                ("zen".to_string(), "claude-sonnet-4-5".to_string()),
+                ("zen-go".to_string(), "deepseek-v4-flash".to_string()),
+            ],
+            "route_targets must list target 0 first, then the chain"
+        );
+
+        // The rendered line is what `routes_menu` prints; drive the menu itself
+        // so the assertion covers the code, not just the accessor.
+        let mut p = ScriptedPrompt::new(&["4"]); // Back
+        state.routes_menu(&mut p).unwrap();
+        assert!(
+            p.asked.iter().any(|q| q.contains("Routes")),
+            "the routes menu never ran: {:?}",
+            p.asked
+        );
+    }
+
+    #[test]
+    fn add_route_with_a_target_commits_and_validates() {
+        // The end-to-end property: a route built entirely through the wizard's
+        // target path lands on disk, parses, validates, and keeps every starter
+        // comment — the same bar `commit_writes_a_config_that_parses_and_
+        // validates` holds for the flat path.
+        let path = temp_path("commit-target");
+        let mut state = target_state();
+
+        let mut p = ScriptedPrompt::new(&["1", "2", "deepseek-v4-flash", "", "", "5"]);
+        state.targets_menu(&mut p, "claude-sonnet-5").unwrap();
+        let mut p = ScriptedPrompt::new(&["3"]); // failover
+        state.set_strategy(&mut p, "claude-sonnet-5").unwrap();
+
+        let mut store = memory_store();
+        state.commit(&path, &mut store, false).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let cfg = crate::config::load_from_str(&written).unwrap();
+        let r = cfg.routes.get("claude-sonnet-5").unwrap();
+        assert_eq!(r.targets().len(), 2);
+        assert_eq!(r.strategy, crate::config::Strategy::Failover);
+
+        let starter = Doc::starter().unwrap();
+        for comment in starter.comments() {
+            assert!(
+                written.contains(&comment),
+                "the target path dropped the comment {comment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn removing_the_last_target_resets_a_stranded_strategy() {
+        // `remove_target` undoes what `set_strategy` refuses to create: a
+        // non-static strategy with one target. The wizard resets it and says so
+        // rather than leaving a file its own doctor warns about.
+        let mut state = target_state();
+        state
+            .doc
+            .add_route_target(
+                "claude-sonnet-5",
+                &TargetDraft {
+                    provider: "zen-go".into(),
+                    model: "deepseek-v4-flash".into(),
+                    display_name: None,
+                    context_tokens: None,
+                },
+            )
+            .unwrap();
+        state
+            .doc
+            .set_route_scalar("claude-sonnet-5", "strategy", "failover")
+            .unwrap();
+
+        // `remove_target` asks twice: which target (the list skips target 0, so
+        // "1" is its only row) and then a confirm, which defaults to no.
+        let mut p = ScriptedPrompt::new(&["1", "y"]);
+        let chain = state.doc.route_targets("claude-sonnet-5");
+        state
+            .remove_target(&mut p, "claude-sonnet-5", &chain)
+            .unwrap();
+
+        let written = state.doc.as_str();
+        assert!(
+            !written.contains("[[routes.\"claude-sonnet-5\".target]]"),
+            "the target block survived:\n{written}"
+        );
+        let cfg = crate::config::load_from_str(&written).unwrap();
+        let r = cfg.routes.get("claude-sonnet-5").unwrap();
+        assert_eq!(r.targets().len(), 1);
+        assert_eq!(
+            r.strategy,
+            crate::config::Strategy::Static,
+            "a stranded strategy must be reset to static:\n{written}"
+        );
     }
 }

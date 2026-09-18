@@ -257,11 +257,45 @@ picker lists.
 unresolvable primary key no longer fails loudly at request time, so the static
 check is how a dead primary still gets noticed.
 
+## Configuring it: `turnpike setup`
+
+Hand-editing `[[…target]]` works and `doctor` validates it, but the wizard
+writes the same blocks through the same comment-preserving `toml_edit` path as
+every other field. Under **Routes** → edit a route, two menu entries do the work:
+
+- **Targets** — lists the whole chain (`target 0` is labelled *the route's own
+  pair*), then Add / Edit / Remove / Strategy / Back. Adding asks the provider
+  from a menu of `[providers.*]` ids, the upstream model, and then
+  `display_name`/`context_tokens`, where an empty answer **omits** the key
+  rather than writing `key = ""`.
+- **strategy** — `static` / `load-balance` / `failover`, defaulting to the
+  route's current value.
+
+Two rules the wizard enforces, both matching `doctor` rather than inventing a
+second opinion:
+
+1. **A non-`static` strategy needs 2+ targets.** Choosing `failover` on a
+   1-target route prints the requirement and writes nothing — it will not create
+   the state `routes-strategy` warns about.
+2. **Removing a target can strand a strategy, so the wizard resets it.**
+   Dropping back to one target resets a non-`static` strategy to `static` and
+   says so, undoing rule 1's state rather than leaving a file the user's own
+   `doctor` complains about.
+
+**Target 0 is never rewritten.** The wizard appends to the `target` array, which
+is targets 1..N by definition; the route's own flat `provider`/`model` is edited
+through the route's ordinary `provider`/`model` fields. Writing a `[[…target]]`
+block for the pair the route already has would give it two target 0s.
+
+**Removing a target loses its introducing comment.** A `# …` line above a
+`[[…target]]` header lives in that table's prefix decor, and dropping the block
+drops the comment with it. This is accepted and documented rather than worked
+around: the comment-preservation rule exists for scalars a user annotates
+(`api_key`), and a half-working graft for a second header shape would be worse
+than a known limit.
+
 ## What is not here, explicitly
 
-- **The setup wizard's target add/edit/remove UI.** This feature is schema +
-  gateway + doctor. A user who runs only `turnpike setup` can still hand-edit
-  `[[…target]]`, and `doctor` will validate it.
 - **Weighted or weighted-random balancing.** `load-balance` is round-robin only.
   The schema leaves room: a `weight` field on `TargetCfg` is additive and no
   existing key changes meaning.

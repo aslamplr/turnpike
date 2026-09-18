@@ -85,6 +85,14 @@ choosing among them (`static`, `load-balance`, `failover`) — a route with no
 including the retryable-failure rule and the context-window order, is in
 [routing.md](routing.md).
 
+`turnpike setup` writes the `[[routes.<id>.target]]` blocks through the same
+comment-preserving path as every other field, under Routes → edit a route →
+**Targets**. It appends to the `target` array and never rewrites target 0 — the
+route's own flat `provider`/`model`, edited through the fields below. A
+non-`static` `strategy` needs 2+ targets, so the wizard refuses one until a
+second target exists, and choosing `static` **omits** the key rather than
+writing `strategy = "static"`, which is the same thing to the config layer.
+
 Each route is one client-facing model id. The id is the only thing a client
 picks that affects routing; everything else (provider choice, upstream model,
 credentials) is decided here.

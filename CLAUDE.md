@@ -89,7 +89,12 @@ cargo test        # inline #[cfg(test)] modules per file
   resolution scans the **whole target chain**, not the flat `model`, or a request for a target's
   upstream id would silently stop resolving. Round-robin counters are keyed by **route id, not
   index** (`routes` is a `BTreeMap`, so iteration is alphabetical) and built **once** in
-  `Gateway::new` — a per-request map degenerates to "always target 0".
+  `Gateway::new` — a per-request map degenerates to "always target 0". The wizard's target UI
+  (`turnpike setup` → Routes → edit a route → Targets) **appends** to the `target` array and never
+  rewrites target 0, which stays the route's flat `provider`/`model`: `targets()` synthesizes
+  target 0, so a block for that pair would give the route two of them. It refuses a non-`static`
+  strategy on a 1-target route (the state `routes-strategy` lints) and resets a stranded strategy
+  to `static` when a removal leaves one target.
 - **Failover is pre-first-byte only.** Once the first SSE byte reaches the client the response is
   committed; buffering to allow mid-stream failover would cost streaming latency on every request
   to such a route. Failover covers the **first upstream contact** only — `bridge()` re-sends the

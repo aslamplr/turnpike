@@ -16,7 +16,7 @@
 use std::fmt;
 
 use anyhow::{Context, Result};
-use toml_edit::{Array, DocumentMut, Item, Table, Value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
 
 use crate::config::{ProviderCfg, SearchCfg, Spec};
 
@@ -259,6 +259,216 @@ impl Doc {
         self.set_scalar(&["routes", id], key, value)
     }
 
+    /// Drop a route-level scalar, grafting any comment that introduced it onto
+    /// the next surviving key.
+    ///
+    /// The route-level counterpart to `remove_provider_inline_key_keeping_comment`,
+    /// and the write path for `strategy = "static"`: the key is *removed* rather
+    /// than written, because `static` is the schema default and
+    /// `default_config_text()` writes no `strategy` line — a route that spells
+    /// out the default is a diff against a fresh config for no behavioral
+    /// difference.
+    pub fn remove_route_scalar_keeping_comment(&mut self, id: &str, key: &str) -> bool {
+        self.remove_scalar_keeping_comment(&["routes", id], key)
+    }
+
+    /// Append one `[[routes.<id>.target]]` block.
+    ///
+    /// This writes target 1..N only. **Target 0 is the route's own flat
+    /// `provider`/`model`** and is never touched here — `targets()` synthesizes
+    /// it, so writing a block for it would give the route two target 0s and
+    /// change what `resolve()` answers.
+    ///
+    /// Validation runs before any mutation, per `add_route`: a wizard error must
+    /// leave the document byte-identical, or a failed add becomes a half-add.
+    pub fn add_route_target(&mut self, id: &str, t: &TargetDraft) -> Result<()> {
+        if !self.route_ids().iter().any(|r| r == id) {
+            anyhow::bail!("no route named {id:?}");
+        }
+        if !self.provider_ids().iter().any(|p| p == &t.provider) {
+            anyhow::bail!(
+                "route {id:?} target points at unknown provider {:?}",
+                t.provider
+            );
+        }
+
+        let mut table = Table::new();
+        table["provider"] = toml_edit::value(t.provider.as_str());
+        table["model"] = toml_edit::value(t.model.as_str());
+        if let Some(v) = &t.display_name {
+            table["display_name"] = toml_edit::value(v.as_str());
+        }
+        if let Some(v) = t.context_tokens {
+            table["context_tokens"] = toml_edit::value(v as i64);
+        }
+
+        let routes = self
+            .doc
+            .get_mut("routes")
+            .and_then(|r| r.as_table_like_mut())
+            .with_context(|| format!("no [routes] section to edit for {id:?}"))?;
+        let route = routes
+            .get_mut(id)
+            .and_then(|r| r.as_table_like_mut())
+            .with_context(|| format!("no route named {id:?}"))?;
+
+        // The array is created on first use and then appended to. `target` is
+        // purely additive in the schema, so a route with no targets simply has
+        // no key — no `target = []` placeholder.
+        //
+        // No `set_position` here, unlike `add_provider`/`add_route`: those
+        // append a *table* whose implicit position would otherwise inherit its
+        // parent's and render mid-file. An array-of-tables is appended to a
+        // named key inside a table it already belongs to, and `push` lands it
+        // after the existing blocks. Probed: a second target renders after the
+        // first, and a target on a mid-file route lands on that route.
+        if route.get("target").is_none() {
+            route.insert("target", Item::ArrayOfTables(ArrayOfTables::new()));
+        }
+        let aot = route
+            .get_mut("target")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .with_context(|| format!("route {id:?} has a non-array `target` key"))?;
+        aot.push(table);
+        Ok(())
+    }
+
+    /// Remove target 1..N by its position **in the `target` array** — so the
+    /// wizard's "target 1" is index 0 here, and target 0 is not removable
+    /// because it is not in the array.
+    ///
+    /// A comment introducing a `[[…target]]` block lives in that *table's*
+    /// prefix decor, and `ArrayOfTables::remove` drops it with the block.
+    /// `comment_above` cannot reach a target header — it is scoped to
+    /// `[routes.<id>]` and stops at the first `\n[`. That loss is accepted and
+    /// documented rather than half-fixed: the rule `remove_scalar_keeping_comment`
+    /// exists for (`api_key` is the key a user annotates by hand) does not hold
+    /// for a generated target block.
+    pub fn remove_route_target(&mut self, id: &str, index: usize) -> Result<()> {
+        let routes = self
+            .doc
+            .get_mut("routes")
+            .and_then(|r| r.as_table_like_mut())
+            .with_context(|| format!("no [routes] section to edit for {id:?}"))?;
+        let route = routes
+            .get_mut(id)
+            .and_then(|r| r.as_table_like_mut())
+            .with_context(|| format!("no route named {id:?}"))?;
+        let aot = route
+            .get_mut("target")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .with_context(|| format!("route {id:?} has no targets"))?;
+
+        if index >= aot.len() {
+            anyhow::bail!(
+                "route {id:?} has {} target(s); there is no target {}",
+                aot.len(),
+                index + 1
+            );
+        }
+        aot.remove(index);
+
+        // Emptying the array drops the key outright. A bare `target = []` is
+        // valid TOML that means the same thing, but it is a key the wizard
+        // invented and `default_config_text()` never writes, so leaving it would
+        // show up as a diff against a fresh config for no reason.
+        if aot.is_empty() {
+            route.remove("target");
+        }
+        Ok(())
+    }
+
+    /// Replace one scalar inside `[[routes.<id>.target]]` entry `index`.
+    ///
+    /// `index` is the **array** index, as in `remove_route_target`. This does
+    /// not go through `set_scalar`/`table_mut`, which walk a path of *tables*:
+    /// `target` is an array of tables, so a numeric path segment does not
+    /// address its entries. The lookup is spelled out here instead, and the
+    /// decor discipline `set_scalar` documents — clone the old line's decor so
+    /// a trailing `# comment` survives — is applied to the table we fetch.
+    pub fn set_route_target_scalar(
+        &mut self,
+        id: &str,
+        index: usize,
+        key: &str,
+        value: impl Into<Value>,
+    ) -> Result<()> {
+        let entry = self.target_table_mut(id, index)?;
+        let new = match entry.get_mut(key).and_then(|i| i.as_value_mut()) {
+            Some(slot) => {
+                let mut item = toml_edit::value(value);
+                if let Some(dst) = item.as_value_mut() {
+                    dst.decor_mut().clone_from(slot.decor());
+                }
+                item
+            }
+            None => toml_edit::value(value),
+        };
+        entry.insert(key, new);
+        Ok(())
+    }
+
+    /// Drop one scalar from a target. Returns whether it was there.
+    ///
+    /// Unlike the route-level `remove_route_scalar_keeping_comment`, no attempt
+    /// is made to graft a comment: a target's introducing comment lives in the
+    /// table's prefix decor, not above the individual key, so there is nothing
+    /// for `comment_above` to find here.
+    pub fn remove_route_target_scalar(&mut self, id: &str, index: usize, key: &str) -> bool {
+        self.target_table_mut(id, index)
+            .ok()
+            .and_then(|t| t.remove(key))
+            .is_some()
+    }
+
+    /// The `index`-th `[[routes.<id>.target]]` table, or an error naming why not.
+    fn target_table_mut(&mut self, id: &str, index: usize) -> Result<&mut Table> {
+        let routes = self
+            .doc
+            .get_mut("routes")
+            .and_then(|r| r.as_table_like_mut())
+            .with_context(|| format!("no [routes] section for {id:?}"))?;
+        let route = routes
+            .get_mut(id)
+            .and_then(|r| r.as_table_like_mut())
+            .with_context(|| format!("no route named {id:?}"))?;
+        let aot = route
+            .get_mut("target")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .with_context(|| format!("route {id:?} has no targets"))?;
+        // Read the length before the mutable borrow: `with_context` takes a
+        // closure that would otherwise capture `aot` and borrow it a second
+        // time while `get_mut`'s borrow is still live.
+        let len = aot.len();
+        aot.get_mut(index).with_context(|| {
+            format!(
+                "route {id:?} has {len} target(s); there is no target {}",
+                index + 1
+            )
+        })
+    }
+
+    /// The full target chain as `provider/model` strings, target 0 first.
+    ///
+    /// Parsed back through the config layer rather than read out of the
+    /// document, so the list the user sees is the list the gateway will honor —
+    /// including the synthesized target 0, which exists in no `[[…target]]`
+    /// block.
+    pub fn route_targets(&self, id: &str) -> Vec<(String, String)> {
+        let Ok(cfg) = crate::config::load_from_str(&self.as_str()) else {
+            return Vec::new();
+        };
+        cfg.routes
+            .get(id)
+            .map(|r| {
+                r.targets()
+                    .iter()
+                    .map(|t| (t.provider.clone(), t.model.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Routes that reference a provider, with the upstream model, so error
     /// messages can name them.
     pub fn routes_using(&self, provider: &str) -> Vec<(String, String)> {
@@ -452,6 +662,25 @@ impl RouteDraft {
     /// expect to see in the picker.
     pub const FAMILIES: [&'static str; 4] = ["sonnet", "opus", "haiku", "other"];
 }
+
+/// The fields the wizard collects for one `[[routes.<id>.target]]` block.
+///
+/// `provider`/`model` are required here, unlike on `RouteDraft` — a target with
+/// no provider is not target 0, it is nothing, and `config::validate` would
+/// reject it. The optionals follow the same rule as `RouteDraft`: `None` omits
+/// the key rather than writing an empty value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetDraft {
+    pub provider: String,
+    pub model: String,
+    pub display_name: Option<String>,
+    pub context_tokens: Option<u64>,
+}
+
+/// The `strategy` values, in the order the wizard offers them. Kebab-case to
+/// match the config file (`Strategy`'s serde rename), unlike the snake_case
+/// config *keys* around them.
+pub const STRATEGIES: [&str; 3] = ["static", "load-balance", "failover"];
 
 /// Search defaults, so `setup` can write a `[search]` block that `doctor` and
 /// `SearchManager::from_config` both accept.
@@ -776,5 +1005,323 @@ mod tests {
         .unwrap();
         assert!(has_inline_key(&doc, "zen"));
         assert!(!has_inline_key(&doc, "nope"));
+    }
+
+    // --- targets -----------------------------------------------------------
+
+    fn draft(provider: &str, model: &str) -> TargetDraft {
+        TargetDraft {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            display_name: None,
+            context_tokens: None,
+        }
+    }
+
+    /// A route with no `[[…target]]` yet: the array is created on first use
+    /// rather than requiring an existing key.
+    #[test]
+    fn add_target_creates_the_aot_when_absent() {
+        let mut doc = starter();
+        assert!(
+            !doc.as_str().contains(".target]]"),
+            "starter should have no target blocks"
+        );
+
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "claude-sonnet-4-5"))
+            .unwrap();
+
+        let out = doc.as_str();
+        assert!(
+            out.contains("[[routes.\"claude-sonnet-5\".target]]"),
+            "expected a target header, got:\n{out}"
+        );
+        // The key is quoted, matching what `config.toml` and the starter do.
+        assert!(
+            out.contains("\"claude-sonnet-5\""),
+            "route key lost its quotes"
+        );
+
+        // And the config layer sees it as target 1, behind the flat pair.
+        let cfg = doc.validated().unwrap();
+        let r = &cfg.routes["claude-sonnet-5"];
+        let targets = r.targets();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].provider, "zen");
+        assert_eq!(targets[1].provider, "zen");
+        assert_eq!(targets[1].model, "claude-sonnet-4-5");
+    }
+
+    /// A second target appends to the existing array instead of clobbering it.
+    #[test]
+    fn add_target_appends_to_an_existing_aot() {
+        let mut doc = starter();
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "first"))
+            .unwrap();
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "second"))
+            .unwrap();
+
+        let out = doc.as_str();
+        assert_eq!(
+            out.matches("[[routes.\"claude-sonnet-5\".target]]").count(),
+            2,
+            "expected two headers:\n{out}"
+        );
+
+        let cfg = doc.validated().unwrap();
+        let targets = cfg.routes["claude-sonnet-5"].targets();
+        assert_eq!(targets.len(), 3);
+        // Order is declaration order: flat pair, then first, then second.
+        assert_eq!(targets[1].model, "first");
+        assert_eq!(targets[2].model, "second");
+    }
+
+    /// A target naming a provider that does not exist is refused *before* any
+    /// mutation — a wizard error must leave the document byte-identical.
+    #[test]
+    fn add_target_rejects_unknown_provider() {
+        let mut doc = starter();
+        let before = doc.as_str();
+        let err = doc
+            .add_route_target("claude-sonnet-5", &draft("nope", "m"))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown provider"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(doc.as_str(), before, "document changed on a rejected add");
+    }
+
+    /// An unknown route id is refused the same way.
+    #[test]
+    fn add_target_rejects_unknown_route() {
+        let mut doc = starter();
+        let before = doc.as_str();
+        let err = doc
+            .add_route_target("no-such-route", &draft("zen", "m"))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no route named"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(doc.as_str(), before, "document changed on a rejected add");
+    }
+
+    /// Removing index 0 leaves the second target as the sole extra — the
+    /// remaining block keeps its own provider/model rather than sliding a
+    /// stale one into place.
+    #[test]
+    fn remove_target_reindexes() {
+        let mut doc = starter();
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "first"))
+            .unwrap();
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "second"))
+            .unwrap();
+
+        doc.remove_route_target("claude-sonnet-5", 0).unwrap();
+
+        let cfg = doc.validated().unwrap();
+        let targets = cfg.routes["claude-sonnet-5"].targets();
+        assert_eq!(targets.len(), 2, "one extra target should remain");
+        assert_eq!(targets[1].model, "second");
+    }
+
+    /// Removing the last one drops the `target` key outright: a bare
+    /// `target = []` is valid but is a key the wizard invented, and it would
+    /// show as a diff against a freshly written config.
+    #[test]
+    fn remove_last_target_drops_the_key() {
+        let mut doc = starter();
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "only"))
+            .unwrap();
+        doc.remove_route_target("claude-sonnet-5", 0).unwrap();
+
+        let out = doc.as_str();
+        assert!(!out.contains(".target]]"), "target header survived:\n{out}");
+        assert!(!out.contains("target = []"), "left a bare array:\n{out}");
+        assert!(!out.contains("target ="), "left a target key:\n{out}");
+
+        // And the route still resolves to exactly its flat pair.
+        let cfg = doc.validated().unwrap();
+        assert_eq!(cfg.routes["claude-sonnet-5"].targets().len(), 1);
+    }
+
+    /// Removing an index that is not there is an error, not a silent no-op.
+    #[test]
+    fn remove_target_out_of_range_is_an_error() {
+        let mut doc = starter();
+        let err = doc.remove_route_target("claude-sonnet-5", 0).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no target"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// A scalar inside a target block round-trips, and clearing it removes the
+    /// key rather than writing an empty value.
+    #[test]
+    fn target_scalar_round_trips_and_clears() {
+        let mut doc = starter();
+        let mut t = draft("zen", "claude-sonnet-4-5");
+        t.display_name = Some("Zen primary".into());
+        t.context_tokens = Some(200_000);
+        doc.add_route_target("claude-sonnet-5", &t).unwrap();
+
+        let cfg = doc.validated().unwrap();
+        let targets = cfg.routes["claude-sonnet-5"].targets();
+        assert_eq!(targets[1].display_name.as_deref(), Some("Zen primary"));
+        assert_eq!(targets[1].context_tokens, Some(200_000));
+
+        // Overwrite, then clear both.
+        doc.set_route_target_scalar("claude-sonnet-5", 0, "context_tokens", 128_000i64)
+            .unwrap();
+        let cfg = doc.validated().unwrap();
+        assert_eq!(
+            cfg.routes["claude-sonnet-5"].targets()[1].context_tokens,
+            Some(128_000)
+        );
+
+        assert!(doc.remove_route_target_scalar("claude-sonnet-5", 0, "display_name"));
+        assert!(doc.remove_route_target_scalar("claude-sonnet-5", 0, "context_tokens"));
+        let out = doc.as_str();
+        assert!(
+            !out.contains("Zen primary"),
+            "display_name survived:\n{out}"
+        );
+        assert!(!out.contains("128000"), "context_tokens survived:\n{out}");
+
+        // Clearing a key that is not there reports false rather than failing.
+        assert!(!doc.remove_route_target_scalar("claude-sonnet-5", 0, "display_name"));
+    }
+
+    /// Adding a target must not disturb the route's own fields — `targets()`
+    /// synthesizes target 0 from them, so an edit there would silently change
+    /// what target 0 reports.
+    #[test]
+    fn add_target_leaves_route_fields_alone() {
+        let mut doc = starter();
+        let before = crate::config::load_from_str(&doc.as_str()).unwrap();
+        let before_route = before.routes["claude-sonnet-5"].clone();
+
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "fallback"))
+            .unwrap();
+
+        let after = crate::config::load_from_str(&doc.as_str()).unwrap();
+        let after_route = &after.routes["claude-sonnet-5"];
+        assert_eq!(after_route.provider, before_route.provider);
+        assert_eq!(after_route.model, before_route.model);
+        assert_eq!(after_route.display_name, before_route.display_name);
+        assert_eq!(after_route.family, before_route.family);
+        assert_eq!(after_route.max_tokens, before_route.max_tokens);
+        assert_eq!(after_route.context_tokens, before_route.context_tokens);
+        // Target 0 still reports the route's own pair.
+        assert_eq!(after_route.targets()[0].model, before_route.model);
+    }
+
+    /// The block the wizard wrote is a valid config, and the route resolves to
+    /// the new target's upstream id as well as its own.
+    #[test]
+    fn added_target_block_is_valid_config() {
+        let mut doc = starter();
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "claude-sonnet-4-5"))
+            .unwrap();
+        let cfg = doc.validated().unwrap();
+        assert!(cfg.routes.contains_key("claude-sonnet-5"));
+        // Rule 2 of resolution scans the whole chain, so the target's upstream
+        // id now resolves too.
+        let r = cfg.resolve("claude-sonnet-4-5").unwrap();
+        assert_eq!(r.upstream_model, "claude-sonnet-4-5");
+    }
+
+    /// A target appended to a mid-file route lands on that route, not on a
+    /// neighbour — the array is fetched through the named route, not by
+    /// position.
+    #[test]
+    fn add_target_lands_on_the_named_route_only() {
+        let mut doc = Doc::parse(
+            "[providers.zen]\nspec = \"anthropic\"\nbase_url = \"https://x\"\n\n\
+             [routes.a]\nprovider = \"zen\"\nmodel = \"ma\"\n\n\
+             [routes.b]\nprovider = \"zen\"\nmodel = \"mb\"\n\n\
+             [routes.c]\nprovider = \"zen\"\nmodel = \"mc\"\n",
+        )
+        .unwrap();
+
+        doc.add_route_target("b", &draft("zen", "extra")).unwrap();
+
+        let cfg = doc.validated().unwrap();
+        assert_eq!(cfg.routes["a"].targets().len(), 1);
+        assert_eq!(cfg.routes["b"].targets().len(), 2);
+        assert_eq!(cfg.routes["c"].targets().len(), 1);
+        assert_eq!(cfg.routes["b"].targets()[1].model, "extra");
+    }
+
+    /// `route_targets` reports the full chain, target 0 first, including the
+    /// synthesized entry that exists in no `[[…target]]` block.
+    #[test]
+    fn route_targets_lists_target_zero_first() {
+        let mut doc = starter();
+        assert_eq!(doc.route_targets("claude-sonnet-5").len(), 1);
+
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "extra"))
+            .unwrap();
+
+        let chain = doc.route_targets("claude-sonnet-5");
+        assert_eq!(chain.len(), 2);
+        // Target 0 is the route's own pair, not the block we appended.
+        assert_eq!(
+            chain[0],
+            ("zen".to_string(), "claude-sonnet-4-5".to_string())
+        );
+        assert_eq!(chain[1], ("zen".to_string(), "extra".to_string()));
+
+        // An unknown route is an empty chain, not a panic.
+        assert!(doc.route_targets("nope").is_empty());
+    }
+
+    /// The strategy write path is `set_route_scalar`, and the unset path drops
+    /// the key. Both have to survive the config layer.
+    #[test]
+    fn strategy_scalar_round_trips_and_clears() {
+        let mut doc = starter();
+        doc.set_route_scalar("claude-sonnet-5", "strategy", "failover")
+            .unwrap();
+        let cfg = doc.validated().unwrap();
+        assert_eq!(
+            cfg.routes["claude-sonnet-5"].strategy,
+            crate::config::Strategy::Failover
+        );
+
+        assert!(doc.remove_route_scalar_keeping_comment("claude-sonnet-5", "strategy"));
+        let out = doc.as_str();
+        assert!(!out.contains("strategy"), "strategy key survived:\n{out}");
+        let cfg = doc.validated().unwrap();
+        assert_eq!(
+            cfg.routes["claude-sonnet-5"].strategy,
+            crate::config::Strategy::Static
+        );
+    }
+
+    /// A target add/remove cycle preserves every comment in the starter.
+    ///
+    /// Removal loses the *target block's own* introducing comment — that is
+    /// documented behavior, and there is no such comment in the starter, so the
+    /// property this pins is that nothing else is disturbed.
+    #[test]
+    fn target_cycle_preserves_route_comments() {
+        let before = starter().comments();
+        let mut doc = starter();
+
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "extra"))
+            .unwrap();
+        doc.remove_route_target("claude-sonnet-5", 0).unwrap();
+
+        let after = doc.comments();
+        for c in &before {
+            assert!(
+                after.contains(c),
+                "comment lost across a target cycle: {c}\n{}",
+                doc.as_str()
+            );
+        }
     }
 }

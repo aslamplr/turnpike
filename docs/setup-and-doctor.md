@@ -73,7 +73,32 @@ second question.
 - **Routes** — list / add / edit / remove over the route fields. `family` is a
   menu whose first entry is `(infer from upstream model)`, so the common path is
   one keystroke. Optional fields are asked one at a time and an empty answer
-  **omits** the key rather than writing `key = ""`.
+  **omits** the key rather than writing `key = ""`. The list view renders the
+  whole target chain, not just target 0: `claude-sonnet-5 -> zen-go/v4-flash
+  [failover, 3 targets]`. Editing a route offers two more entries:
+
+  - **strategy** — `static` / `load-balance` / `failover`, defaulting to the
+    route's current value. `static` **omits** the key rather than writing
+    `strategy = "static"`, the same omit-when-default discipline as an empty
+    optional. A non-`static` choice on a route with fewer than 2 targets prints
+    the requirement and writes nothing — the wizard will not create the state
+    `routes-strategy` warns about.
+  - **Targets** — the `[[routes.<id>.target]]` chain, listed with `target 0`
+    labelled *the route's own pair*, then Add / Edit / Remove / Back. Add asks
+    the provider from a menu of `[providers.*]` ids, the upstream model, then
+    `display_name` / `context_tokens` with the same omit-on-empty rule. Target 0
+    is never written: the route's own flat `provider`/`model` is edited through
+    the route's ordinary fields, and a block for it would give the route two
+    target 0s.
+
+  Removing a target **loses its introducing comment**: a `# …` line above a
+  `[[…target]]` header lives in that table's prefix decor, and dropping the
+  block drops the comment with it. `comment_above`'s preservation rule is scoped
+  to the route's own `[routes.<id>]` section — it exists for scalars a user
+  annotates (`api_key`) — and a half-working graft for a second header shape
+  would be worse than a known limit. Removing down to one target also resets a
+  stranded non-`static` strategy to `static` and says so, undoing the gate above
+  rather than leaving a file the user's own `doctor` complains about.
 - **Keys** — per provider: paste a value (encrypted into the store), name an env
   var (writes `api_key_env`), or leave it unset. The paste path uses
   `ask_secret`, which turns terminal echo off and **never logs or echoes the

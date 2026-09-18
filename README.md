@@ -176,6 +176,11 @@ committed, so there is no mid-stream failover. An unknown `strategy` value is a
 parse error, not a silent fallback. The full story, including the context-window
 rule, is in [docs/routing.md](docs/routing.md).
 
+`turnpike setup` writes these blocks too — Routes → edit a route → **Targets** —
+appending to the `target` array and never rewriting target 0. A non-`static`
+`strategy` needs 2+ targets, so the wizard refuses one until a second target
+exists and resets a stranded strategy when a removal leaves only one.
+
 ### OpenCode Go subscription
 
 Models on the Go plan live under `https://opencode.ai/zen/go/v1/` and are
