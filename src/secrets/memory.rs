@@ -19,7 +19,11 @@ pub struct MemoryStore {
 #[allow(dead_code)]
 impl MemoryStore {
     pub fn new(label: impl Into<String>) -> Self {
-        Self { label: label.into(), entries: BTreeMap::new(), saved: false }
+        Self {
+            label: label.into(),
+            entries: BTreeMap::new(),
+            saved: false,
+        }
     }
 
     /// Seed a value, so a test can write

@@ -80,8 +80,10 @@ pub fn router(gw: Arc<Gateway>) -> Router {
 
 async fn health() -> Response {
     let mut res = StatusCode::NO_CONTENT.into_response();
-    res.headers_mut()
-        .insert(HeaderName::from_static(HEALTH_HEADER_NAME), HeaderValue::from_static("1"));
+    res.headers_mut().insert(
+        HeaderName::from_static(HEALTH_HEADER_NAME),
+        HeaderValue::from_static("1"),
+    );
     res
 }
 
@@ -124,7 +126,10 @@ async fn count_tokens(State(gw): State<Arc<Gateway>>, headers: HeaderMap, body: 
         Ok(v) => v,
         Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, format!("decode request: {e}")),
     };
-    let model = payload.get("model").and_then(Value::as_str).unwrap_or_default();
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if let Err(e) = gw.config.resolve(model) {
         return resolve_error(StatusCode::BAD_REQUEST, &e, Family::Anthropic);
     }
@@ -186,12 +191,22 @@ async fn forward(
         return res;
     }
     if body.len() > MAX_BODY_BYTES {
-        return spec_error(family, StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+        return spec_error(
+            family,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+        );
     }
 
     let mut payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return spec_error(family, StatusCode::BAD_REQUEST, format!("decode request body: {e}")),
+        Err(e) => {
+            return spec_error(
+                family,
+                StatusCode::BAD_REQUEST,
+                format!("decode request body: {e}"),
+            )
+        }
     };
 
     let requested = payload
@@ -209,7 +224,11 @@ async fn forward(
     };
 
     if family_for_path(path) != Some(family) {
-        return spec_error(family, StatusCode::INTERNAL_SERVER_ERROR, "unsupported path");
+        return spec_error(
+            family,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unsupported path",
+        );
     }
     let provider_spec = spec_of(resolved.provider_cfg.spec);
     tracing::info!(
@@ -232,7 +251,13 @@ async fn forward(
         payload["model"] = Value::String(resolved.upstream_model.clone());
         let rewritten = match serde_json::to_vec(&payload) {
             Ok(v) => v,
-            Err(e) => return spec_error(family, StatusCode::BAD_REQUEST, format!("encode request body: {e}")),
+            Err(e) => {
+                return spec_error(
+                    family,
+                    StatusCode::BAD_REQUEST,
+                    format!("encode request body: {e}"),
+                )
+            }
         };
 
         let url = format!(
@@ -281,7 +306,11 @@ async fn forward(
              this endpoint requires the {} spec",
             resolved.provider,
             resolved.provider_cfg.spec,
-            if family == Family::Anthropic { "anthropic" } else { "openai" }
+            if family == Family::Anthropic {
+                "anthropic"
+            } else {
+                "openai"
+            }
         ),
     )
 }
@@ -316,10 +345,13 @@ async fn bridge(
         strip_server_tools(&mut payload);
     }
 
-    let openai_payload = match crate::translate::request_to_openai(&payload, &resolved.upstream_model) {
-        Ok(v) => v,
-        Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, format!("bridge request: {e}")),
-    };
+    let openai_payload =
+        match crate::translate::request_to_openai(&payload, &resolved.upstream_model) {
+            Ok(v) => v,
+            Err(e) => {
+                return anthropic_error(StatusCode::BAD_REQUEST, format!("bridge request: {e}"))
+            }
+        };
 
     let tool_count = openai_payload
         .get("tools")
@@ -339,7 +371,17 @@ async fn bridge(
                 middleware = "off",
                 "bridge: single-shot path"
             );
-            return single_shot_bridge(gw, resolved, key, headers, openai_payload, requested, stream, input_estimate).await;
+            return single_shot_bridge(
+                gw,
+                resolved,
+                key,
+                headers,
+                openai_payload,
+                requested,
+                stream,
+                input_estimate,
+            )
+            .await;
         }
     };
     let max_loops = gw.search_max_loops;
@@ -396,10 +438,7 @@ async fn bridge(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "search loop: upstream 2xx was not JSON");
-                return anthropic_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("decode upstream: {e}"),
-                );
+                return anthropic_error(StatusCode::BAD_GATEWAY, format!("decode upstream: {e}"));
             }
         };
         total_input += openai_json
@@ -498,10 +537,12 @@ async fn bridge(
         "search loop complete: assembling final response"
     );
 
-    let final_openai = final_openai.unwrap_or_else(|| json!({
-        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": ""}}],
-        "usage": {"prompt_tokens": total_input, "completion_tokens": total_output}
-    }));
+    let final_openai = final_openai.unwrap_or_else(|| {
+        json!({
+            "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": ""}}],
+            "usage": {"prompt_tokens": total_input, "completion_tokens": total_output}
+        })
+    });
 
     let mut response = crate::translate::response_to_anthropic(
         &final_openai,
@@ -558,7 +599,9 @@ async fn bridge(
             .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
             .header(axum::http::header::CACHE_CONTROL, "no-cache")
             .body(Body::from(sse))
-            .unwrap_or_else(|e| anthropic_error(StatusCode::BAD_GATEWAY, format!("stream setup failed: {e}")))
+            .unwrap_or_else(|e| {
+                anthropic_error(StatusCode::BAD_GATEWAY, format!("stream setup failed: {e}"))
+            })
     } else {
         Json(response).into_response()
     }
@@ -615,7 +658,10 @@ async fn single_shot_bridge(
         let bytes = match upstream.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                return anthropic_error(StatusCode::BAD_GATEWAY, format!("upstream read failed: {e}"))
+                return anthropic_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("upstream read failed: {e}"),
+                )
             }
         };
         let openai_json: Value = match serde_json::from_slice(&bytes) {
@@ -663,7 +709,12 @@ async fn send_openai_chat(
 ) -> Result<reqwest::Response, Response> {
     let body = match serde_json::to_vec(payload) {
         Ok(v) => v,
-        Err(e) => return Err(anthropic_error(StatusCode::BAD_REQUEST, format!("bridge encode: {e}"))),
+        Err(e) => {
+            return Err(anthropic_error(
+                StatusCode::BAD_REQUEST,
+                format!("bridge encode: {e}"),
+            ))
+        }
     };
     let mut req = gw.http.request(Method::POST, upstream_chat_url(resolved));
     for (name, value) in filtered_request_headers(headers) {
@@ -749,10 +800,7 @@ fn has_turnpike_search_tool(openai_payload: &Value) -> bool {
 /// Remove Anthropic server-tool declarations (web_search_*) whose execution
 /// turnpike cannot take over (no search provider configured).
 fn strip_server_tools(payload: &mut Value) {
-    if let Some(tools) = payload
-        .get_mut("tools")
-        .and_then(Value::as_array_mut)
-    {
+    if let Some(tools) = payload.get_mut("tools").and_then(Value::as_array_mut) {
         tools.retain(|t| {
             let ttype = t.get("type").and_then(Value::as_str).unwrap_or("");
             !ttype.starts_with("web_search")
@@ -1000,8 +1048,8 @@ fn spec_of(s: crate::config::Spec) -> Family {
 /// Stream the upstream response straight back to the client, copying headers
 /// minus hop-by-hop framing.
 async fn turnpike_response(upstream: reqwest::Response) -> Response {
-    let status = StatusCode::from_u16(upstream.status().as_u16())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     {
         let headers = builder.headers_mut().expect("fresh builder");
@@ -1076,7 +1124,9 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
-    HOP_BY_HOP.iter().any(|h| name.as_str().eq_ignore_ascii_case(h))
+    HOP_BY_HOP
+        .iter()
+        .any(|h| name.as_str().eq_ignore_ascii_case(h))
 }
 
 /// Strip client credentials, hop-by-hop framing, and content negotiation.
@@ -1121,11 +1171,16 @@ fn provider_extra_headers(cfg: &crate::config::ProviderCfg) -> Vec<(HeaderName, 
     out
 }
 
-fn inject_auth(req: reqwest::RequestBuilder, spec: crate::config::Spec, key: &str) -> reqwest::RequestBuilder {
+fn inject_auth(
+    req: reqwest::RequestBuilder,
+    spec: crate::config::Spec,
+    key: &str,
+) -> reqwest::RequestBuilder {
     match spec {
         crate::config::Spec::Anthropic => {
             // Anthropic transport: x-api-key (+ a version if the client omitted it).
-            req.header("x-api-key", key).header("anthropic-version", "2023-06-01")
+            req.header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01")
         }
         crate::config::Spec::Openai | crate::config::Spec::OpenaiCompatible => {
             req.header(axum::http::header::AUTHORIZATION, format!("Bearer {key}"))
@@ -1222,8 +1277,9 @@ mod tests {
     use crate::config::Config;
 
     fn config() -> Arc<Config> {
-        Arc::new(toml::from_str(
-            r#"
+        Arc::new(
+            toml::from_str(
+                r#"
 [server]
 listen = "127.0.0.1:8710"
 
@@ -1237,8 +1293,9 @@ provider = "zen"
 model = "claude-sonnet-4-5"
 display_name = "Sonnet 5"
 "#,
+            )
+            .unwrap(),
         )
-        .unwrap())
     }
 
     #[test]
@@ -1288,7 +1345,9 @@ display_name = "Sonnet 5"
             .uri("/v1/messages")
             .header("host", "127.0.0.1:8710")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"nope","max_tokens":1,"messages":[]}"#))
+            .body(Body::from(
+                r#"{"model":"nope","max_tokens":1,"messages":[]}"#,
+            ))
             .unwrap();
         let res = tower::ServiceExt::oneshot(res, req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
@@ -1419,7 +1478,11 @@ model = "claude-sonnet-4-5"
         assert_eq!(model["messages"][0]["role"], "user"); // passthrough preserved
         let key = seen_key.lock().await.take().expect("stub saw key");
         assert_eq!(key, "upstream-secret"); // client placeholder replaced
-        let session = seen_session.lock().await.take().expect("stub saw extra header");
+        let session = seen_session
+            .lock()
+            .await
+            .take()
+            .expect("stub saw extra header");
         assert_eq!(session, "sess-42"); // provider extra_headers injected
     }
 
@@ -1427,8 +1490,7 @@ model = "claude-sonnet-4-5"
     async fn bridges_anthropic_client_to_openai_upstream_non_streaming() {
         // Stub OpenAI chat-completions upstream: records what it got, replies
         // in OpenAI shape.
-        let seen: Arc<tokio::sync::Mutex<Option<Value>>> =
-            Arc::new(tokio::sync::Mutex::new(None));
+        let seen: Arc<tokio::sync::Mutex<Option<Value>>> = Arc::new(tokio::sync::Mutex::new(None));
         let rx = seen.clone();
         let stub = axum::Router::new()
             .route(
@@ -1612,7 +1674,7 @@ model = "deepseek-v4-flash"
         assert!(text.contains("\"partial_json\":\"{\\\"city\\\":"));
         assert!(text.contains("\"partial_json\":\"\\\"Paris\\\"}\""));
         assert!(text.contains("\"stop_reason\":\"tool_use\""));
-        assert!(text.contains("\"output_tokens\":8") == false);
+        assert!(!text.contains("\"output_tokens\":8"));
         assert!(text.contains("\"input_tokens\":")); // estimated at start, real usage in message_delta
     }
 
@@ -1690,9 +1752,9 @@ api_key = "test-key"
         );
         let cfg: Config = toml::from_str(&cfg_text).unwrap();
         let mut gw = Gateway::new(Arc::new(cfg));
-        gw.search = Some(Arc::new(crate::search::SearchManager::new(Some(
-            Box::new(MockSearch),
-        ))));
+        gw.search = Some(Arc::new(crate::search::SearchManager::new(Some(Box::new(
+            MockSearch,
+        )))));
         let res = router(Arc::new(gw));
 
         // Client declares Anthropic's web_search server tool and pins
@@ -1734,10 +1796,7 @@ api_key = "test-key"
         let calls = seen.lock().await;
         assert_eq!(calls.len(), 2);
         // First iteration honored the pinned tool_choice…
-        assert_eq!(
-            calls[0]["tool_choice"]["function"]["name"],
-            "web_search"
-        );
+        assert_eq!(calls[0]["tool_choice"]["function"]["name"], "web_search");
         // …and the follow-up was relaxed to auto so the model can answer.
         assert_eq!(calls[1]["tool_choice"], "auto");
         let second = &calls[1];
@@ -1752,7 +1811,10 @@ api_key = "test-key"
             .find(|m| m["role"] == "tool")
             .expect("tool result appended");
         assert_eq!(tool_msg["tool_call_id"], "call_ws");
-        assert!(tool_msg["content"].as_str().unwrap().contains("About rust gateway"));
+        assert!(tool_msg["content"]
+            .as_str()
+            .unwrap()
+            .contains("About rust gateway"));
         // Loop ran non-streaming upstream even though the client streamed.
         assert_eq!(second["stream"], false);
     }
@@ -1760,8 +1822,7 @@ api_key = "test-key"
     #[tokio::test]
     async fn search_middleware_disabled_strips_server_tools() {
         // No [search] config → server tools are dropped, not forwarded.
-        let seen: Arc<tokio::sync::Mutex<Option<Value>>> =
-            Arc::new(tokio::sync::Mutex::new(None));
+        let seen: Arc<tokio::sync::Mutex<Option<Value>>> = Arc::new(tokio::sync::Mutex::new(None));
         let rx = seen.clone();
         let stub = axum::Router::new()
             .route(

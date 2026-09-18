@@ -24,7 +24,11 @@ impl ClaudeCode {
     /// Locate the claude binary: PATH, then the well-known install fallbacks.
     pub fn find_path(&self) -> Option<PathBuf> {
         if let Ok(p) = std::env::var("PATH") {
-            let name = if cfg!(windows) { "claude.exe" } else { "claude" };
+            let name = if cfg!(windows) {
+                "claude.exe"
+            } else {
+                "claude"
+            };
             for dir in std::env::split_paths(&p) {
                 let candidate = dir.join(name);
                 if candidate.is_file() {
@@ -61,8 +65,11 @@ impl ClaudeCode {
             .context("running claude installer")?;
         anyhow::ensure!(status.success(), "failed to install claude");
 
-        self.find_path()
-            .ok_or_else(|| anyhow::anyhow!("claude was installed but the binary was not found on PATH; restart your shell"))
+        self.find_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "claude was installed but the binary was not found on PATH; restart your shell"
+            )
+        })
     }
 
     /// Environment variables routing all Claude Code model tiers through the
@@ -107,7 +114,13 @@ impl ClaudeCode {
     }
 
     /// Spawn claude attached to the current terminal.
-    pub fn run(&self, config: &Config, model: &str, extra: &[String], install: bool) -> anyhow::Result<()> {
+    pub fn run(
+        &self,
+        config: &Config,
+        model: &str,
+        extra: &[String],
+        install: bool,
+    ) -> anyhow::Result<()> {
         let claude = self.ensure_installed(install)?;
         let mut cmd = Command::new(claude);
         cmd.arg("--model").arg(model);
@@ -122,7 +135,10 @@ impl ClaudeCode {
 
 fn installer_command() -> Option<(&'static str, Vec<&'static str>)> {
     if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
-        Some(("bash", vec!["-c", "curl -fsSL https://claude.ai/install.sh | bash"]))
+        Some((
+            "bash",
+            vec!["-c", "curl -fsSL https://claude.ai/install.sh | bash"],
+        ))
     } else if cfg!(target_os = "windows") {
         Some((
             "powershell",

@@ -114,7 +114,13 @@ impl Check {
         detail: Option<String>,
         fix: Option<String>,
     ) -> Self {
-        Self { id: id.to_string(), status, summary: summary.into(), detail, fix }
+        Self {
+            id: id.to_string(),
+            status,
+            summary: summary.into(),
+            detail,
+            fix,
+        }
     }
 
     fn with_detail(mut self, detail: impl Into<String>) -> Self {
@@ -152,6 +158,13 @@ pub struct DoctorOptions {
 /// The list is a contract, not documentation: `check_list_is_complete` asserts
 /// the produced ids equal it exactly, so a check added without a line here (or a
 /// reorder) fails the build rather than silently drifting.
+///
+/// Only `#[cfg(test)]` code reads this today, which is why it carries the
+/// allowance rather than being deleted: `check_list_is_complete` is a real
+/// assertion about a real contract (a check added without a line here fails the
+/// build), and the constant is the thing it asserts against. `cargo build` sees
+/// no reader; the test profile does.
+#[allow(dead_code)]
 pub const CHECK_IDS: [&str; 20] = [
     "config-found",
     "config-parse",
@@ -277,9 +290,19 @@ pub(crate) async fn diagnose(config_path: Option<PathBuf>, live: bool) -> Vec<Ch
     if let Some(cfg) = cfg.as_mut() {
         secrets::hydrate(cfg, &store);
     }
-    let ctx = Ctx { path: path.clone(), raw, cfg, parse_error, store: Some(store), live };
+    let ctx = Ctx {
+        path: path.clone(),
+        raw,
+        cfg,
+        parse_error,
+        store: Some(store),
+        live,
+    };
 
-    let mut checks = vec![Check::ok("config-found", format!("config at {}", path.display()))];
+    let mut checks = vec![Check::ok(
+        "config-found",
+        format!("config at {}", path.display()),
+    )];
     checks.extend(config_checks(&ctx));
     checks.extend(store_checks(&ctx));
     checks.extend(shape_checks(&ctx));
@@ -312,21 +335,32 @@ fn config_checks(ctx: &Ctx) -> Vec<Check> {
 
     match &ctx.parse_error {
         Some(e) => checks.push(
-            Check::fail("config-parse", "the config is not valid TOML", "fix the syntax error below")
-                .with_detail(e.clone()),
+            Check::fail(
+                "config-parse",
+                "the config is not valid TOML",
+                "fix the syntax error below",
+            )
+            .with_detail(e.clone()),
         ),
         None => checks.push(Check::ok("config-parse", "parses as TOML")),
     }
 
     let Some(cfg) = &ctx.cfg else {
-        checks.push(Check::skip("validate", "skipped — the config did not parse"));
+        checks.push(Check::skip(
+            "validate",
+            "skipped — the config did not parse",
+        ));
         return checks;
     };
 
     match config::validate(cfg) {
         Ok(()) => checks.push(Check::ok(
             "validate",
-            format!("{} providers, {} routes", cfg.providers.len(), cfg.routes.len()),
+            format!(
+                "{} providers, {} routes",
+                cfg.providers.len(),
+                cfg.routes.len()
+            ),
         )),
         Err(e) => checks.push(Check::fail(
             "validate",
@@ -348,27 +382,43 @@ fn config_checks(ctx: &Ctx) -> Vec<Check> {
         }
     }
     if cfg.providers.values().all(|p| p.api_key_env.is_none()) {
-        checks.push(Check::ok("providers-key-env", "no provider uses api_key_env"));
-    } else if unset.is_empty() {
-        checks.push(Check::ok("providers-key-env", "every api_key_env is set and non-empty"));
-    } else {
-        checks.push(Check::warn(
+        checks.push(Check::ok(
             "providers-key-env",
-            format!("{} api_key_env var(s) unset in this shell", unset.len()),
-            "export them, or store the key with `turnpike setup` so the shell does not \
+            "no provider uses api_key_env",
+        ));
+    } else if unset.is_empty() {
+        checks.push(Check::ok(
+            "providers-key-env",
+            "every api_key_env is set and non-empty",
+        ));
+    } else {
+        checks.push(
+            Check::warn(
+                "providers-key-env",
+                format!("{} api_key_env var(s) unset in this shell", unset.len()),
+                "export them, or store the key with `turnpike setup` so the shell does not \
              have to carry it",
-        )
-        .with_detail(unset.join(", ")));
+            )
+            .with_detail(unset.join(", ")),
+        );
     }
 
     let inline: Vec<&String> = cfg
         .providers
         .iter()
-        .filter(|(_, p)| p.api_key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false))
+        .filter(|(_, p)| {
+            p.api_key
+                .as_deref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false)
+        })
         .map(|(id, _)| id)
         .collect();
     if inline.is_empty() {
-        checks.push(Check::ok("providers-key-inline", "no plaintext api_key in the config"));
+        checks.push(Check::ok(
+            "providers-key-inline",
+            "no plaintext api_key in the config",
+        ));
     } else {
         // One WARN for the set, not one per provider: the fix is the same
         // command for all of them, and a wall of identical warnings buries it.
@@ -382,7 +432,18 @@ fn config_checks(ctx: &Ctx) -> Vec<Check> {
             .with_detail(
                 inline
                     .iter()
-                    .map(|id| format!("{id} → api_key (plaintext, in the config file)"))
+                    .map(|id| {
+                        match ctx
+                            .raw
+                            .as_deref()
+                            .and_then(|raw| line_of_in_table(raw, "providers", id, "api_key"))
+                        {
+                            Some(line) => {
+                                format!("{id} → api_key, plaintext, at line {line}")
+                            }
+                            None => format!("{id} → api_key (plaintext, in the config file)"),
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
@@ -444,7 +505,8 @@ fn store_checks(ctx: &Ctx) -> Vec<Check> {
                 } else {
                     c = c.with_detail(format!(
                         "{} is mode {:04o}",
-                        secrets::file::MASTER_KEY_FILE, mode
+                        secrets::file::MASTER_KEY_FILE,
+                        mode
                     ));
                 }
             }
@@ -488,9 +550,7 @@ fn store_checks(ctx: &Ctx) -> Vec<Check> {
                 // to guess which one is in play.
                 if let KeySource::Env(var) = &outcome.source {
                     if p.resolved_key.is_some() {
-                        shadowed.push(format!(
-                            "provider.{id}: ${var} shadows the stored copy"
-                        ));
+                        shadowed.push(format!("provider.{id}: ${var} shadows the stored copy"));
                     }
                 }
             }
@@ -524,8 +584,10 @@ fn store_checks(ctx: &Ctx) -> Vec<Check> {
     }
 
     if unresolved == 0 {
-        checks.push(Check::ok("key-resolvable", "every provider resolves an API key")
-            .with_detail(resolved.join("\n")));
+        checks.push(
+            Check::ok("key-resolvable", "every provider resolves an API key")
+                .with_detail(resolved.join("\n")),
+        );
     } else {
         checks.push(
             Check::warn(
@@ -538,7 +600,10 @@ fn store_checks(ctx: &Ctx) -> Vec<Check> {
     }
 
     if shadowed.is_empty() {
-        checks.push(Check::ok("precedence-shadow", "no stored key is shadowed by an env var"));
+        checks.push(Check::ok(
+            "precedence-shadow",
+            "no stored key is shadowed by an env var",
+        ));
     } else {
         checks.push(
             Check::warn(
@@ -563,7 +628,10 @@ fn store_checks(ctx: &Ctx) -> Vec<Check> {
         }
     }
     if synced.is_empty() {
-        checks.push(Check::ok("store-location", "neither the store nor the config is in a sync folder"));
+        checks.push(Check::ok(
+            "store-location",
+            "neither the store nor the config is in a sync folder",
+        ));
     } else {
         checks.push(
             Check::warn(
@@ -585,10 +653,18 @@ fn store_checks(ctx: &Ctx) -> Vec<Check> {
 fn shape_checks(ctx: &Ctx) -> Vec<Check> {
     let mut checks = Vec::new();
     let Some(cfg) = &ctx.cfg else {
-        for id in ["listen-addr", "search-config", "routes-shape", "base-url-shape"] {
+        for id in [
+            "listen-addr",
+            "search-config",
+            "routes-shape",
+            "base-url-shape",
+        ] {
             checks.push(Check::skip(id, "skipped — the config did not parse"));
         }
-        checks.push(Check::skip("config-perms", "skipped — the config did not parse"));
+        checks.push(Check::skip(
+            "config-perms",
+            "skipped — the config did not parse",
+        ));
         checks.push(Check::skip("backups", "skipped — the config did not parse"));
         return checks;
     };
@@ -628,9 +704,11 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
     let mut seen: std::collections::BTreeMap<(String, String), String> =
         std::collections::BTreeMap::new();
     for (id, route) in &cfg.routes {
-        if let Some(prev) = seen.insert((route.provider.clone(), route.model.clone()), id.clone())
-        {
-            problems.push(format!("{id:?} and {prev:?} both point at {}/{}", route.provider, route.model));
+        if let Some(prev) = seen.insert((route.provider.clone(), route.model.clone()), id.clone()) {
+            problems.push(format!(
+                "{id:?} and {prev:?} both point at {}/{}",
+                route.provider, route.model
+            ));
         }
         if let Some(fam) = &route.family {
             if !KNOWN_FAMILIES.contains(&fam.as_str()) {
@@ -651,7 +729,10 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
         problems.push("no routes are defined, so no model can be requested".to_string());
     }
     if problems.is_empty() {
-        checks.push(Check::ok("routes-shape", format!("{} route(s) look well-formed", cfg.routes.len())));
+        checks.push(Check::ok(
+            "routes-shape",
+            format!("{} route(s) look well-formed", cfg.routes.len()),
+        ));
     } else {
         checks.push(
             Check::warn(
@@ -674,7 +755,8 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
                 if url.scheme() != "http" && url.scheme() != "https" {
                     base_problems.push(format!("{id}: {:?} is not http(s)", p.base_url));
                 }
-                if p.spec == config::Spec::Anthropic && url.path().trim_end_matches('/').ends_with("/v1")
+                if p.spec == config::Spec::Anthropic
+                    && url.path().trim_end_matches('/').ends_with("/v1")
                 {
                     base_problems.push(format!(
                         "{id}: {:?} ends in /v1 — turnpike appends the request path, so this \
@@ -698,26 +780,34 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
         );
     }
 
-    let has_inline = cfg
-        .providers
-        .values()
-        .any(|p| p.api_key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false))
-        || cfg.search.api_key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false);
+    let has_inline = cfg.providers.values().any(|p| {
+        p.api_key
+            .as_deref()
+            .map(|k| !k.trim().is_empty())
+            .unwrap_or(false)
+    }) || cfg
+        .search
+        .api_key
+        .as_deref()
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
     match file_mode(&ctx.path) {
-        Some(mode) if has_inline && mode & 0o077 != 0 => checks.push(
-            Check::warn(
-                "config-perms",
-                format!("the config is mode {mode:04o} and holds a plaintext key"),
-                format!("chmod 600 {}", ctx.path.display()),
+        Some(mode) if has_inline && mode & 0o077 != 0 => checks.push(Check::warn(
+            "config-perms",
+            format!("the config is mode {mode:04o} and holds a plaintext key"),
+            format!("chmod 600 {}", ctx.path.display()),
+        )),
+        Some(mode) => checks.push(
+            Check::ok("config-perms", format!("the config is mode {mode:04o}")).detail_if(
+                has_inline.then(|| {
+                    "it holds a plaintext api_key, so keeping it 0600 matters".to_string()
+                }),
             ),
         ),
-        Some(mode) => checks.push(
-            Check::ok("config-perms", format!("the config is mode {mode:04o}"))
-                .detail_if(has_inline.then(|| {
-                    "it holds a plaintext api_key, so keeping it 0600 matters".to_string()
-                })),
-        ),
-        None => checks.push(Check::skip("config-perms", "file mode is not reported on this platform")),
+        None => checks.push(Check::skip(
+            "config-perms",
+            "file mode is not reported on this platform",
+        )),
     }
 
     // The first-write backup: proves the wizard had something to preserve, and
@@ -728,8 +818,14 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
         .map(|s| s.root.join(secrets::file::BACKUPS_DIR))
         .filter(|d| d.exists());
     match backups {
-        Some(dir) => checks.push(Check::ok("backups", format!("backups in {}", dir.display()))),
-        None => checks.push(Check::skip("backups", "no backup yet — `setup` writes one on first save")),
+        Some(dir) => checks.push(Check::ok(
+            "backups",
+            format!("backups in {}", dir.display()),
+        )),
+        None => checks.push(Check::skip(
+            "backups",
+            "no backup yet — `setup` writes one on first save",
+        )),
     }
 
     checks
@@ -780,7 +876,11 @@ fn launcher_checks() -> Vec<Check> {
         let applied = crate::launch::claude_desktop::uses_turnpike_gateway();
         parts.push(format!(
             "Claude Desktop: {}",
-            if applied { "turnpike gateway profile applied" } else { "no turnpike profile" }
+            if applied {
+                "turnpike gateway profile applied"
+            } else {
+                "no turnpike profile"
+            }
         ));
     } else {
         parts.push("Claude Desktop: not present on this platform".to_string());
@@ -794,7 +894,10 @@ async fn probe_checks(ctx: &Ctx) -> Vec<Check> {
     let Some(cfg) = &ctx.cfg else {
         return vec![
             Check::skip("gateway-detected", "skipped — the config did not parse"),
-            Check::skip("gateway-shadows-config", "skipped — nothing to compare against"),
+            Check::skip(
+                "gateway-shadows-config",
+                "skipped — nothing to compare against",
+            ),
         ];
     };
     let detected = probe_gateway(cfg).await;
@@ -809,7 +912,10 @@ async fn probe_checks(ctx: &Ctx) -> Vec<Check> {
         if ctx.live {
             checks.push(live_provider_check(cfg).await);
         } else {
-            checks.push(Check::skip("provider-reach", "not requested — pass --live to probe providers"));
+            checks.push(Check::skip(
+                "provider-reach",
+                "not requested — pass --live to probe providers",
+            ));
         }
         return checks;
     };
@@ -827,20 +933,36 @@ async fn probe_checks(ctx: &Ctx) -> Vec<Check> {
             "the running gateway serves exactly these routes",
         ));
     } else {
-        let missing: Vec<&String> = ours.iter().copied().filter(|r| !theirs.contains(r)).collect();
-        let extra: Vec<&String> = theirs.iter().copied().filter(|r| !ours.contains(r)).collect();
+        let missing: Vec<&String> = ours
+            .iter()
+            .copied()
+            .filter(|r| !theirs.contains(r))
+            .collect();
+        let extra: Vec<&String> = theirs
+            .iter()
+            .copied()
+            .filter(|r| !ours.contains(r))
+            .collect();
         let mut detail = Vec::new();
         if !missing.is_empty() {
             // In this config, absent from the running gateway.
             detail.push(format!(
                 "in this config only: {}",
-                missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                missing
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         if !extra.is_empty() {
             detail.push(format!(
                 "on the running gateway only: {}",
-                extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                extra
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         checks.push(
@@ -861,7 +983,10 @@ async fn probe_checks(ctx: &Ctx) -> Vec<Check> {
     if ctx.live {
         checks.push(live_provider_check(cfg).await);
     } else {
-        checks.push(Check::skip("provider-reach", "not requested — pass --live to probe providers"));
+        checks.push(Check::skip(
+            "provider-reach",
+            "not requested — pass --live to probe providers",
+        ));
     }
 
     // `return_path` is deliberately unused beyond keeping the borrow story
@@ -896,7 +1021,10 @@ async fn probe_gateway(cfg: &Config) -> Probe {
         Ok(c) => c,
         Err(e) => {
             return Probe {
-                check: Check::skip("gateway-detected", format!("could not build a probe client: {e}")),
+                check: Check::skip(
+                    "gateway-detected",
+                    format!("could not build a probe client: {e}"),
+                ),
                 routes: None,
             }
         }
@@ -988,8 +1116,15 @@ async fn probe_gateway(cfg: &Config) -> Probe {
             };
 
             Probe {
-                check: Check::ok("gateway-detected", format!("a turnpike gateway is running on {base}"))
-                    .detail_if(routes.as_ref().map(|r| format!("{} route(s) advertised", r.len()))),
+                check: Check::ok(
+                    "gateway-detected",
+                    format!("a turnpike gateway is running on {base}"),
+                )
+                .detail_if(
+                    routes
+                        .as_ref()
+                        .map(|r| format!("{} route(s) advertised", r.len())),
+                ),
                 routes,
             }
         }
@@ -1067,10 +1202,45 @@ async fn live_provider_check(cfg: &Config) -> Check {
 // Small helpers
 // ---------------------------------------------------------------------------
 
+/// The 1-based line number of `<key> = …` in the config text, searching only
+/// inside the `[<table>.<id>]` block.
+///
+/// This exists so `providers-key-inline` can say *where* a plaintext key is,
+/// not merely which provider holds one: the provider id is already visible in
+/// the file, and "line 12" is the part a reader cannot get by scanning. One
+/// pass over the raw text, no parser — the config is already known to parse
+/// (or the check would not have run), so a hand-rolled scan for the table
+/// header and the first matching assignment is sufficient and cannot mis-fire
+/// on another table's key.
+fn line_of_in_table(raw: &str, table: &str, id: &str, key: &str) -> Option<usize> {
+    let header = format!("[{table}.{id}]");
+    let mut inside = false;
+    for (i, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            // Any header ends the previous block — including a sub-table that
+            // happens to sit under the one we are scanning.
+            inside = trimmed == header;
+            continue;
+        }
+        if inside {
+            let Some((lhs, _)) = trimmed.split_once('=') else {
+                continue;
+            };
+            if lhs.trim() == key {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
+}
+
 /// `http://127.0.0.1:8710` → `127.0.0.1:8710`, so the probe's Host header
 /// matches the address it dialed.
 fn host_of(base: &str) -> String {
-    base.trim_start_matches("http://").trim_start_matches("https://").to_string()
+    base.trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string()
 }
 
 /// The file mode, on platforms that have one.
@@ -1078,7 +1248,9 @@ fn file_mode(path: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777)
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777)
     }
     #[cfg(not(unix))]
     {
@@ -1143,15 +1315,25 @@ fn print_json(checks: &[Check]) {
         "checks": checks,
         "summary": { "warnings": warns, "failures": fails, "total": checks.len() },
     });
-    println!("{}", serde_json::to_string_pretty(&doc).expect("checks serialize"));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&doc).expect("checks serialize")
+    );
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::secrets::tests::temp_root;
 
     /// A config with a loopback listen, no network, and the standard shape.
+    ///
+    /// Unused: the shape checks are all driven through `write_config` +
+    /// `diagnose` instead, which is strictly better coverage since it exercises
+    /// the real entry point. Kept rather than deleted because it documents the
+    /// fixture the checks are written against.
+    #[allow(dead_code)]
     fn config() -> Config {
         config::load_from_str(
             r#"
@@ -1176,12 +1358,14 @@ model = "claude-sonnet-4-5"
         .unwrap()
     }
 
-    /// A config written to a temp dir, with `TURNPIKE_HOME` pointed at a
-    /// sibling temp dir so `secrets::open` never touches the real store.
+    /// Write a config to a temp dir and return its path.
     ///
-    /// No env mutation: the store root is passed through `$TURNPIKE_HOME` only
-    /// because `FileStore` is constructed by `secrets::open`, which reads it.
-    /// Tests that need a synthetic root use `diagnose_with` below instead.
+    /// This only writes the file — it does **not** redirect the store, and
+    /// nothing here sets `$TURNPIKE_HOME`. `diagnose` opens the store through
+    /// `secrets::open(&path)`, which resolves to the real `~/.turnpike/`, so a
+    /// test that calls `diagnose` directly reads (and, with `live`, can probe)
+    /// the developer's own machine. Use `diagnose_with` below, which takes an
+    /// in-memory store, unless the real store is genuinely what is under test.
     fn write_config(raw: &str) -> PathBuf {
         let dir = temp_root("doctor");
         let path = dir.join("config.toml");
@@ -1192,8 +1376,35 @@ model = "claude-sonnet-4-5"
     /// `diagnose`, with the store replaced by an in-memory one so the result
     /// does not depend on the machine's `~/.turnpike`.
     ///
+    /// Mirrors `diagnose`'s shape, including its two early exits: a `path` that
+    /// does not exist produces the same `config-found: Fail` +
+    /// `store_only_checks` report the real command produces, so a missing-config
+    /// test exercises the actual failure branch instead of a helper that
+    /// cheerfully reports a config it never read.
+    ///
     /// Async for the same reason `diagnose` is: it runs the gateway probe.
     async fn diagnose_with(path: PathBuf, cfg_raw: &str, store: secrets::StoreCtx) -> Vec<Check> {
+        if !path.exists() {
+            let mut checks = vec![Check::fail(
+                "config-found",
+                format!("no config at {}", path.display()),
+                "run `turnpike setup` to create one, or `turnpike serve --init` \
+                 to write a starter non-interactively",
+            )];
+            checks.push(Check::skip(
+                "config-parse",
+                "skipped — there is no config to parse",
+            ));
+            // The store still matters here even though the config does not:
+            // a user who deleted the config needs to find out what happened to
+            // their keys. `store_only_checks` opens the store itself from the
+            // path, so it is called with the path, exactly as `diagnose` does
+            // — the in-memory store handed to this helper is not consulted on
+            // this branch, which is why the missing-config test asserts on
+            // `secrets-store` rather than on its contents.
+            checks.extend(store_only_checks(&path));
+            return checks;
+        }
         // Parsed without validating, and hydrated — both mirroring `diagnose`.
         // A helper that diverged from the real path would test a doctor nobody
         // runs: `cfg: None` here would `Skip` the validate check, and skipping
@@ -1205,14 +1416,17 @@ model = "claude-sonnet-4-5"
             secrets::hydrate(cfg, &store);
         }
         let ctx = Ctx {
-            path,
+            path: path.clone(),
             raw: Some(cfg_raw.to_string()),
             cfg,
             parse_error,
             store: Some(store),
             live: false,
         };
-        let mut checks = vec![Check::ok("config-found", "config found")];
+        let mut checks = vec![Check::ok(
+            "config-found",
+            format!("config at {}", path.display()),
+        )];
         checks.extend(config_checks(&ctx));
         checks.extend(store_checks(&ctx));
         checks.extend(shape_checks(&ctx));
@@ -1232,8 +1446,9 @@ model = "claude-sonnet-4-5"
 
     #[tokio::test]
     async fn check_list_is_complete() {
-        let path = write_config(&config::default_config_text());
-        let checks = diagnose(Some(path), false).await;
+        let raw = config::default_config_text();
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
         let ids: Vec<&str> = checks.iter().map(|c| c.id.as_str()).collect();
         // Not just membership: `CHECK_IDS`'s doc comment claims the order is the
         // order the report prints, and that claim is only worth making if it is
@@ -1255,19 +1470,30 @@ model = "claude-sonnet-4-5"
 
     #[tokio::test]
     async fn live_checks_are_opt_in() {
-        let path = write_config(&config::default_config_text());
-        let checks = diagnose(Some(path), false).await;
+        let raw = config::default_config_text();
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
         let reach = checks.iter().find(|c| c.id == "provider-reach").unwrap();
-        assert_eq!(reach.status, Status::Skip, "provider-reach must not run without --live");
+        assert_eq!(
+            reach.status,
+            Status::Skip,
+            "provider-reach must not run without --live"
+        );
     }
 
     #[tokio::test]
     async fn a_missing_config_is_a_failure_with_a_fix() {
         let dir = temp_root("doctor-missing");
-        let checks = diagnose(Some(dir.join("nope.toml")), false).await;
+        // `diagnose_with` rather than `diagnose`: the point of this test is a
+        // *missing* config, and going through `diagnose` would make it also
+        // depend on whatever `~/.turnpike/` happens to hold.
+        let checks = diagnose_with(dir.join("nope.toml"), "", memory_store()).await;
         let found = checks.iter().find(|c| c.id == "config-found").unwrap();
         assert_eq!(found.status, Status::Fail);
-        assert!(found.fix.as_deref().unwrap().contains("turnpike setup"), "{found:?}");
+        assert!(
+            found.fix.as_deref().unwrap().contains("turnpike setup"),
+            "{found:?}"
+        );
         // And the report still covers the store, so a user who deleted the
         // config can find out what happened to their keys.
         assert!(checks.iter().any(|c| c.id == "secrets-store"));
@@ -1275,10 +1501,15 @@ model = "claude-sonnet-4-5"
 
     #[tokio::test]
     async fn an_unparseable_config_fails_parse_not_validate() {
-        let path = write_config("this is not = = toml");
-        let checks = diagnose(Some(path), false).await;
+        let raw = "this is not = = toml";
+        let path = write_config(raw);
+        let checks = diagnose_with(path, raw, memory_store()).await;
         assert_eq!(
-            checks.iter().find(|c| c.id == "config-parse").unwrap().status,
+            checks
+                .iter()
+                .find(|c| c.id == "config-parse")
+                .unwrap()
+                .status,
             Status::Fail
         );
         assert_eq!(
@@ -1300,7 +1531,7 @@ provider = "ghost"
 model = "m"
 "#;
         let path = write_config(raw);
-        let checks = diagnose(Some(path), false).await;
+        let checks = diagnose_with(path, raw, memory_store()).await;
         let v = checks.iter().find(|c| c.id == "validate").unwrap();
         assert_eq!(v.status, Status::Fail);
         assert!(v.summary.contains("ghost"), "{v:?}");
@@ -1319,12 +1550,50 @@ provider = "zen"
 model = "m"
 "#;
         let path = write_config(raw);
-        let checks = diagnose(Some(path), false).await;
-        let inline: Vec<&Check> =
-            checks.iter().filter(|c| c.id == "providers-key-inline").collect();
-        assert_eq!(inline.len(), 1, "one warning for the set, not one per provider");
+        let checks = diagnose_with(path, raw, memory_store()).await;
+        let inline: Vec<&Check> = checks
+            .iter()
+            .filter(|c| c.id == "providers-key-inline")
+            .collect();
+        assert_eq!(
+            inline.len(),
+            1,
+            "one warning for the set, not one per provider"
+        );
         assert_eq!(inline[0].status, Status::Warn);
-        assert!(inline[0].detail.as_deref().unwrap().contains("zen"));
+        let detail = inline[0].detail.as_deref().unwrap();
+        assert!(detail.contains("zen"), "{inline:?}");
+        // And *where*: the provider id is already visible in the file, so the
+        // line number is the part of the finding a reader cannot get by
+        // scanning. `api_key = "k"` is on line 5 of the literal above.
+        assert!(detail.contains("line 5"), "{inline:?}");
+    }
+
+    #[test]
+    fn line_of_in_table_finds_the_key_inside_its_own_block_only() {
+        let raw = r#"
+[providers.zen]
+api_key = "a"
+
+[providers.other]
+api_key = "b"
+"#;
+        assert_eq!(
+            line_of_in_table(raw, "providers", "zen", "api_key"),
+            Some(3)
+        );
+        assert_eq!(
+            line_of_in_table(raw, "providers", "other", "api_key"),
+            Some(6)
+        );
+        // A provider with no literal key gets no line, not its neighbour's.
+        assert_eq!(line_of_in_table(raw, "providers", "ghost", "api_key"), None);
+        // `api_key_env` must not be mistaken for `api_key`.
+        let env_only = "[providers.zen]\napi_key_env = \"K\"\n";
+        assert_eq!(
+            line_of_in_table(env_only, "providers", "zen", "api_key"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1349,7 +1618,10 @@ model = "m"
         // names the tier that answered.
         assert_eq!(k.status, Status::Warn);
         let detail = k.detail.as_deref().unwrap();
-        assert!(detail.contains("provider.zen → inline (plaintext)"), "{k:?}");
+        assert!(
+            detail.contains("provider.zen → inline (plaintext)"),
+            "{k:?}"
+        );
         assert!(detail.contains("search.exa → none"), "{k:?}");
     }
 
@@ -1368,7 +1640,10 @@ model = "m"
         let checks = diagnose_with(path, raw, memory_store()).await;
         let k = checks.iter().find(|c| c.id == "key-resolvable").unwrap();
         assert_eq!(k.status, Status::Warn);
-        assert!(k.detail.as_deref().unwrap().contains("provider.zen → none"), "{k:?}");
+        assert!(
+            k.detail.as_deref().unwrap().contains("provider.zen → none"),
+            "{k:?}"
+        );
     }
 
     #[tokio::test]
@@ -1438,7 +1713,11 @@ model = "m"
         let path = write_config(raw);
         let checks = diagnose_with(path, raw, memory_store()).await;
         let l = checks.iter().find(|c| c.id == "listen-addr").unwrap();
-        assert_eq!(l.status, Status::Warn, "wildcard listen is unwise, not unusable");
+        assert_eq!(
+            l.status,
+            Status::Warn,
+            "wildcard listen is unwise, not unusable"
+        );
     }
 
     #[tokio::test]
@@ -1461,7 +1740,10 @@ model = "same"
         let checks = diagnose_with(path, raw, memory_store()).await;
         let r = checks.iter().find(|c| c.id == "routes-shape").unwrap();
         assert_eq!(r.status, Status::Warn);
-        assert!(r.detail.as_deref().unwrap().contains("both point at"), "{r:?}");
+        assert!(
+            r.detail.as_deref().unwrap().contains("both point at"),
+            "{r:?}"
+        );
     }
 
     #[tokio::test]
@@ -1475,7 +1757,11 @@ model = "same"
         // record can actually be produced.
         let checks = diagnose_with(path, &raw, memory_store()).await;
         assert_eq!(
-            checks.iter().find(|c| c.id == "secrets-decrypt").unwrap().status,
+            checks
+                .iter()
+                .find(|c| c.id == "secrets-decrypt")
+                .unwrap()
+                .status,
             Status::Ok
         );
         let _ = MemoryStore::new("fake");
@@ -1493,8 +1779,9 @@ model = "same"
 
     #[tokio::test]
     async fn json_output_carries_every_check_and_a_summary() {
-        let path = write_config(&config::default_config_text());
-        let checks = diagnose(Some(path), false).await;
+        let raw = config::default_config_text();
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
         let doc = serde_json::json!({
             "checks": &checks,
             "summary": { "total": checks.len() },
@@ -1546,7 +1833,9 @@ model = "same"
                     }
                 })
             };
-            Router::new().route("/_health", health).route("/v1/models", models)
+            Router::new()
+                .route("/_health", health)
+                .route("/v1/models", models)
         }
 
         fn config_for(listen: &str, routes: &[&str]) -> Config {
@@ -1571,8 +1860,14 @@ model = "same"
 
             let detected = probe_gateway(&cfg).await;
             assert_eq!(detected.check.status, Status::Ok);
-            assert!(detected.check.summary.contains("turnpike gateway is running"));
-            assert_eq!(detected.routes.as_deref(), Some(&["other-route".to_string()][..]));
+            assert!(detected
+                .check
+                .summary
+                .contains("turnpike gateway is running"));
+            assert_eq!(
+                detected.routes.as_deref(),
+                Some(&["other-route".to_string()][..])
+            );
 
             // Now the same probe through `probe_checks`, which is where the
             // divergence warning is built.
@@ -1585,7 +1880,10 @@ model = "same"
                 live: false,
             };
             let checks = probe_checks(&ctx).await;
-            let shadow = checks.iter().find(|c| c.id == "gateway-shadows-config").unwrap();
+            let shadow = checks
+                .iter()
+                .find(|c| c.id == "gateway-shadows-config")
+                .unwrap();
             assert_eq!(shadow.status, Status::Warn);
             // `other-route` is on the stub only; `claude-sonnet-5` is ours only.
             let detail = shadow.detail.as_deref().unwrap();
@@ -1608,7 +1906,11 @@ model = "same"
             };
             let checks = probe_checks(&ctx).await;
             assert_eq!(
-                checks.iter().find(|c| c.id == "gateway-shadows-config").unwrap().status,
+                checks
+                    .iter()
+                    .find(|c| c.id == "gateway-shadows-config")
+                    .unwrap()
+                    .status,
                 Status::Ok
             );
         }

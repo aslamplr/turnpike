@@ -35,8 +35,6 @@ pub use memory::MemoryStore;
 
 /// Master key length in bytes (AES-256).
 pub const MASTER_KEY_LEN: usize = 32;
-/// AEAD nonce length in bytes (96-bit, the AES-GCM standard).
-pub const NONCE_LEN: usize = 12;
 
 /// A secret value held in memory.
 ///
@@ -94,10 +92,6 @@ pub enum StoreStatus {
 }
 
 impl StoreStatus {
-    pub fn is_unavailable(&self) -> bool {
-        matches!(self, StoreStatus::Unavailable(_))
-    }
-
     pub fn reason(&self) -> Option<&str> {
         match self {
             StoreStatus::Unavailable(r) => Some(r.as_str()),
@@ -126,10 +120,17 @@ impl fmt::Display for KeySource {
 
 /// A successful lookup: the value, which tier answered, and whether the store
 /// was skipped along the way.
+///
+/// `store_status` is not consulted inside this module — `hydrate` copies the
+/// status onto `ProviderCfg`/`SearchCfg` directly. It is kept because it makes
+/// the *degradation* visible on the success path: a lookup that answered from
+/// inline while the store was unreadable is exactly the case callers warn
+/// about, and they can only tell by asking the outcome.
 #[derive(Debug, Clone)]
 pub struct KeyOutcome {
     pub value: String,
     pub source: KeySource,
+    #[allow(dead_code)]
     pub store_status: StoreStatus,
 }
 
@@ -283,9 +284,8 @@ fn canonical_config_path(path: &Path) -> Result<PathBuf, StoreError> {
     let name = path
         .file_name()
         .ok_or_else(|| StoreError::Path(format!("{} has no file name", path.display())))?;
-    let parent = std::fs::canonicalize(parent).map_err(|e| {
-        StoreError::Path(format!("canonicalizing {}: {e}", parent.display()))
-    })?;
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|e| StoreError::Path(format!("canonicalizing {}: {e}", parent.display())))?;
     Ok(parent.join(name))
 }
 
@@ -329,6 +329,11 @@ pub trait SecretStore: Send + Sync {
     }
 
     /// Human-readable location, for messages.
+    ///
+    /// Only reachable from tests today — both implementations define it and
+    /// `MemoryStore` asserts on it — so the trait keeps it rather than folding
+    /// it into the two impls and losing the shape.
+    #[allow(dead_code)]
     fn location(&self) -> String;
 }
 
@@ -347,7 +352,12 @@ impl StoreCtx {
     /// A context with no store at all. Used when the namespace or home
     /// directory cannot even be determined.
     pub fn broken(status: StoreStatus, root: PathBuf) -> Self {
-        Self { ns: String::new(), root, status, store: None }
+        Self {
+            ns: String::new(),
+            root,
+            status,
+            store: None,
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<Secret> {
@@ -369,7 +379,12 @@ impl StoreCtx {
     /// than through [`open`], which always builds a `FileStore`.
     #[cfg(test)]
     pub fn with_store(ns: &str, root: PathBuf, store: Box<dyn SecretStore>) -> Self {
-        Self { ns: ns.to_string(), root, status: StoreStatus::Ok, store: Some(store) }
+        Self {
+            ns: ns.to_string(),
+            root,
+            status: StoreStatus::Ok,
+            store: Some(store),
+        }
     }
 
     /// True when a store object exists (writes are possible even before the
@@ -417,7 +432,12 @@ pub fn open(config_path: &Path) -> StoreCtx {
     }
 
     match FileStore::load(root.clone(), ns.clone(), canonical) {
-        Ok(store) => StoreCtx { ns, root, status: StoreStatus::Ok, store: Some(Box::new(store)) },
+        Ok(store) => StoreCtx {
+            ns,
+            root,
+            status: StoreStatus::Ok,
+            store: Some(Box::new(store)),
+        },
         Err(e) => {
             tracing::warn!(
                 "secret store at {} is unusable ({e}); falling back to env and inline keys",
@@ -464,7 +484,7 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 
 pub(crate) fn from_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.is_empty() || s.len() % 2 != 0 {
+    if s.is_empty() || !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -513,7 +533,10 @@ fn default_secrets_version() -> u32 {
 
 impl Default for SecretsDoc {
     fn default() -> Self {
-        Self { version: default_secrets_version(), configs: Default::default() }
+        Self {
+            version: default_secrets_version(),
+            configs: Default::default(),
+        }
     }
 }
 
@@ -555,7 +578,9 @@ pub(crate) mod tests {
         let b = namespace(&cfg).unwrap();
         assert_eq!(a, b, "namespace must be stable across calls");
         assert_eq!(a.len(), 16);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
 
         // A path that does not exist yet canonicalizes through its parent, so
         // the namespace is the same before and after the wizard writes it.
@@ -602,7 +627,10 @@ pub(crate) mod tests {
             &ok,
         )
         .unwrap();
-        assert_eq!((o.value.as_str(), o.source), ("from-store", KeySource::Store));
+        assert_eq!(
+            (o.value.as_str(), o.source),
+            ("from-store", KeySource::Store)
+        );
 
         // Store empty → inline.
         let o = resolve_chain(
@@ -614,11 +642,21 @@ pub(crate) mod tests {
             &ok,
         )
         .unwrap();
-        assert_eq!((o.value.as_str(), o.source), ("from-inline", KeySource::Inline));
+        assert_eq!(
+            (o.value.as_str(), o.source),
+            ("from-inline", KeySource::Inline)
+        );
 
         // Inline only, no env var name at all.
-        let o = resolve_chain("provider \"zen\"", None, None, None, Some("from-inline"), &ok)
-            .unwrap();
+        let o = resolve_chain(
+            "provider \"zen\"",
+            None,
+            None,
+            None,
+            Some("from-inline"),
+            &ok,
+        )
+        .unwrap();
         assert_eq!(o.source, KeySource::Inline);
 
         // Nothing at all → Err.
@@ -655,8 +693,15 @@ pub(crate) mod tests {
         // An unavailable store does not fail the lookup — it degrades to
         // inline and reports why, so the caller can warn.
         let broken = StoreStatus::Unavailable("permission denied".into());
-        let o = resolve_chain("provider \"zen\"", None, None, None, Some("from-inline"), &broken)
-            .unwrap();
+        let o = resolve_chain(
+            "provider \"zen\"",
+            None,
+            None,
+            None,
+            Some("from-inline"),
+            &broken,
+        )
+        .unwrap();
         assert_eq!(o.source, KeySource::Inline);
         assert_eq!(o.store_status.reason(), Some("permission denied"));
     }
@@ -692,8 +737,15 @@ pub(crate) mod tests {
         assert!(e.to_string().contains("bad master key"), "{e}");
 
         // No env var configured at all: the message still names all three tiers.
-        let e = resolve_chain("provider \"zen\"", None, None, None, None, &StoreStatus::NotFound)
-            .unwrap_err();
+        let e = resolve_chain(
+            "provider \"zen\"",
+            None,
+            None,
+            None,
+            None,
+            &StoreStatus::NotFound,
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("api_key_env"), "{e}");
     }
 

@@ -49,7 +49,9 @@ pub struct ServerCfg {
 
 impl Default for ServerCfg {
     fn default() -> Self {
-        Self { listen: default_listen() }
+        Self {
+            listen: default_listen(),
+        }
     }
 }
 
@@ -105,7 +107,10 @@ impl ProviderCfg {
         } else {
             format!("provider {:?}", self.id)
         };
-        let env_value = self.api_key_env.as_deref().and_then(|v| std::env::var(v).ok());
+        let env_value = self
+            .api_key_env
+            .as_deref()
+            .and_then(|v| std::env::var(v).ok());
         resolve_chain(
             &label,
             self.api_key_env.as_deref(),
@@ -205,7 +210,10 @@ impl SearchCfg {
 
     pub fn resolved_api_key_detailed(&self) -> std::result::Result<KeyOutcome, KeyError> {
         let label = format!("search provider {:?}", self.provider);
-        let env_value = self.api_key_env.as_deref().and_then(|v| std::env::var(v).ok());
+        let env_value = self
+            .api_key_env
+            .as_deref()
+            .and_then(|v| std::env::var(v).ok());
         resolve_chain(
             &label,
             self.api_key_env.as_deref(),
@@ -245,8 +253,12 @@ pub enum Family {
 
 pub fn family_for_path(path: &str) -> Option<Family> {
     match path {
-        "/v1/messages" | "/v1/messages/count_tokens" | "/v1/messages/batches" => Some(Family::Anthropic),
-        "/v1/chat/completions" | "/v1/completions" | "/v1/responses" | "/v1/embeddings" => Some(Family::OpenAI),
+        "/v1/messages" | "/v1/messages/count_tokens" | "/v1/messages/batches" => {
+            Some(Family::Anthropic)
+        }
+        "/v1/chat/completions" | "/v1/completions" | "/v1/responses" | "/v1/embeddings" => {
+            Some(Family::OpenAI)
+        }
         _ => None,
     }
 }
@@ -389,8 +401,8 @@ pub fn default_config_path() -> Option<PathBuf> {
 pub fn load(path: &PathBuf) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: Config = toml::from_str(&raw)
-        .with_context(|| format!("parsing config {}", path.display()))?;
+    let cfg: Config =
+        toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
     validate(&cfg)?;
     Ok(cfg)
 }
@@ -417,7 +429,10 @@ pub(crate) fn validate(cfg: &Config) -> Result<()> {
     }
     for (id, route) in &cfg.routes {
         if !cfg.providers.contains_key(&route.provider) {
-            anyhow::bail!("route {id:?} references unknown provider {:?}", route.provider);
+            anyhow::bail!(
+                "route {id:?} references unknown provider {:?}",
+                route.provider
+            );
         }
     }
     Ok(())
@@ -563,7 +578,10 @@ model = "openai/gpt-5"
     #[test]
     fn family_mapping() {
         assert_eq!(family_for_path("/v1/messages"), Some(Family::Anthropic));
-        assert_eq!(family_for_path("/v1/chat/completions"), Some(Family::OpenAI));
+        assert_eq!(
+            family_for_path("/v1/chat/completions"),
+            Some(Family::OpenAI)
+        );
         assert_eq!(family_for_path("/v1/responses"), Some(Family::OpenAI));
         assert_eq!(family_for_path("/v1/whatever"), None);
     }
@@ -619,7 +637,7 @@ model = "openai/gpt-5"
 
         // No sonnet anywhere → falls back to the only route.
         let mut cfg2 = test_config();
-        for (_, r) in cfg2.routes.iter_mut() {
+        for r in cfg2.routes.values_mut() {
             r.family = Some("haiku".into());
         }
         assert_eq!(cfg2.default_launch_route().unwrap(), "claude-sonnet-5");
@@ -629,11 +647,20 @@ model = "openai/gpt-5"
     fn resolve_launch_model_accepts_all_gateway_forms() {
         let cfg = test_config();
         // exact route id
-        assert_eq!(cfg.resolve_launch_model("claude-sonnet-5").unwrap(), "claude-sonnet-5");
+        assert_eq!(
+            cfg.resolve_launch_model("claude-sonnet-5").unwrap(),
+            "claude-sonnet-5"
+        );
         // upstream model id targeted by a route
-        assert_eq!(cfg.resolve_launch_model("claude-sonnet-4-5").unwrap(), "claude-sonnet-4-5");
+        assert_eq!(
+            cfg.resolve_launch_model("claude-sonnet-4-5").unwrap(),
+            "claude-sonnet-4-5"
+        );
         // explicit provider/model
-        assert_eq!(cfg.resolve_launch_model("zen/claude-opus-4-1").unwrap(), "claude-opus-4-1");
+        assert_eq!(
+            cfg.resolve_launch_model("zen/claude-opus-4-1").unwrap(),
+            "claude-opus-4-1"
+        );
         // unknown, no slash → error
         assert!(cfg.resolve_launch_model("nope").is_err());
         // empty → error
@@ -661,7 +688,10 @@ api_key = "k"
         let a = &cfg.providers["a"];
         assert_eq!(
             a.extra_header_pairs(),
-            vec![("x-opencode-session".to_string(), "turnpike-stable-session".to_string())]
+            vec![(
+                "x-opencode-session".to_string(),
+                "turnpike-stable-session".to_string()
+            )]
         );
         assert!(cfg.providers["b"].extra_headers.is_empty());
     }
@@ -723,7 +753,10 @@ api_key = "inline-key"
         let p = &cfg.providers["a"];
         assert!(p.resolved_key.is_none());
         assert_eq!(p.api_key().unwrap(), "inline-key");
-        assert_eq!(p.resolved_api_key_detailed().unwrap().source, KeySource::Inline);
+        assert_eq!(
+            p.resolved_api_key_detailed().unwrap().source,
+            KeySource::Inline
+        );
     }
 
     #[test]
@@ -741,7 +774,10 @@ api_key = "inline-key"
 
         let p = &cfg.providers["a"];
         assert_eq!(p.api_key().unwrap(), "stored-key");
-        assert_eq!(p.resolved_api_key_detailed().unwrap().source, KeySource::Store);
+        assert_eq!(
+            p.resolved_api_key_detailed().unwrap().source,
+            KeySource::Store
+        );
     }
 
     #[test]
@@ -786,7 +822,10 @@ api_key = "or-inline"
         let zen = &cfg.providers["zen"];
         assert_eq!(zen.id, "zen");
         assert_eq!(zen.api_key().unwrap(), "sk-from-store");
-        assert_eq!(zen.resolved_api_key_detailed().unwrap().source, KeySource::Store);
+        assert_eq!(
+            zen.resolved_api_key_detailed().unwrap().source,
+            KeySource::Store
+        );
 
         // A provider with no stored record still hydrates: the id is set and
         // the inline key remains the last resort.
@@ -794,7 +833,10 @@ api_key = "or-inline"
         assert_eq!(or.id, "openrouter");
         assert!(or.resolved_key.is_none());
         assert_eq!(or.api_key().unwrap(), "or-inline");
-        assert_eq!(or.resolved_api_key_detailed().unwrap().source, KeySource::Inline);
+        assert_eq!(
+            or.resolved_api_key_detailed().unwrap().source,
+            KeySource::Inline
+        );
     }
 
     #[test]

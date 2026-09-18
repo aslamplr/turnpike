@@ -18,7 +18,7 @@ use std::fmt;
 use anyhow::{Context, Result};
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
-use crate::config::{ProviderCfg, RouteCfg, SearchCfg, Spec};
+use crate::config::{ProviderCfg, SearchCfg, Spec};
 
 /// A parsed document, plus the config it currently renders to.
 ///
@@ -47,7 +47,10 @@ impl Doc {
         Ok(Self { doc })
     }
 
-    /// Start from the built-in starter text.
+    /// Start from the built-in starter text. Test-only today: the wizard is
+    /// handed a document by `setup::run`, which parses the real config or falls
+    /// back to `default_config_text()` itself.
+    #[cfg(test)]
     pub fn starter() -> Result<Self> {
         Self::parse(&crate::config::default_config_text())
     }
@@ -138,7 +141,12 @@ impl Doc {
     }
 
     /// Set a scalar on `[providers.<id>]`, preserving that line's decor.
-    pub fn set_provider_scalar(&mut self, id: &str, key: &str, value: impl Into<Value>) -> Result<()> {
+    pub fn set_provider_scalar(
+        &mut self,
+        id: &str,
+        key: &str,
+        value: impl Into<Value>,
+    ) -> Result<()> {
         self.set_scalar(&["providers", id], key, value)
     }
 
@@ -156,6 +164,10 @@ impl Doc {
 
     /// Remove an inline plaintext key, leaving every neighbouring line — the
     /// `api_key_env` above it included — untouched.
+    /// Kept alongside `remove_provider_inline_key_keeping_comment` so the
+    /// comment-preserving and plain removals stay comparable; only the latter
+    /// has a production caller (`setup::mod`'s migration path).
+    #[allow(dead_code)]
     pub fn remove_provider_inline_key(&mut self, id: &str) -> bool {
         self.remove_scalar(&["providers", id], "api_key")
     }
@@ -285,12 +297,7 @@ impl Doc {
     /// the surrounding whitespace *and* the trailing comment, which is why it
     /// is worth reaching through `as_value_mut()` for: `Item` itself has no
     /// `decor_mut()`.
-    fn set_scalar(
-        &mut self,
-        path: &[&str],
-        key: &str,
-        value: impl Into<Value>,
-    ) -> Result<()> {
+    fn set_scalar(&mut self, path: &[&str], key: &str, value: impl Into<Value>) -> Result<()> {
         let table = self
             .table_mut(path)
             .with_context(|| format!("no [{}] section to edit", path.join(".")))?;
@@ -311,10 +318,11 @@ impl Doc {
     }
 
     /// Drop one scalar. Returns whether it was there.
+    /// The plain counterpart to `remove_scalar_keeping_comment`; see the note on
+    /// `remove_provider_inline_key`.
+    #[allow(dead_code)]
     fn remove_scalar(&mut self, path: &[&str], key: &str) -> bool {
-        self.table_mut(path)
-            .and_then(|t| t.remove(key))
-            .is_some()
+        self.table_mut(path).and_then(|t| t.remove(key)).is_some()
     }
 
     /// Drop one scalar, grafting any comment that introduced it onto the next
@@ -397,10 +405,10 @@ impl Doc {
         })?;
         for line in body[..key_line].iter().rev() {
             let t = line.trim_start();
+            // Only comment lines are collected; the first non-comment, non-blank
+            // line ends the run.
             if t.starts_with('#') {
                 lines.push(line);
-            } else if t.is_empty() {
-                break;
             } else {
                 break;
             }
@@ -443,17 +451,6 @@ impl RouteDraft {
     /// The known `family` values, matching what `launch` and Claude Desktop
     /// expect to see in the picker.
     pub const FAMILIES: [&'static str; 4] = ["sonnet", "opus", "haiku", "other"];
-
-    pub fn from_route(provider: &str, r: &RouteCfg) -> Self {
-        Self {
-            provider: provider.to_string(),
-            model: r.model.clone(),
-            display_name: r.display_name.clone(),
-            family: r.family.clone(),
-            max_tokens: r.max_tokens,
-            context_tokens: r.context_tokens,
-        }
-    }
 }
 
 /// Search defaults, so `setup` can write a `[search]` block that `doctor` and
@@ -464,6 +461,10 @@ pub fn search_defaults() -> SearchCfg {
 
 /// Strip a scalar and report whether it was there — handy for the inline-key
 /// migration, which must only strip after the store write succeeded.
+///
+/// Test-only: the migration path calls `remove_provider_inline_key_keeping_comment`
+/// directly, and the tests use this to assert on the resulting document.
+#[cfg(test)]
 pub fn has_inline_key(doc: &Doc, provider_id: &str) -> bool {
     doc.provider(provider_id)
         .map(|p| p.api_key.is_some())
@@ -507,7 +508,11 @@ mod tests {
 
         let after = doc.comments();
         for c in &expected {
-            assert!(after.contains(c), "comment lost: {c}\nafter:\n{}", doc.as_str());
+            assert!(
+                after.contains(c),
+                "comment lost: {c}\nafter:\n{}",
+                doc.as_str()
+            );
         }
 
         // …and the addition is a pure append: everything that came before is
@@ -547,14 +552,16 @@ mod tests {
     #[test]
     fn edit_scalar_keeps_trailing_comment() {
         let mut doc = Doc::parse(
-            "[providers.zen]\nspec = \"anthropic\"\nbase_url = \"https://x\"\nmax_tokens = 64000 # generous\n"
-                .into(),
+            "[providers.zen]\nspec = \"anthropic\"\nbase_url = \"https://x\"\nmax_tokens = 64000 # generous\n",
         )
         .unwrap();
         doc.set_provider_scalar("zen", "max_tokens", 128000i64)
             .unwrap();
         let out = doc.as_str();
-        assert!(out.contains("max_tokens = 128000 # generous"), "got:\n{out}");
+        assert!(
+            out.contains("max_tokens = 128000 # generous"),
+            "got:\n{out}"
+        );
     }
 
     /// Setting `api_key_env` removes a stale inline key in the same operation —
@@ -569,11 +576,26 @@ mod tests {
         doc.set_provider_key_env("zen", "OPENCODE_API_KEY").unwrap();
 
         let out = doc.as_str();
-        assert!(!out.contains("sk-secret"), "inline key not stripped:\n{out}");
-        assert!(!out.contains("api_key ="), "api_key line not removed:\n{out}");
-        assert!(out.contains("api_key_env = \"OPENCODE_API_KEY\""), "got:\n{out}");
-        assert!(out.contains("# keep me"), "neighbouring comment lost:\n{out}");
-        assert!(out.contains("base_url = \"https://x\""), "neighbour lost:\n{out}");
+        assert!(
+            !out.contains("sk-secret"),
+            "inline key not stripped:\n{out}"
+        );
+        assert!(
+            !out.contains("api_key ="),
+            "api_key line not removed:\n{out}"
+        );
+        assert!(
+            out.contains("api_key_env = \"OPENCODE_API_KEY\""),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("# keep me"),
+            "neighbouring comment lost:\n{out}"
+        );
+        assert!(
+            out.contains("base_url = \"https://x\""),
+            "neighbour lost:\n{out}"
+        );
     }
 
     /// `remove_inline_api_key_leaves_env_line_intact` — the exact shape the
@@ -581,15 +603,17 @@ mod tests {
     #[test]
     fn remove_inline_api_key_leaves_env_line_intact() {
         let mut doc = Doc::parse(
-            "[providers.zen]\nspec = \"anthropic\"\napi_key_env = \"OPENCODE_API_KEY\"\napi_key = \"sk-plain\"\nbase_url = \"https://x\"\n"
-                .into(),
+            "[providers.zen]\nspec = \"anthropic\"\napi_key_env = \"OPENCODE_API_KEY\"\napi_key = \"sk-plain\"\nbase_url = \"https://x\"\n",
         )
         .unwrap();
 
         assert!(doc.remove_provider_inline_key("zen"));
 
         let out = doc.as_str();
-        assert!(out.contains("api_key_env = \"OPENCODE_API_KEY\""), "got:\n{out}");
+        assert!(
+            out.contains("api_key_env = \"OPENCODE_API_KEY\""),
+            "got:\n{out}"
+        );
         assert!(!out.contains("sk-plain"), "got:\n{out}");
         // The removal is a genuine deletion, not a repeated call returning true.
         assert!(!doc.remove_provider_inline_key("zen"));
@@ -747,8 +771,7 @@ mod tests {
     #[test]
     fn has_inline_key_reflects_the_document() {
         let doc = Doc::parse(
-            "[providers.zen]\nspec = \"anthropic\"\nbase_url = \"https://x\"\napi_key = \"sk\"\n"
-                .into(),
+            "[providers.zen]\nspec = \"anthropic\"\nbase_url = \"https://x\"\napi_key = \"sk\"\n",
         )
         .unwrap();
         assert!(has_inline_key(&doc, "zen"));

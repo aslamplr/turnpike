@@ -110,7 +110,9 @@ impl FileStore {
     /// Decrypt this namespace's records into `plain`, collecting failures
     /// rather than aborting — one unreadable record should not hide the rest.
     fn decrypt_existing(&mut self) {
-        let Some(entry) = self.doc.configs.get(&self.ns) else { return };
+        let Some(entry) = self.doc.configs.get(&self.ns) else {
+            return;
+        };
         let Some(key) = self.key.as_ref() else {
             // Records exist but no key does: every one of them is unreadable.
             self.undecryptable = entry.secrets.keys().cloned().collect();
@@ -404,12 +406,7 @@ fn aes_key(master: &[u8; MASTER_KEY_LEN]) -> Result<LessSafeKey, StoreError> {
     Ok(LessSafeKey::new(unbound))
 }
 
-fn encrypt(
-    key: &LessSafeKey,
-    ns: &str,
-    name: &str,
-    plaintext: &str,
-) -> Result<Record, StoreError> {
+fn encrypt(key: &LessSafeKey, ns: &str, name: &str, plaintext: &str) -> Result<Record, StoreError> {
     // A fresh nonce per write, from the system RNG — never derived from the
     // plaintext, which is what would make a repeat key/nonce pair fatal.
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -425,17 +422,18 @@ fn encrypt(
     )
     .map_err(|_| StoreError::Format("encrypting a secret failed".into()))?;
 
-    Ok(Record { nonce: to_hex(&nonce_bytes), ciphertext: to_hex(&in_out) })
+    Ok(Record {
+        nonce: to_hex(&nonce_bytes),
+        ciphertext: to_hex(&in_out),
+    })
 }
 
-fn decrypt(
-    key: &LessSafeKey,
-    ns: &str,
-    name: &str,
-    record: &Record,
-) -> Result<String, StoreError> {
+fn decrypt(key: &LessSafeKey, ns: &str, name: &str, record: &Record) -> Result<String, StoreError> {
     let nonce = from_hex(&record.nonce).ok_or(StoreError::Decrypt)?;
-    let nonce: [u8; NONCE_LEN] = nonce.as_slice().try_into().map_err(|_| StoreError::Decrypt)?;
+    let nonce: [u8; NONCE_LEN] = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| StoreError::Decrypt)?;
 
     let mut in_out = from_hex(&record.ciphertext).ok_or(StoreError::Decrypt)?;
     let plain = key
@@ -509,7 +507,9 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<(), StoreError> {
 #[cfg(unix)]
 fn mode_of(path: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
-    fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777)
+    fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o777)
 }
 
 #[cfg(not(unix))]
@@ -524,7 +524,11 @@ mod tests {
 
     fn store_at(root: &Path, tag: &str) -> FileStore {
         // A config path inside the same temp tree keeps everything hermetic.
-        FileStore::empty(root.to_path_buf(), tag.to_string(), root.join("config.toml"))
+        FileStore::empty(
+            root.to_path_buf(),
+            tag.to_string(),
+            root.join("config.toml"),
+        )
     }
 
     fn mode(path: &Path) -> u32 {
@@ -539,7 +543,10 @@ mod tests {
 
         let rec = encrypt(&key, "ns1", "provider.zen", "sk-secret-value").unwrap();
         assert_ne!(rec.ciphertext, "sk-secret-value");
-        assert!(!rec.ciphertext.contains("sk-secret"), "plaintext leaked into ciphertext");
+        assert!(
+            !rec.ciphertext.contains("sk-secret"),
+            "plaintext leaked into ciphertext"
+        );
         assert_eq!(rec.nonce.len(), NONCE_LEN * 2);
 
         let back = decrypt(&key, "ns1", "provider.zen", &rec).unwrap();
@@ -562,20 +569,32 @@ mod tests {
         // Flip one bit in the ciphertext body (not in the GCM tag).
         let mut bytes = from_hex(&rec.ciphertext).unwrap();
         bytes[0] ^= 0x01;
-        let tampered = Record { nonce: rec.nonce.clone(), ciphertext: to_hex(&bytes) };
+        let tampered = Record {
+            nonce: rec.nonce.clone(),
+            ciphertext: to_hex(&bytes),
+        };
         assert!(decrypt(&key, "ns1", "provider.zen", &tampered).is_err());
 
         // And flipping a tag byte fails too.
         let mut bytes = from_hex(&rec.ciphertext).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
-        let tampered = Record { nonce: rec.nonce.clone(), ciphertext: to_hex(&bytes) };
+        let tampered = Record {
+            nonce: rec.nonce.clone(),
+            ciphertext: to_hex(&bytes),
+        };
         assert!(decrypt(&key, "ns1", "provider.zen", &tampered).is_err());
 
         // Junk nonces are a clean failure, not a panic.
-        let bad = Record { nonce: "nothex".into(), ciphertext: rec.ciphertext.clone() };
+        let bad = Record {
+            nonce: "nothex".into(),
+            ciphertext: rec.ciphertext.clone(),
+        };
         assert!(decrypt(&key, "ns1", "provider.zen", &bad).is_err());
-        let bad = Record { nonce: rec.nonce.clone(), ciphertext: "zz".into() };
+        let bad = Record {
+            nonce: rec.nonce.clone(),
+            ciphertext: "zz".into(),
+        };
         assert!(decrypt(&key, "ns1", "provider.zen", &bad).is_err());
     }
 
@@ -611,7 +630,10 @@ mod tests {
         // A read-only store never creates anything.
         assert!(store.get("provider.zen").is_none());
         store.save().unwrap();
-        assert!(!root.exists(), "save() with nothing staged must not create files");
+        assert!(
+            !root.exists(),
+            "save() with nothing staged must not create files"
+        );
 
         store.put("provider.zen", Secret::new("sk-zen"));
         // Staged but not yet persisted.
@@ -631,7 +653,10 @@ mod tests {
         assert!(!body.contains("sk-zen"), "{body}");
         assert!(body.contains("provider.zen"), "{body}");
         assert!(body.contains("ciphertext"), "{body}");
-        assert!(body.contains(&root.join("config.toml").to_string_lossy().to_string()), "{body}");
+        assert!(
+            body.contains(&root.join("config.toml").to_string_lossy().to_string()),
+            "{body}"
+        );
 
         // Reopen: the value survives, and the master key is reused, not
         // regenerated.
@@ -645,7 +670,10 @@ mod tests {
         assert_eq!(reopened.get("provider.zen").unwrap().expose(), "sk-zen");
         reopened.put("provider.openrouter", Secret::new("sk-or"));
         reopened.save().unwrap();
-        assert_eq!(fs::read_to_string(root.join(MASTER_KEY_FILE)).unwrap(), key_before);
+        assert_eq!(
+            fs::read_to_string(root.join(MASTER_KEY_FILE)).unwrap(),
+            key_before
+        );
 
         // Both records decrypt under the same key.
         let reopened = FileStore::load(
@@ -655,8 +683,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.get("provider.zen").unwrap().expose(), "sk-zen");
-        assert_eq!(reopened.get("provider.openrouter").unwrap().expose(), "sk-or");
-        assert_eq!(reopened.names(), vec!["provider.openrouter", "provider.zen"]);
+        assert_eq!(
+            reopened.get("provider.openrouter").unwrap().expose(),
+            "sk-or"
+        );
+        assert_eq!(
+            reopened.names(),
+            vec!["provider.openrouter", "provider.zen"]
+        );
         assert!(reopened.undecryptable().is_empty());
 
         // A delete round-trips too.
@@ -671,7 +705,10 @@ mod tests {
         )
         .unwrap();
         assert!(reopened.get("provider.zen").is_none());
-        assert_eq!(reopened.get("provider.openrouter").unwrap().expose(), "sk-or");
+        assert_eq!(
+            reopened.get("provider.openrouter").unwrap().expose(),
+            "sk-or"
+        );
     }
 
     #[test]
@@ -770,9 +807,11 @@ mod tests {
         assert_eq!(fs::read_to_string(&written).unwrap(), "first");
 
         // A missing config is not an error, just nothing to back up.
-        assert!(backup_config_once(&root, "abc123", &cfg_dir.join("nope.toml"))
-            .unwrap()
-            .is_none());
+        assert!(
+            backup_config_once(&root, "abc123", &cfg_dir.join("nope.toml"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

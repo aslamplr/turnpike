@@ -120,7 +120,10 @@ pub fn request_to_openai(anthropic: &Value, model: &str) -> Result<Value, String
         out.insert("tools".into(), Value::Array(tools));
     }
 
-    let stream = anthropic.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let stream = anthropic
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if stream {
         out.insert("stream".into(), json!(true));
         // Ask for usage in the final chunk when the provider supports it.
@@ -141,9 +144,10 @@ fn map_tool_choice(tc: &Value) -> Option<Value> {
         Some("auto") => Some(json!("auto")),
         Some("none") => Some(json!("none")),
         Some("any") => Some(json!("required")),
-        Some("tool") => tc.get("name").and_then(Value::as_str).map(|name| {
-            json!({"type": "function", "function": {"name": name}})
-        }),
+        Some("tool") => tc
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| json!({"type": "function", "function": {"name": name}})),
         _ => None,
     }
 }
@@ -353,15 +357,23 @@ pub fn response_to_anthropic(openai: &Value, requested_model: &str, id: &str) ->
 
     let stop_reason = map_finish(
         choice.get("finish_reason").and_then(Value::as_str),
-        content.iter().any(|c| c.get("type") == Some(&json!("tool_use"))),
+        content
+            .iter()
+            .any(|c| c.get("type") == Some(&json!("tool_use"))),
     );
 
     let usage = openai.get("usage").cloned().unwrap_or(Value::Null);
-    let input = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let input = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let cached = usage
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64);
-    let output = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let output = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
 
     json!({
         "id": id,
@@ -553,10 +565,7 @@ mod tests {
         // Server tool gets a synthesized query schema the model can call;
         // turnpike's middleware intercepts and executes it.
         assert_eq!(tools[0]["function"]["name"], "web_search");
-        assert_eq!(
-            tools[0]["function"]["parameters"]["required"][0],
-            "query"
-        );
+        assert_eq!(tools[0]["function"]["parameters"]["required"][0], "query");
         assert_eq!(tools[1]["function"]["name"], "ping");
     }
 

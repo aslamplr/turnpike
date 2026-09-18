@@ -60,7 +60,8 @@ struct ExaResult {
 #[async_trait]
 impl SearchProvider for ExaSearch {
     async fn search(&self, query: &str) -> Result<Vec<SearchResult>, SearchError> {
-        let resp = self.client
+        let resp = self
+            .client
             .post("https://api.exa.ai/search")
             .header("x-api-key", &self.api_key)
             .json(&serde_json::json!({
@@ -78,11 +79,15 @@ impl SearchProvider for ExaSearch {
         }
 
         let data: ExaResponse = resp.json().await?;
-        Ok(data.results.into_iter().map(|r| SearchResult {
-            url: r.url,
-            title: r.title,
-            content: r.text.unwrap_or_else(|| "No content available".to_string()),
-        }).collect())
+        Ok(data
+            .results
+            .into_iter()
+            .map(|r| SearchResult {
+                url: r.url,
+                title: r.title,
+                content: r.text.unwrap_or_else(|| "No content available".to_string()),
+            })
+            .collect())
     }
 }
 
@@ -233,9 +238,7 @@ by the [N] markers below.";
     let body = results
         .iter()
         .enumerate()
-        .map(|(i, r)| {
-            format!("[{}] {}\nURL: {}\n{}", i + 1, r.title, r.url, r.content)
-        })
+        .map(|(i, r)| format!("[{}] {}\nURL: {}\n{}", i + 1, r.title, r.url, r.content))
         .collect::<Vec<_>>()
         .join("\n\n");
 
@@ -301,7 +304,10 @@ mod tests {
 
     #[tokio::test]
     async fn searxng_non_200_becomes_search_error() {
-        let stub = Router::new().route("/search", get(|| async { (axum::http::StatusCode::FORBIDDEN, "json format not enabled") }));
+        let stub = Router::new().route(
+            "/search",
+            get(|| async { (axum::http::StatusCode::FORBIDDEN, "json format not enabled") }),
+        );
         let base = spawn_stub(stub).await;
         let provider = SearxSearch::new(base);
         let err = provider.search("q").await.unwrap_err();

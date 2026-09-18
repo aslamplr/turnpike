@@ -5,7 +5,7 @@
 # installs it to ~/.local/bin (override with TURNPIKE_INSTALL_DIR).
 #
 # Environment overrides:
-#   TURNPIKE_VERSION=v0.1.1   pin a release instead of "latest"
+#   TURNPIKE_VERSION=v0.1.2   pin a release instead of "latest"
 #   TURNPIKE_INSTALL_DIR=...  install somewhere other than ~/.local/bin
 #   TURNPIKE_SKIP_SHA256=1    skip checksum verification (not recommended)
 set -euo pipefail

@@ -25,7 +25,11 @@ use config::Config;
 use secrets::StoreCtx;
 
 #[derive(Parser)]
-#[command(name = "turnpike", version, about = "Local gateway for Claude/Anthropic and OpenAI-spec clients, with model remapping")]
+#[command(
+    name = "turnpike",
+    version,
+    about = "Local gateway for Claude/Anthropic and OpenAI-spec clients, with model remapping"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -113,7 +117,11 @@ async fn main() -> Result<()> {
     init_tracing(&cli.command);
 
     match cli.command {
-        Commands::Serve { config, listen, init } => serve(config, listen, init).await,
+        Commands::Serve {
+            config,
+            listen,
+            init,
+        } => serve(config, listen, init).await,
         Commands::Launch {
             target,
             config,
@@ -123,7 +131,16 @@ async fn main() -> Result<()> {
             no_auto_mode,
             install,
             args,
-        } => launch(config, &target, model, restore, force, no_auto_mode, install, &args),
+        } => launch(
+            config,
+            &target,
+            model,
+            restore,
+            force,
+            no_auto_mode,
+            install,
+            &args,
+        ),
         Commands::Routes { config } => routes(config),
         // Both take their config path straight through rather than going via
         // `resolve_config`: with no config they start from the starter text in
@@ -173,9 +190,18 @@ fn default_log_filter(command: &Commands) -> &'static str {
 ///
 /// The store is opened here and nowhere else, so every command sees the same
 /// view of where keys come from.
+///
+/// Only `cfg` is read today — hydration has already folded the store's answers
+/// into it by the time this is returned. The other two are kept because they
+/// are what makes a store *error* reportable to a caller that wants to say
+/// which path it opened and how the open went, and because dropping them would
+/// mean re-deriving both at each such site. If that need never arrives, this is
+/// the pair to delete.
 pub(crate) struct Loaded {
+    #[allow(dead_code)]
     pub path: PathBuf,
     pub cfg: Config,
+    #[allow(dead_code)]
     pub store: StoreCtx,
 }
 
@@ -230,7 +256,11 @@ fn resolve_config(path: Option<PathBuf>, mode: ConfigMode) -> Result<Loaded> {
 }
 
 async fn serve(config_path: Option<PathBuf>, listen: Option<String>, init: bool) -> Result<()> {
-    let mode = if init { ConfigMode::InitOnly } else { ConfigMode::ServeInteractive };
+    let mode = if init {
+        ConfigMode::InitOnly
+    } else {
+        ConfigMode::ServeInteractive
+    };
     let mut cfg = resolve_config(config_path, mode)?.cfg;
     if let Some(l) = listen {
         cfg.server.listen = l;
@@ -247,10 +277,7 @@ async fn serve(config_path: Option<PathBuf>, listen: Option<String>, init: bool)
     let listener = tokio::net::TcpListener::bind(&cfg.server.listen)
         .await
         .map_err(|e| anyhow::anyhow!("binding {}: {e}", cfg.server.listen))?;
-    println!(
-        "turnpike gateway on http://{} — routes:",
-        cfg.server.listen
-    );
+    println!("turnpike gateway on http://{} — routes:", cfg.server.listen);
     for (id, r) in &cfg.routes {
         println!("  {id} -> {}/{} ({})", id, r.provider, r.model);
     }
@@ -280,10 +307,9 @@ fn launch(
         "claude-code" | "claude_code" | "claudecode" => {
             let model = match model {
                 Some(m) => cfg.resolve_launch_model(&m)?,
-                None => cfg
-                    .default_launch_route()
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("config defines no [routes.*] to launch with"))?,
+                None => cfg.default_launch_route().cloned().ok_or_else(|| {
+                    anyhow::anyhow!("config defines no [routes.*] to launch with")
+                })?,
             };
             launch::claude_code::ClaudeCode.run(&cfg, &model, args, install)
         }
@@ -305,7 +331,11 @@ fn routes(config_path: Option<PathBuf>) -> Result<()> {
     let header = "upstream model";
     println!("{:<32} {:<12} {header}", "client id", "provider");
     for (id, r) in &cfg.routes {
-        let spec = cfg.providers.get(&r.provider).map(|p| p.spec.as_str()).unwrap_or("?");
+        let spec = cfg
+            .providers
+            .get(&r.provider)
+            .map(|p| p.spec.as_str())
+            .unwrap_or("?");
         println!("{:<32} {:<12} {} [{}]", id, r.provider, r.model, spec);
     }
     Ok(())

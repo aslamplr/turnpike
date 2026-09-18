@@ -173,8 +173,7 @@ pub fn configure(config: &Config, api_key: &str, force: bool, auto_mode: bool) -
     cfg["disableEssentialTelemetry"] = json!(true);
     cfg["disableNonessentialTelemetry"] = json!(true);
     cfg["autoModeEnabled"] = json!(auto_mode);
-    cfg.as_object_mut()
-        .map(|o| o.remove("inferenceModels"));
+    cfg.as_object_mut().map(|o| o.remove("inferenceModels"));
     write_json(&paths.profile, &cfg)?;
 
     register_in_meta(&paths.meta)?;
@@ -194,9 +193,16 @@ pub fn restore() -> Result<()> {
 
     if meta_backup.exists() {
         std::fs::copy(&meta_backup, &paths.meta).with_context(|| {
-            format!("restoring {} from {}", paths.meta.display(), meta_backup.display())
+            format!(
+                "restoring {} from {}",
+                paths.meta.display(),
+                meta_backup.display()
+            )
         })?;
-        println!("Restored Claude Desktop _meta.json from {}", meta_backup.display());
+        println!(
+            "Restored Claude Desktop _meta.json from {}",
+            meta_backup.display()
+        );
     } else {
         unregister_in_meta(&paths.meta)?;
     }
@@ -209,7 +215,10 @@ pub fn restore() -> Result<()> {
                 profile_backup.display()
             )
         })?;
-        println!("Restored Claude Desktop profile from {}", profile_backup.display());
+        println!(
+            "Restored Claude Desktop profile from {}",
+            profile_backup.display()
+        );
     } else if paths.profile.exists() {
         std::fs::remove_file(&paths.profile)
             .with_context(|| format!("removing {}", paths.profile.display()))?;
@@ -281,7 +290,10 @@ fn migrate_legacy(paths: &ClaudeDesktopPaths) -> Result<()> {
             let _ = std::fs::copy(legacy, &snapshot);
             std::fs::remove_file(legacy)
                 .with_context(|| format!("removing legacy {}", legacy.display()))?;
-            println!("Migrated legacy profile {} out of configLibrary", legacy.display());
+            println!(
+                "Migrated legacy profile {} out of configLibrary",
+                legacy.display()
+            );
         }
     }
     Ok(())
@@ -333,8 +345,7 @@ fn read_json_allow_missing(path: &Path) -> Value {
 
 fn write_json(path: &Path, v: &Value) -> Result<()> {
     let s = serde_json::to_string_pretty(v)?;
-    std::fs::write(path, s + "\n")
-        .with_context(|| format!("writing {}", path.display()))
+    std::fs::write(path, s + "\n").with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -342,10 +353,8 @@ mod tests {
     use super::*;
 
     fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "turnpike-desktop-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("turnpike-desktop-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("configLibrary")).unwrap();
         dir
@@ -367,7 +376,8 @@ mod tests {
         );
         assert_eq!(
             paths.legacy_backup,
-            root.join("configLibrary").join("turnpike.json.turnpike-backup.json")
+            root.join("configLibrary")
+                .join("turnpike.json.turnpike-backup.json")
         );
         assert_eq!(paths.backup_dir, root.join("turnpike-backups"));
     }
@@ -386,10 +396,7 @@ mod tests {
         register_in_meta(&meta_path).unwrap();
         let meta: Value =
             serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
-        assert_eq!(
-            meta["appliedId"],
-            "00000000-0000-5000-9000-000000000128"
-        );
+        assert_eq!(meta["appliedId"], "00000000-0000-5000-9000-000000000128");
         let entries = meta["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["name"], "Ollama");
@@ -420,8 +427,13 @@ mod tests {
         assert!(!paths.legacy_profile.exists());
         assert!(!paths.legacy_backup.exists());
         assert!(paths.backup_dir.join("legacy-turnpike.json").exists());
-        assert!(paths.backup_dir.join("legacy-turnpike.json.turnpike-backup.json").exists());
-        assert!(library.join("00000000-0000-4000-8000-000000000114.json").exists());
+        assert!(paths
+            .backup_dir
+            .join("legacy-turnpike.json.turnpike-backup.json")
+            .exists());
+        assert!(library
+            .join("00000000-0000-4000-8000-000000000114.json")
+            .exists());
     }
 
     #[test]

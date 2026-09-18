@@ -67,7 +67,8 @@ impl Plan {
     /// re-entering a key before saving does the obvious thing.
     pub fn stage_secret(&mut self, name: &str, value: &str) {
         self.secret_deletes.retain(|n| n != name);
-        self.secret_writes.insert(name.to_string(), Secret::new(value));
+        self.secret_writes
+            .insert(name.to_string(), Secret::new(value));
     }
 
     /// Stage a delete, cancelling any write staged for the same slot.
@@ -92,12 +93,34 @@ pub struct SetupOptions {
 }
 
 /// Entry point for `turnpike setup`.
+///
+/// A one-line adapter: it supplies the two things the wizard must get from the
+/// process — whether stdin is a terminal, and the real prompt source — and
+/// delegates to [`run_with`]. Keeping the ambient reads here, at the very edge,
+/// is what lets the tests drive the real entry point with neither.
 pub fn run(opts: SetupOptions) -> Result<()> {
+    run_with(opts, prompt::stdin_is_tty(), &mut prompt::Terminal)
+}
+
+/// The wizard proper, with both of its ambient dependencies injected.
+///
+/// `is_tty` and `p` are parameters rather than lookups because a test cannot
+/// control either one from the outside, and a test that asserts an environment
+/// property it does not own is not a test — it is a coin flip that lands
+/// differently depending on how `cargo test` was invoked. (Concretely: the tty
+/// guard below is skipped entirely when a developer runs `cargo test` from a
+/// terminal, because then fd 0 really is a terminal, and the menu's first
+/// prompt then blocks on `read()` forever waiting for a keystroke.)
+pub(crate) fn run_with(
+    opts: SetupOptions,
+    is_tty: bool,
+    prompter: &mut dyn Prompter,
+) -> Result<()> {
     // Non-tty: refusing up front is the only honest behavior. A prompt read
     // from a pipe returns "" immediately, so an unattended run would answer
     // "no" to everything and then save an unchanged file — a wizard that looks
     // like it did something and did nothing.
-    if !prompt::stdin_is_tty() {
+    if !is_tty {
         anyhow::bail!(
             "turnpike setup needs an interactive terminal — use \
              `turnpike serve --init` to write a starter config non-interactively, \
@@ -114,8 +137,7 @@ pub fn run(opts: SetupOptions) -> Result<()> {
     // **in memory** — `setup` never writes a starter to disk just to have
     // something to edit, or "quit without saving" would leave a file behind.
     let raw = if path.exists() {
-        std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
     } else {
         crate::config::default_config_text()
     };
@@ -138,7 +160,6 @@ pub fn run(opts: SetupOptions) -> Result<()> {
     }
 
     let path_display = path.display().to_string();
-    let mut prompter = prompt::Terminal;
     let mut state = WizardState::new(doc, Plan::default());
 
     loop {
@@ -156,10 +177,10 @@ pub fn run(opts: SetupOptions) -> Result<()> {
         // `choose` runs 1..=len and re-asks on anything else, so "quit" cannot
         // arrive as a bare Enter — it asks for the number, like every other row.
         match prompter.choose("What next?", top, 0)? {
-            0 => state.providers_menu(&mut prompter)?,
-            1 => state.routes_menu(&mut prompter)?,
-            2 => keys_menu(&mut state, &store, &mut prompter)?,
-            3 => validate_now(&state, &mut prompter)?,
+            0 => state.providers_menu(prompter)?,
+            1 => state.routes_menu(prompter)?,
+            2 => keys_menu(&mut state, &store, prompter)?,
+            3 => validate_now(&state, prompter)?,
             // Row 5 is a signpost, not a runner: doctor is its own command with
             // its own flags (`--json`, `--live`), and re-implementing its check
             // list inside the wizard would be a second copy to keep in sync.
@@ -208,11 +229,7 @@ impl WizardState {
                     .unwrap_or_else(|| "?".into());
                 println!("  {id}  [{spec}]");
             }
-            let action = p.choose(
-                "Providers:",
-                &["Add", "Edit", "Remove", "Back"],
-                3,
-            )?;
+            let action = p.choose("Providers:", &["Add", "Edit", "Remove", "Back"], 3)?;
             match action {
                 0 => self.add_provider(p)?,
                 1 => self.edit_provider(p, &ids)?,
@@ -226,10 +243,17 @@ impl WizardState {
         let specs = ["anthropic", "openai"];
         let which = p.choose(
             "Wire spec:",
-            &["anthropic (Anthropic Messages API)", "openai (chat-completions)"],
+            &[
+                "anthropic (Anthropic Messages API)",
+                "openai (chat-completions)",
+            ],
             0,
         )?;
-        let spec = if which == 0 { Spec::Anthropic } else { Spec::Openai };
+        let spec = if which == 0 {
+            Spec::Anthropic
+        } else {
+            Spec::Openai
+        };
 
         let id = p.ask("Provider id (e.g. zen)")?;
         let base_url = p.ask("Base URL (no spec path, e.g. https://opencode.ai/zen)")?;
@@ -257,7 +281,11 @@ impl WizardState {
             }
             1 => {
                 let which = p.choose("Wire spec:", &["anthropic", "openai"], 0)?;
-                let spec = if which == 0 { Spec::Anthropic } else { Spec::Openai };
+                let spec = if which == 0 {
+                    Spec::Anthropic
+                } else {
+                    Spec::Openai
+                };
                 report(self.doc.set_provider_scalar(&id, "spec", spec.as_str()));
             }
             _ => {}
@@ -384,7 +412,15 @@ impl WizardState {
 
         let field = p.choose(
             "Which field?",
-            &["model", "provider", "family", "display_name", "max_tokens", "context_tokens", "Back"],
+            &[
+                "model",
+                "provider",
+                "family",
+                "display_name",
+                "max_tokens",
+                "context_tokens",
+                "Back",
+            ],
             6,
         )?;
         match field {
@@ -405,7 +441,13 @@ impl WizardState {
             2 => {
                 let fam = p.choose(
                     "Family tier:",
-                    &["(infer from upstream model)", "sonnet", "opus", "haiku", "other"],
+                    &[
+                        "(infer from upstream model)",
+                        "sonnet",
+                        "opus",
+                        "haiku",
+                        "other",
+                    ],
                     0,
                 )?;
                 if fam == 0 {
@@ -459,7 +501,12 @@ impl WizardState {
     // --- commit ------------------------------------------------------------
 
     /// Write everything staged, in the order that keeps a crash recoverable.
-    fn commit(&mut self, path: &Path, store: &mut secrets::StoreCtx, no_validate: bool) -> Result<()> {
+    fn commit(
+        &mut self,
+        path: &Path,
+        store: &mut secrets::StoreCtx,
+        no_validate: bool,
+    ) -> Result<()> {
         // Validate the rendered document *before* anything is written, so a
         // document the wizard built but that is not a valid config is caught
         // while the file on disk is still the old one.
@@ -508,7 +555,10 @@ impl WizardState {
                 .map_err(|e| anyhow::anyhow!("writing the secret store: {e}"))?;
             let n = self.plan.secret_writes.len();
             if n > 0 {
-                println!("  stored {n} secret{} encrypted", if n == 1 { "" } else { "s" });
+                println!(
+                    "  stored {n} secret{} encrypted",
+                    if n == 1 { "" } else { "s" }
+                );
             }
         }
 
@@ -527,7 +577,6 @@ impl WizardState {
 
         Ok(())
     }
-
 }
 
 /// Report a `Doc` mutation's outcome without swallowing it.
@@ -674,10 +723,8 @@ fn keys_menu(
         )?;
         match choice {
             0 => {
-                let value = p.ask_secret(&format!(
-                    "API key for {} (input hidden)",
-                    search.provider
-                ))?;
+                let value =
+                    p.ask_secret(&format!("API key for {} (input hidden)", search.provider))?;
                 state
                     .plan
                     .stage_secret(&secrets::search_key_name(&search.provider), &value);
@@ -685,7 +732,9 @@ fn keys_menu(
             1 => {
                 let var = p.ask("Environment variable holding the search key")?;
                 report(state.doc.set_search_key_env(&var));
-                state.plan.stage_delete(&secrets::search_key_name(&search.provider));
+                state
+                    .plan
+                    .stage_delete(&secrets::search_key_name(&search.provider));
             }
             _ => {}
         }
@@ -736,8 +785,8 @@ fn write_atomic(path: &Path, body: &str) -> Result<()> {
     let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
 
     {
-        let mut file = std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         file.write_all(body.as_bytes())?;
         file.sync_all()?;
     }
@@ -855,7 +904,10 @@ mod tests {
         assert_eq!(store.get("provider.zen").unwrap().expose(), "sk-secret");
         // ...and the plaintext is nowhere in the config file.
         let written = std::fs::read_to_string(&path).unwrap();
-        assert!(!written.contains("sk-secret"), "key leaked into config.toml");
+        assert!(
+            !written.contains("sk-secret"),
+            "key leaked into config.toml"
+        );
     }
 
     #[test]
@@ -873,10 +925,7 @@ mod tests {
         // referent: drop `zen` while its routes still point at it.
         state.doc.remove_route("claude-sonnet-5").unwrap();
         state.doc.remove_route("claude-opus-5").unwrap();
-        state
-            .doc
-            .remove_route("claude-haiku-4-5")
-            .unwrap();
+        state.doc.remove_route("claude-haiku-4-5").unwrap();
         // Now remove the provider; with no routes left, this succeeds and leaves
         // a config with no providers, which `validate` rejects.
         state.doc.remove_provider("zen").unwrap();
@@ -921,7 +970,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.contains(".tmp-"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 
     #[test]
@@ -984,8 +1036,7 @@ base_url = "https://opencode.ai/zen"
             )
             .unwrap(),
             Plan::default(),
-        )
-;
+        );
         let store = memory_store();
         // "1" picks paste; then the secret; then "3" leaves the search key alone
         // — and the search prompt itself defaults to no.
@@ -1016,8 +1067,7 @@ api_key = "sk-inline"
             )
             .unwrap(),
             Plan::default(),
-        )
-;
+        );
         let store = memory_store();
         // The inline key is already resolvable, so `keys_menu` asks "Replace the
         // key for zen?" *before* offering the three choices — "y" answers that,
@@ -1058,12 +1108,46 @@ base_url = "https://opencode.ai/zen"
 
     #[test]
     fn non_tty_run_bails_with_the_serve_init_message() {
-        // Assert the message text only — do not fake a tty. `stdin` under
-        // `cargo test` is not a terminal, so this exercises the real guard.
-        let err = run(SetupOptions::default()).unwrap_err();
+        // Drive the guard with `false` injected rather than inheriting fd 0.
+        //
+        // The earlier version called `run()` and asserted the message, on the
+        // premise that "`stdin` under `cargo test` is not a terminal". That
+        // premise is false whenever a developer runs `cargo test` from a
+        // terminal: fd 0 really is a tty, `stdin_is_tty()` returns true, the
+        // guard is skipped, and the wizard's first menu prompt then blocks on
+        // `read()` waiting for a keystroke that never comes — `cargo test`
+        // hangs with no failing test to point at.
+        //
+        // A test cannot assert an ambient property it does not own. Injecting
+        // the answer is what the rest of this module already does for prompts
+        // (`ScriptedPrompt`), one layer down.
+        let err = run_with(
+            SetupOptions::default(),
+            false,
+            &mut ScriptedPrompt::new(&[]),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("interactive terminal"), "got: {err:#}");
         assert!(msg.contains("serve --init"), "got: {err:#}");
+    }
+
+    #[test]
+    fn tty_run_reaches_the_wizard_and_never_blocks() {
+        // The other half of the contract: with `is_tty = true` the guard must
+        // *not* fire, and the scripted "quit without saving" answer must walk
+        // out of the menu. Without this, deleting the guard entirely would
+        // still leave the non-tty test above passing.
+        let dir = crate::secrets::tests::temp_root("setup-tty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut p = ScriptedPrompt::new(&["7"]); // "Quit without saving"
+        let opts = SetupOptions {
+            config: Some(path.clone()),
+            no_validate: false,
+        };
+        run_with(opts, true, &mut p).unwrap();
+        assert!(!path.exists(), "quit-without-saving must not write a file");
     }
 
     #[test]

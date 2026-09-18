@@ -22,6 +22,7 @@ use std::io::{BufRead, IsTerminal, Write};
 
 use anyhow::Result;
 
+#[cfg(test)]
 use crate::setup::edit::Doc;
 
 /// True when stdin is a terminal.
@@ -74,6 +75,12 @@ pub fn ask_default(question: &str, default: &str) -> Result<String> {
 }
 
 /// Yes/no, defaulting to yes. `[Y/n]` — so a bare Enter is the common path.
+///
+/// Every caller in the wizard wants an explicit default, so this convenience
+/// wrapper is exercised only by its own test; it stays part of the prompt
+/// module's vocabulary rather than being deleted and re-added at the next
+/// yes-by-default question.
+#[allow(dead_code)]
 pub fn confirm(question: &str) -> Result<bool> {
     confirm_default(question, true)
 }
@@ -229,6 +236,8 @@ impl Drop for EchoGuard {
 pub trait Prompter {
     fn ask(&mut self, question: &str) -> Result<String>;
     fn ask_default(&mut self, question: &str, default: &str) -> Result<String>;
+    /// Yes-by-default convenience; see the free function of the same name.
+    #[allow(dead_code)]
     fn confirm(&mut self, question: &str) -> Result<bool>;
     fn confirm_default(&mut self, question: &str, default: bool) -> Result<bool>;
     fn choose(&mut self, question: &str, options: &[&str], default: usize) -> Result<usize>;
@@ -263,6 +272,11 @@ impl Prompter for Terminal {
 ///
 /// Lives here rather than in `edit` because it is presentation, and `edit` is
 /// deliberately free of it.
+///
+/// Currently test-only: the menu header in `setup::mod` builds its own richer
+/// line. Kept because the counting it does (providers, routes) is the shape the
+/// header wants, and the test is what pins it.
+#[cfg(test)]
 pub fn describe_doc(doc: &Doc) -> String {
     format!(
         "{} providers · {} routes",

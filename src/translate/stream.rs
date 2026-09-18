@@ -180,12 +180,7 @@ impl StreamConverter {
                     self.close_open_block(&mut events);
                     let anthropic_index = self.block_index;
                     self.block_index += 1;
-                    self.tools.insert(
-                        openai_idx,
-                        ToolState {
-                            anthropic_index,
-                        },
-                    );
+                    self.tools.insert(openai_idx, ToolState { anthropic_index });
                     self.open_block = Some(OpenBlock::Tool(anthropic_index));
                     let id = call
                         .get("id")
@@ -236,8 +231,14 @@ impl StreamConverter {
                 .cloned()
                 .or_else(|| self.usage.take())
                 .unwrap_or(Value::Null);
-            let input = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-            let output = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+            let input = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let output = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             events.push(Event {
                 name: "message_delta".into(),
                 data: json!({
@@ -325,10 +326,7 @@ mod tests {
         all.extend(c.process(&chunk(json!({"role": "assistant"}), None)));
         all.extend(c.process(&chunk(json!({"content": "Hel"}), None)));
         all.extend(c.process(&chunk(json!({"content": "lo"}), None)));
-        all.extend(c.process(&chunk(
-            json!({}),
-            Some("stop"),
-        )));
+        all.extend(c.process(&chunk(json!({}), Some("stop"))));
         let seq: Vec<String> = event_bodies(&all).into_iter().map(|(n, _)| n).collect();
         assert_eq!(
             seq,
@@ -457,6 +455,9 @@ mod tests {
     #[test]
     fn sse_framing_is_anthropic_shaped() {
         let framed = format_sse("message_stop", &json!({"type": "message_stop"}));
-        assert_eq!(framed, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        assert_eq!(
+            framed,
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
     }
 }
