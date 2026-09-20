@@ -20,10 +20,17 @@ module provides the providers and `src/proxy.rs` runs the loop.
    there is no search provider — an unexecutable tool must not reach the
    model).
 3. **Loop.** Every iteration sends the full conversation **non-streaming**
-   upstream. The first iteration uses the client's original `tool_choice`;
-   from iteration 2 on, `tool_choice` is forced to `"auto"` so a
-   client-pinned `web_search` tool choice can't make the model search
-   forever.
+   upstream. A **forced** client `tool_choice` is relaxed to `"auto"` before
+   the first iteration, because the middleware executes the search itself:
+   reasoning-mode upstreams reject a forced choice outright —
+   `400 invalid_request_error: Thinking mode does not support this
+   tool_choice` — and a pin to turnpike's own `web_search` would force a
+   search on every iteration instead of letting the model answer. Forced
+   means `any` (translated to `"required"`) or a pin to `web_search`;
+   `"auto"`/`"none"` and a pin to any *other* tool pass through untouched, so
+   the client's contract for its own tools is never rewritten. Iterations
+   after the first are `"auto"` as well — the loop's own guarantee that an
+   executed search is never repeated by force.
    - If the model answers with **no tool calls**, or with any tool call that
      isn't `web_search`, the loop ends with that response. Only when *every*
      call is turnpike's `web_search` does the loop continue — mixed client-tool

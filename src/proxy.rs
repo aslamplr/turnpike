@@ -660,6 +660,17 @@ async fn bridge(
     if let Some(obj) = loop_template.as_object_mut() {
         obj.remove("stream_options");
     }
+    // Normalize once, on the template, so iteration 0 cannot carry a forced
+    // choice either. Doing it per-iteration was the original bug: iteration 0
+    // forwarded the client's forced choice, a reasoning-mode upstream 400'd it,
+    // and `upstream_error_response` handed that 400 straight to the client
+    // without a single search having run.
+    if relax_forced_tool_choice(&mut loop_template) {
+        tracing::info!(
+            middleware = "search",
+            "relaxed a forced tool_choice to \"auto\" for the loop"
+        );
+    }
 
     let mut trace: Vec<Value> = Vec::new();
     let mut total_input = 0u64;
@@ -670,9 +681,10 @@ async fn bridge(
         let mut req_payload = loop_template.clone();
         req_payload["messages"] = Value::Array(history.clone());
         if iteration > 0 {
-            // After a search has executed, a client-pinned tool_choice
-            // (e.g. {"type":"tool","name":"web_search"}) would force the
-            // model to search again forever. Let it answer.
+            // The template's forced choices were already relaxed (see
+            // `relax_forced_tool_choice`), so this is normally a no-op. It
+            // stays as the loop's own guarantee: once a search has executed,
+            // nothing can force another one, whatever the client pinned.
             req_payload["tool_choice"] = json!("auto");
         }
 
@@ -1045,6 +1057,35 @@ fn has_turnpike_search_tool(openai_payload: &Value) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// Relax a *forced* OpenAI `tool_choice` to `"auto"`, for the search loop's
+/// request template. Returns true when it rewrote the choice.
+///
+/// The middleware executes `web_search` itself, so a forced choice breaks the
+/// loop in two ways: reasoning-mode upstreams reject one outright — 400
+/// `invalid_request_error: Thinking mode does not support this tool_choice`,
+/// reported live against a `{"type":"tool","name":"web_search"}` pin and
+/// against `{"type":"any"}` — and a pin to turnpike's own search alias would
+/// re-force a search on every iteration instead of letting the model answer.
+///
+/// `"auto"`/`"none"` and a pin to any *other* tool pass through untouched: the
+/// client's contract for its own tools is not the middleware's to rewrite, and
+/// such a request is the same one the non-middleware path forwards verbatim.
+fn relax_forced_tool_choice(payload: &mut Value) -> bool {
+    let forced = match payload.get("tool_choice") {
+        // OpenAI's only unforced string values are "auto" and "none";
+        // Anthropic's `any` arrives here as "required".
+        Some(Value::String(s)) => s != "auto" && s != "none",
+        Some(v) => {
+            v.pointer("/function/name").and_then(Value::as_str) == Some(TURNPIKE_SEARCH_TOOL)
+        }
+        None => false,
+    };
+    if forced {
+        payload["tool_choice"] = json!("auto");
+    }
+    forced
 }
 
 /// Remove Anthropic server-tool declarations (web_search_*) whose execution
@@ -2008,8 +2049,9 @@ api_key = "test-key"
         let res = router(Arc::new(gw));
 
         // Client declares Anthropic's web_search server tool and pins
-        // tool_choice to it (the shape that made upstreams 400), asks to
-        // stream.
+        // tool_choice to it — the exact shape that made reasoning-mode
+        // upstreams 400 ("Thinking mode does not support this tool_choice") —
+        // and asks to stream.
         let req = axum::http::Request::builder()
             .method(Method::POST)
             .uri("/v1/messages")
@@ -2045,9 +2087,10 @@ api_key = "test-key"
         // Upstream saw exactly two calls; the second carried the tool result.
         let calls = seen.lock().await;
         assert_eq!(calls.len(), 2);
-        // First iteration honored the pinned tool_choice…
-        assert_eq!(calls[0]["tool_choice"]["function"]["name"], "web_search");
-        // …and the follow-up was relaxed to auto so the model can answer.
+        // The pinned web_search choice was relaxed *before* iteration 0 — a
+        // forced choice both 400s on reasoning-mode upstreams and would
+        // re-force a search on every later iteration.
+        assert_eq!(calls[0]["tool_choice"], "auto");
         assert_eq!(calls[1]["tool_choice"], "auto");
         let second = &calls[1];
         let msgs = second["messages"].as_array().unwrap();
@@ -2067,6 +2110,267 @@ api_key = "test-key"
             .contains("About rust gateway"));
         // Loop ran non-streaming upstream even though the client streamed.
         assert_eq!(second["stream"], false);
+    }
+
+    #[test]
+    fn relax_forced_tool_choice_rewrites_only_forced_choices() {
+        fn relaxed(mut v: Value) -> Value {
+            relax_forced_tool_choice(&mut v);
+            v.get("tool_choice").cloned().unwrap_or(Value::Null)
+        }
+        // Anthropic's `any` arrives translated as "required", and a pin to
+        // turnpike's own search alias as a function object: both are forced.
+        assert_eq!(relaxed(json!({"tool_choice": "required"})), json!("auto"));
+        assert_eq!(
+            relaxed(json!({"tool_choice":
+                {"type": "function", "function": {"name": "web_search"}}})),
+            json!("auto")
+        );
+        // Unforced, or pinned to a tool that is the client's own: untouched.
+        assert_eq!(relaxed(json!({"tool_choice": "auto"})), json!("auto"));
+        assert_eq!(relaxed(json!({"tool_choice": "none"})), json!("none"));
+        assert_eq!(
+            relaxed(json!({"tool_choice":
+                {"type": "function", "function": {"name": "get_weather"}}})),
+            json!({"type": "function", "function": {"name": "get_weather"}})
+        );
+        // Absent stays absent: the key is not invented.
+        let mut absent = json!({"model": "x"});
+        assert!(!relax_forced_tool_choice(&mut absent));
+        assert!(absent.get("tool_choice").is_none());
+        // Reports whether it rewrote.
+        assert!(relax_forced_tool_choice(
+            &mut json!({"tool_choice": "required"})
+        ));
+    }
+
+    /// A gateway routed at `addr` with the search middleware enabled.
+    fn search_gateway(addr: std::net::SocketAddr) -> Router {
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.openai_up]
+spec = "openai"
+base_url = "http://{addr}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "openai_up"
+model = "deepseek-v4.1-flash"
+
+[search]
+provider = "exa"
+api_key = "test-key"
+"#
+        );
+        let cfg: Config = toml::from_str(&cfg_text).unwrap();
+        let mut gw = Gateway::new(Arc::new(cfg));
+        gw.search = Some(Arc::new(crate::search::SearchManager::new(Some(Box::new(
+            MockSearch,
+        )))));
+        router(Arc::new(gw))
+    }
+
+    /// POST a `/v1/messages` body, returning (status, body text).
+    async fn send_messages(app: Router, body: &str) -> (StatusCode, String) {
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("host", "127.0.0.1:8710")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let status = res.status();
+        let bytes = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// A stub upstream that rejects a *forced* `tool_choice` exactly as a
+    /// reasoning-mode provider does — the reported 400 — and otherwise runs
+    /// the two-call search loop (tool call, then final answer). Returns the
+    /// bound address and the request bodies it saw.
+    async fn forced_choice_rejecting_upstream(
+    ) -> (std::net::SocketAddr, Arc<tokio::sync::Mutex<Vec<Value>>>) {
+        let seen: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let rx = seen.clone();
+        let stub = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| {
+                let rx = rx.clone();
+                async move {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    let forced = match v.get("tool_choice") {
+                        Some(Value::String(s)) => s != "auto" && s != "none",
+                        Some(_) => true,
+                        None => false,
+                    };
+                    let n = {
+                        let mut g = rx.lock().await;
+                        g.push(v);
+                        g.len()
+                    };
+                    if forced {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": {
+                                "type": "invalid_request_error",
+                                "message": "Thinking mode does not support this tool_choice"
+                            }})),
+                        );
+                    }
+                    if n == 1 {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "c1", "object": "chat.completion", "model": "deepseek-v4.1-flash",
+                                "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                    "message": {"role": "assistant", "content": null,
+                                        "tool_calls": [{"id": "call_ws", "type": "function",
+                                            "function": {"name": "web_search",
+                                                "arguments": "{\"query\":\"turnpike\"}"}}]}}],
+                                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                            })),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "c2", "object": "chat.completion", "model": "deepseek-v4.1-flash",
+                            "choices": [{"index": 0, "finish_reason": "stop",
+                                "message": {"role": "assistant", "content": "Answered."}}],
+                            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, stub.into_make_service())
+                .await
+                .unwrap()
+        });
+        (addr, seen)
+    }
+
+    /// The reported failure, end to end. Iteration 0 used to forward the
+    /// client's forced choice, the upstream 400'd it, and `bridge()` handed
+    /// that 400 straight to the client with no search having run.
+    #[tokio::test]
+    async fn search_middleware_relaxes_a_pinned_web_search_choice() {
+        let (addr, seen) = forced_choice_rejecting_upstream().await;
+        let (status, text) = send_messages(
+            search_gateway(addr),
+            r#"{"model":"claude-sonnet-5","max_tokens":64,"stream":false,
+                "tools":[{"type":"web_search_20250305","name":"web_search"}],
+                "tool_choice":{"type":"tool","name":"web_search"},
+                "messages":[{"role":"user","content":[{"type":"text","text":"test web_search"}]}]}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "client got the upstream 400: {text}"
+        );
+        // The search actually executed, and its trace is in the answer.
+        assert!(text.contains("\"type\":\"server_tool_use\""));
+        assert!(text.contains("\"type\":\"web_search_tool_result\""));
+        assert!(text.contains("Answered."));
+        let calls = seen.lock().await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["tool_choice"], "auto");
+        assert_eq!(calls[1]["tool_choice"], "auto");
+    }
+
+    /// `{"type":"any"}` translates to `"required"` — forced, and rejected by a
+    /// reasoning-mode upstream just the same.
+    #[tokio::test]
+    async fn search_middleware_relaxes_an_anthropic_any_choice() {
+        let (addr, seen) = forced_choice_rejecting_upstream().await;
+        let (status, text) = send_messages(
+            search_gateway(addr),
+            r#"{"model":"claude-sonnet-5","max_tokens":64,"stream":false,
+                "tools":[{"type":"web_search_20250305","name":"web_search"}],
+                "tool_choice":{"type":"any"},
+                "messages":[{"role":"user","content":[{"type":"text","text":"test web_search"}]}]}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "client got the upstream 400: {text}"
+        );
+        assert!(text.contains("\"type\":\"server_tool_use\""));
+        let calls = seen.lock().await;
+        assert_eq!(calls[0]["tool_choice"], "auto");
+    }
+
+    /// A pin to the client's *own* tool is the client's contract, not the
+    /// middleware's: it forwards verbatim, and the tool call passes back — the
+    /// middleware does not execute it and does not search.
+    #[tokio::test]
+    async fn search_middleware_leaves_a_pin_on_a_client_tool_alone() {
+        let seen: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let rx = seen.clone();
+        let stub = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| {
+                let rx = rx.clone();
+                async move {
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    rx.lock().await.push(v);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "c1", "object": "chat.completion", "model": "deepseek-v4.1-flash",
+                            "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                "message": {"role": "assistant", "content": null,
+                                    "tool_calls": [{"id": "call_w", "type": "function",
+                                        "function": {"name": "get_weather",
+                                            "arguments": "{\"city\":\"Paris\"}"}}]}}],
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, stub.into_make_service())
+                .await
+                .unwrap()
+        });
+
+        let (status, text) = send_messages(
+            search_gateway(addr),
+            r#"{"model":"claude-sonnet-5","max_tokens":64,"stream":false,
+                "tools":[{"type":"web_search_20250305","name":"web_search"},
+                         {"name":"get_weather","description":"weather",
+                          "input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],
+                "tool_choice":{"type":"tool","name":"get_weather"},
+                "messages":[{"role":"user","content":[{"type":"text","text":"weather in Paris?"}]}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // The client's own tool call comes back; no search ran.
+        assert!(text.contains("\"name\":\"get_weather\""));
+        assert!(!text.contains("server_tool_use"));
+        let calls = seen.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]["tool_choice"],
+            json!({"type": "function", "function": {"name": "get_weather"}})
+        );
     }
 
     #[tokio::test]

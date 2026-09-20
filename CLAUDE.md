@@ -69,9 +69,15 @@ cargo test        # inline #[cfg(test)] modules per file
   before forwarding; the provider key is injected per request. 64 MiB body limit.
 - **Agentic search middleware**: only when `[search]` is configured (a `web_search` server tool
   alias is declared by the client) AND the request is bridged. turnpike executes the searches
-  itself in a bounded loop (`0..=max_loops`, default 5), appends `role:"tool"` results, relaxes
-  `tool_choice` to `"auto"` after iteration 0, sums usage, and prefixes the final answer with
-  `server_tool_use` + `web_search_tool_result` trace blocks. With no search provider configured,
+  itself in a bounded loop (`0..=max_loops`, default 5), appends `role:"tool"` results, relaxes a
+  **forced** `tool_choice` (`"required"`, or a pin to `web_search`) to `"auto"` **before** the loop
+  via `relax_forced_tool_choice()`, sums usage, and prefixes the final answer with
+  `server_tool_use` + `web_search_tool_result` trace blocks. The relaxation is pre-loop, not
+  post-iteration-0, because reasoning-mode upstreams reject a forced choice outright
+  (`400 … Thinking mode does not support this tool_choice`): relaxing only from iteration 1 left
+  iteration 0 to forward the client's pin, and the upstream's 400 went straight back to the client
+  with no search executed. `"auto"`/`"none"` and a pin to any *other* tool pass through untouched.
+  With no search provider configured,
   server tools are stripped from bridged requests. Search runs against the non-streaming upstream
   and is rendered as full SSE if the client streamed. Every executed search's tool-result content
   is wrapped in an explicit `untrusted web data` trust boundary by `format_results()` (the single

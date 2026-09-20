@@ -57,8 +57,15 @@ pinned to a tool the translation dropped — because upstreams hard-400 with
 "Tools cannot be empty if tool choice is set to a specific tool" otherwise.
 This guard was a live-debugging discovery on the very first `web_search` run:
 a client-pinned `{type:"tool", name:"web_search"}` with the server tool
-present survived translation, but the middleware *also* relaxes `tool_choice`
-to `"auto"` on its iterations 2+. Details in [search.md](search.md).
+present survived translation.
+
+That pin does not reach the upstream unchanged, though — a *forced* choice
+(`"required"`, or a pin to `web_search`) is relaxed to `"auto"` by the search
+middleware's `relax_forced_tool_choice()` before its first iteration.
+Reasoning-mode providers reject a forced choice outright, and the middleware
+executes the search itself rather than letting the client's pin drive it. On
+the non-middleware path no such relaxation happens and the mapped choice is
+forwarded verbatim. Details in [search.md](search.md).
 
 ### Deliberately dropped
 
