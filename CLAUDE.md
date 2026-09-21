@@ -34,6 +34,9 @@ turnpike launch claude-desktop --restore
 # List configured routes
 turnpike routes
 
+# The config as a redacted view — key *tiers*, never key values (--json for the desktop shell)
+turnpike config
+
 # What is wrong, and how to fix it (--json for scripting, --live to probe providers)
 turnpike doctor
 
@@ -57,6 +60,12 @@ cargo test        # inline #[cfg(test)] modules per file
 - `src/setup/mod.rs` — the wizard: menu, staged `Plan`, `commit()`.
 - `src/setup/prompt.rs` — **the only module that writes to stdout for input.** If you add a prompt anywhere else, you have broken the stdout/stderr split.
 - `src/doctor.rs` — the check list (`CHECK_IDS`) and its human + `--json` renderers. Read-only, non-fatal.
+- `src/view.rs` — the config as a **redacted** view for `turnpike config [--json]`: key **tiers**
+  only, `extra_headers` by name only. The redaction boundary; see the invariant below.
+- `desktop/` — the desktop shell (Tauri v2 + Svelte/TS), a separate crate **outside** the root
+  workspace (`exclude = ["desktop"]`, empty `[workspace]` in `desktop/src-tauri/Cargo.toml`).
+  Dev-only in phase 1. It supervises the same `turnpike` binary; the CLI is untouched. Design in
+  `docs/desktop.md`.
 
 ## Key design invariants
 
@@ -125,6 +134,13 @@ cargo test        # inline #[cfg(test)] modules per file
 - **stdout is program output; stderr is diagnostics.** Prompts go through `setup::prompt` only,
   everything else through `tracing`. A prompt sharing a descriptor with an `INFO` is how a wizard
   becomes unusable under `RUST_LOG=debug`.
+- **The config view is the redaction boundary** (`src/view.rs`): `turnpike config` reports key
+  *tiers* (`env VAR` / `store` / `inline (plaintext)` / `missing` / `not required`), never values,
+  and `extra_headers` by **name only**. `config.rs` derives **only `Deserialize`** on purpose —
+  `ProviderCfg.api_key` and `SearchCfg.api_key` are plaintext with no `serde(skip)`, so adding
+  `Serialize` to those types to feed a UI would leak every inline key. `Secret::expose()` must
+  never be called from any view path; the view reads only the source. The desktop shell consumes
+  this view, so this is also what keeps credentials out of the webview.
 - **`Fail` vs `Warn` in `doctor`**: `Fail` means the gateway cannot serve the config at all — the
   three `config::validate` rules and nothing more. Everything else is a lint → `Warn`. Do not widen
   `validate` to cover a lint; it breaks working configs.

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core window and event access only. There is deliberately no `shell:` or `http:` permission: every gateway interaction is Rust-side, and the gateway's loopback Origin guard 403s a webview's `Origin: tauri://localhost` anyway, so `http:` would be dead weight and a footgun. The autostart plugin is driven from Rust, so it needs no webview permission either.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -14,6 +14,7 @@ mod search;
 mod secrets;
 mod setup;
 mod translate;
+mod view;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,10 +81,25 @@ enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Print the loaded config, with key tiers and never key values.
+    ///
+    /// Read-only, and the machine-readable form (`--json`) is what the desktop
+    /// shell consumes. It is the redaction boundary: see `src/view.rs`.
+    Config(ConfigArgs),
     /// Walk through creating or editing the config, including encrypted key storage.
     Setup(SetupArgs),
     /// Check the config, the secret store, and (with --live) the providers.
     Doctor(DoctorArgs),
+}
+
+#[derive(clap::Args)]
+pub struct ConfigArgs {
+    /// Path to config.toml (default: $TURNPIKE_CONFIG or ~/.config/turnpike/config.toml).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Machine-readable output for the desktop shell.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args)]
@@ -142,6 +158,7 @@ async fn main() -> Result<()> {
             &args,
         ),
         Commands::Routes { config } => routes(config),
+        Commands::Config(args) => show_config(args),
         // Both take their config path straight through rather than going via
         // `resolve_config`: with no config they start from the starter text in
         // memory, which is the opposite of what `ConfigMode` exists to decide.
@@ -182,7 +199,10 @@ fn init_tracing(command: &Commands) {
 fn default_log_filter(command: &Commands) -> &'static str {
     match command {
         Commands::Setup(_) | Commands::Doctor(_) => "warn",
-        Commands::Serve { .. } | Commands::Launch { .. } | Commands::Routes { .. } => "info",
+        Commands::Serve { .. }
+        | Commands::Launch { .. }
+        | Commands::Routes { .. }
+        | Commands::Config(_) => "info",
     }
 }
 
@@ -337,6 +357,22 @@ fn routes(config_path: Option<PathBuf>) -> Result<()> {
             .map(|p| p.spec.as_str())
             .unwrap_or("?");
         println!("{:<32} {:<12} {} [{}]", id, r.provider, r.model, spec);
+    }
+    Ok(())
+}
+
+/// Render the config as a view — key *tiers*, never key values.
+///
+/// `ConfigMode::Required` so the view is hydrated and the store's status is
+/// real: a key that only the store could have supplied must not be reported as
+/// missing just because nothing opened it.
+fn show_config(args: ConfigArgs) -> Result<()> {
+    let loaded = resolve_config(args.config, ConfigMode::Required)?;
+    let view = view::build(&loaded.path, &loaded.cfg);
+    if args.json {
+        println!("{}", view::to_json(&view)?);
+    } else {
+        print!("{}", view::to_human(&view));
     }
     Ok(())
 }

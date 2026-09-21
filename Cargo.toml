@@ -4,6 +4,9 @@ version = "0.1.4"
 edition = "2021"
 description = "A minimal local gateway that proxies Claude/Anthropic and OpenAI-spec clients to any OpenAI- or Anthropic-compatible LLM provider, with model remapping and one-command launch integrations for Claude Code and Claude Desktop."
 license = "MIT"
+# `desktop/` is a separate app with its own workspace and its own node_modules.
+# Without this, `cargo package` would sweep both into the crate tarball.
+exclude = ["desktop"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
