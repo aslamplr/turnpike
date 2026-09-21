@@ -10,7 +10,8 @@ publish = false
 # can never be absorbed into the turnpike workspace if the root ever grows one.
 # The root deliberately has none: CI runs `cargo test --locked` on ubuntu-latest,
 # and a root workspace would make it try to build this crate and fail on missing
-# WebKitGTK. Phase 1 changes no CI.
+# WebKitGTK. The desktop ships from its own workflow instead:
+# `.github/workflows/desktop.yml`, which builds on macOS and Windows runners.
 [workspace]
 
 [lib]

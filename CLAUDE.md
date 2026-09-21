@@ -64,8 +64,9 @@ cargo test        # inline #[cfg(test)] modules per file
   only, `extra_headers` by name only. The redaction boundary; see the invariant below.
 - `desktop/` — the desktop shell (Tauri v2 + Svelte/TS), a separate crate **outside** the root
   workspace (`exclude = ["desktop"]`, empty `[workspace]` in `desktop/src-tauri/Cargo.toml`).
-  Dev-only in phase 1. It supervises the same `turnpike` binary; the CLI is untouched. Design in
-  `docs/desktop.md`.
+  It supervises the same `turnpike` binary; the CLI is untouched. Ships **ad-hoc signed** — no
+  Apple account, no notarization — from `.github/workflows/desktop.yml`, a workflow separate from
+  `release.yml` so a slow Tauri build cannot cost the CLI its release. Design in `docs/desktop.md`.
 
 ## Key design invariants
 
