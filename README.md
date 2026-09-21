@@ -110,7 +110,8 @@ turnpike launch claude-desktop --restore
 
 There is also a **desktop shell** (menu-bar item, a supervisor that runs the
 gateway for you, and a read-only settings window) in [desktop/](desktop/) — Tauri
-v2 + Svelte, **dev-only for now** (`cd desktop && npm run tauri dev`). It
+v2 + Svelte, published on each release as an **ad-hoc signed** macOS `.dmg` and an
+unsigned Windows installer (`cd desktop && npm run tauri dev` to hack on it). It
 supervises the same `turnpike` binary; nothing about the CLI changes. See
 [docs/desktop.md](docs/desktop.md).
 
@@ -290,7 +291,7 @@ src/view.rs                   the redacted config view (`turnpike config`)
 src/launch/claude_code.rs     env-var launcher + claude installer
 src/launch/claude_desktop.rs  configLibrary gateway profile writer (backup/restore)
 src/main.rs                   CLI: serve / launch / routes / setup / config / doctor
-desktop/                      the desktop shell (Tauri v2 + Svelte, dev-only)
+desktop/                      the desktop shell (Tauri v2 + Svelte, ad-hoc signed)
 ```
 
 `docs/` holds the design documentation (one page per module above).

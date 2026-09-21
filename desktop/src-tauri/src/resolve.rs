@@ -22,8 +22,9 @@ pub const BIN: &str = "turnpike";
 /// Every place the binary might be, in the order it should be tried. Pure.
 ///
 /// `manifest_dir` is this crate's directory (`desktop/src-tauri`), so the dev
-/// target sits two levels up — phase 1's primary path, since phase 1 is dev-only
-/// and the binary is a `cargo build` at the repo root.
+/// target sits two levels up — the binary a `cargo build` at the repo root leaves
+/// behind. That path is compiled in, so in a shipped bundle it names the CI build
+/// directory and never matches; resolution falls through to the install dirs.
 pub fn candidate_paths(
     env_override: Option<&str>,
     home: &Path,

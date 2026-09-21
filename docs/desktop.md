@@ -10,9 +10,11 @@ backend and a Svelte + TypeScript frontend — and it **supervises the same
 untouched. It owns the process the way a service manager would: it starts it,
 watches its output, restarts it when it crashes, and kills it on quit.
 
-**Phase 1 is dev-only.** No bundle is published, nothing is signed or notarized,
-and no CI workflow changes. You build and run it locally (`cargo tauri dev`, or a
-locally built bundle). The CLI release path is exactly what it was.
+**The shell ships unsigned.** Each release publishes a macOS `.dmg` and a Windows
+installer from `.github/workflows/desktop.yml` — **ad-hoc signed** on macOS, no
+certificate on Windows, no Apple Developer account. Nothing is notarized:
+notarization is an Apple service with no self-hosted form. The CLI release path is
+unchanged, and the bundle does not contain the CLI — see [Shipping](#shipping).
 
 ## What it does
 
@@ -25,9 +27,9 @@ locally built bundle). The CLI release path is exactly what it was.
 | Show the gateway's output | a log panel; stderr marked as diagnostics |
 | **Edit the config** | **no** — `turnpike setup` is the only writer |
 
-The last row is the phase boundary. Phase 1 is a window onto the config, not an
-editor for it: writing config means the comment-preserving `toml_edit` wizard and
-the secret-store commit ordering in
+The last row is the boundary this shell draws. It is a window onto the config, not
+an editor for it: writing config means the comment-preserving `toml_edit` wizard
+and the secret-store commit ordering in
 [setup-and-doctor.md](setup-and-doctor.md), and half of that from a GUI would be
 worse than none of it.
 
@@ -148,8 +150,10 @@ would catch it.
 probed directly, in this order:
 
 1. `$TURNPIKE_BIN`, an explicit path.
-2. The dev build — `<repo>/target/{debug,release}/turnpike`. Phase 1's primary
-   path, since phase 1 is dev-only.
+2. The dev build — `<repo>/target/{debug,release}/turnpike`. This is what makes
+   `cargo tauri dev` work against a repo checkout. In a shipped bundle it never
+   matches: `env!("CARGO_MANIFEST_DIR")` is baked in at compile time, so it names
+   the CI build directory, and resolution falls through to 3.
 3. Fixed install locations: `$HOME/.local/bin` (what `install.sh` uses),
    `/opt/homebrew/bin`, `/usr/local/bin`, `$HOME/.cargo/bin`.
 4. Each `$PATH` entry, last.
@@ -290,7 +294,7 @@ footgun.
 **A force-quit orphans the child.** There is no `PR_SET_PDEATHSIG` on macOS, so
 there is nothing to make the child die with the app. A normal Quit kills it (the
 `RunEvent::Exit` path, with the pid fallback); a SIGKILL of the app itself does
-not. The mitigation is *detection*, not prevention — and phase 1 does not
+not. The mitigation is *detection*, not prevention — and the shell does not
 implement it. The idea is doctor's `gateway-detected` check: at startup, probe the
 loopback listen address and surface "a gateway is already running" rather than
 failing to bind.
@@ -304,9 +308,13 @@ default enable mode is `LocalMachine`, enabling would need admin. The fix, if it
 bites, is to build `AutoLaunchBuilder` with `WindowsEnableMode::CurrentUser`
 instead of using the plugin's `init` convenience.
 
-## Building and running
+**The desktop workflow is unexercised end-to-end.** Its commands and output paths
+were verified by running them locally (a `CI=true` bundle produces
+`bundle/dmg/*.dmg`, which is what the copy step globs), but the workflow itself has
+not run on a runner, and the Windows job cannot be exercised on a macOS machine.
+The first release after it lands is the real check.
 
-Phase 1 is dev-only, so this is the whole distribution story:
+## Building and running
 
 ```bash
 cd desktop
@@ -318,7 +326,96 @@ npm run tauri dev      # dev window + tray, watching src/ and src-tauri/
 tauri-cli`. A **`turnpike` binary must exist** — the supervisor resolves it from
 the list above, and `TURNPIKE_BIN` overrides everything.
 
-`npm run check` runs `svelte-check`; `npm run build` builds the frontend alone.
+`npm run check` runs `svelte-check`; `npm run build` builds the frontend alone. To
+build a bundle by hand:
+
+```bash
+cd desktop
+npm run tauri build -- --bundles app,dmg
+```
+
+## Shipping
+
+`.github/workflows/desktop.yml` runs on the same `release: published` event as the
+CLI, as a **separate workflow**. A Tauri build is an npm install plus a full LTO
+Rust build of the whole Tauri stack, and `release.yml`'s `SHA256SUMS` job waits on
+`needs: [macos, windows]` — so folding these jobs in would either delay every CLI
+release's manifest by that build or leave the desktop assets out of it. Two
+pipelines, two manifests, and a broken Tauri build cannot cost the CLI its release.
+
+Two build jobs, because a macOS bundle can only be assembled on macOS: unlike the
+CLI, which cross-builds both platforms from `ubuntu-latest` with `cargo-zigbuild`
+and `cargo-xwin`, `hdiutil` makes the dmg and the bundler signs the `.app` with the
+host's `codesign`. Both runners are free on a public repo.
+
+| job | runner | artifact |
+| --- | --- | --- |
+| macOS aarch64 dmg | `macos-latest` | `turnpike_desktop-aarch64-apple-darwin.dmg` |
+| Windows x86_64 installer | `windows-latest` | `turnpike_desktop-x86_64-pc-windows-msvc-setup.exe` |
+
+A third job hashes whatever reached the release into `SHA256SUMS-desktop`, running
+on `if: always() && !cancelled()` so a platform that failed does not cost the other
+its checksum.
+
+The asset prefix is `turnpike_desktop-` with an **underscore** on purpose:
+`release.yml`'s own manifest globs `turnpike-*`, and `turnpike-desktop-*` would
+match it, letting the two manifests see each other's assets depending on which
+pipeline finished first. The underscore is load-bearing — `turnpike-*` requires a
+hyphen.
+
+**The bundle does not contain the CLI.** The shell supervises an externally
+installed `turnpike`, resolved at runtime from the list above — so installing the
+desktop app is not a substitute for `install.sh`.
+
+### Signing
+
+macOS is **ad-hoc signed** — `codesign -s -`, configured as
+`bundle.macOS.signingIdentity: "-"` in `tauri.conf.json` rather than through
+`APPLE_SIGNING_IDENTITY`, so a local `npm run tauri build` and CI sign identically
+and there is no env-vs-config precedence to reason about. Ad-hoc is a signature
+with **no** signing identity: it is not a self-signed certificate, and it makes the
+app signed, not trusted.
+
+Nothing is **notarized**. Notarization is an Apple service with no self-hosted form;
+it needs a paid Apple Developer Program membership and either
+`APPLE_ID`/`APPLE_PASSWORD`/`APPLE_TEAM_ID` or the App Store Connect API key trio.
+Absent those the bundler prints `Warn skipping app notarization` and continues —
+a warning, not an error.
+
+Windows has no certificate configured, so no signing step runs and the NSIS
+installer ships unsigned. NSIS over msi: one self-contained `.exe` and no WiX
+download.
+
+### The Gatekeeper wart
+
+A downloaded, unnotarized `.app` is quarantined by Gatekeeper and refuses to open
+on a double-click. The user must right-click → Open, or clear the attribute:
+
+```bash
+xattr -d com.apple.quarantine /Applications/turnpike.app
+```
+
+This is the one user-facing cost of shipping unsigned. turnpike's CLI installer
+sidesteps it entirely because `curl` does not set the quarantine flag — which is
+exactly why the CLI distribution feels frictionless today and a downloaded `.app`
+will not.
+
+On Windows, SmartScreen shows "Windows protected your PC" on first run: **More
+info** → **Run anyway**.
+
+### The dmg step depends on `CI`
+
+tauri-bundler detects CI from the `CI` env var and, when it is set, passes
+`--skip-jenkins` to `bundle_dmg.sh`. Without it the script runs `/usr/bin/osascript`
+to ask Finder to lay out the dmg window; without an Automation→Finder grant that
+fails `-1743 errAEEventNotPermitted`, and the script detaches the image and
+`exit 64`s after leaving a ~30 MB `rw.*.dmg` behind. A headless runner has no GUI
+to accept the prompt, so this path is not optional in CI. GitHub Actions sets
+`CI=true` on every step; the bundle step sets it explicitly anyway so the
+dependency is visible rather than silent.
+
+The cost of `--skip-jenkins` is a dmg with **no custom background and no icon
+positioning** — a plain window holding the `.app` and the `Applications` link.
 
 ## Testing
 
