@@ -472,6 +472,15 @@ impl Supervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // The app is a GUI binary (`windows_subsystem = "windows"` in main.rs) but
+        // `turnpike` is a console-subsystem exe, so Windows gives the child a console
+        // window of its own — and closing that window kills the gateway, which the
+        // supervisor then restarts, spawning another one. `CREATE_NO_WINDOW`
+        // suppresses it; stdout/stderr are pipes either way, so readiness parsing and
+        // the log stream are unaffected.
+        #[cfg(windows)]
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {

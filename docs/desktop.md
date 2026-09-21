@@ -116,6 +116,22 @@ Route lines arrive after the header, so the route count is published as it grows
 rather than guessed. A `search middleware:` line is indented like a route line
 but has no arrow, which is why the parser requires both.
 
+### The spawn
+
+stdin is `Stdio::null()`. `serve` never reads stdin — the only stdin readers in
+the tree are `setup::prompt` and the Claude Code launcher — so this costs nothing
+today, and it turns any prompt added later into an immediate EOF instead of a
+silent hang. stdout and stderr are pipes: stdout is parsed for readiness and the
+route table, stderr feeds the log panel and the crash-report ring buffer.
+
+On Windows the spawn also sets `CREATE_NO_WINDOW` (`windows-sys`). The app is a
+GUI binary — `main.rs` sets `windows_subsystem = "windows"` in release — but
+`turnpike` is a **console**-subsystem exe, so Windows would otherwise give the
+child a console window of its own. Closing that window kills the gateway, which
+the supervisor then restarts, spawning another console. The flag suppresses the
+window; the pipes are unaffected, so readiness parsing and the log stream are
+unchanged.
+
 ### Stop
 
 `serve` ends in a bare `axum::serve` with no signal handling, so there is no
