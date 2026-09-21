@@ -303,3 +303,7 @@ desktop/                      the desktop shell (Tauri v2 + Svelte, ad-hoc signe
 - Live catalog refresh from a server-owned recommendation contract.
 - The Claude Desktop *model menu* UI; the profile currently exposes the
   gateway and the client uses its default model flow.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Aslam Ahammed A.
