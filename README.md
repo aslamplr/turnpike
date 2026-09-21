@@ -108,6 +108,12 @@ turnpike launch claude-desktop
 turnpike launch claude-desktop --restore
 ```
 
+There is also a **desktop shell** (menu-bar item, a supervisor that runs the
+gateway for you, and a read-only settings window) in [desktop/](desktop/) — Tauri
+v2 + Svelte, **dev-only for now** (`cd desktop && npm run tauri dev`). It
+supervises the same `turnpike` binary; nothing about the CLI changes. See
+[docs/desktop.md](docs/desktop.md).
+
 ## Configuration
 
 `~/.config/turnpike/config.toml` (or `$TURNPIKE_CONFIG`, or `--config`):
@@ -280,9 +286,11 @@ src/setup/edit.rs             comment-preserving toml_edit mutations
 src/setup/mod.rs              the wizard: menu, staged Plan, commit()
 src/setup/prompt.rs           the only stdout prompt module (+ Prompter trait)
 src/doctor.rs                 the check list and its human/--json renderers
+src/view.rs                   the redacted config view (`turnpike config`)
 src/launch/claude_code.rs     env-var launcher + claude installer
 src/launch/claude_desktop.rs  configLibrary gateway profile writer (backup/restore)
-src/main.rs                   CLI: serve / launch / routes / setup / doctor
+src/main.rs                   CLI: serve / launch / routes / setup / config / doctor
+desktop/                      the desktop shell (Tauri v2 + Svelte, dev-only)
 ```
 
 `docs/` holds the design documentation (one page per module above).

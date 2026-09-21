@@ -1,0 +1,48 @@
+[package]
+name = "turnpike-desktop"
+version = "0.1.4"
+edition = "2021"
+description = "Desktop shell for the turnpike local LLM gateway: menu-bar item, process supervisor, start-at-login, read-only settings."
+license = "MIT"
+publish = false
+
+# An explicit, empty workspace table. This crate is its own workspace root, so it
+# can never be absorbed into the turnpike workspace if the root ever grows one.
+# The root deliberately has none: CI runs `cargo test --locked` on ubuntu-latest,
+# and a root workspace would make it try to build this crate and fail on missing
+# WebKitGTK. Phase 1 changes no CI.
+[workspace]
+
+[lib]
+name = "turnpike_desktop_lib"
+crate-type = ["lib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `tray-icon` is not in tauri v2's default feature set — the tray API is gated.
+# `image-png` lets the tray load its own template image from bytes.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "process",
+    "io-util",
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+] }
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

@@ -1,12 +1,15 @@
-# `setup` and `doctor`: configuring and auditing turnpike
+# `setup`, `config` and `doctor`: writing, reading and auditing turnpike
 
-Two commands, one shared concern. `turnpike setup` writes a config and its
-secrets; `turnpike doctor` reads them back and says what is wrong. They share
-the prompt module (`src/setup/prompt.rs`) and the discipline that goes with it —
-so they share a page.
+Three commands, one shared concern. `turnpike setup` writes a config and its
+secrets; `turnpike config` reads them back as a view; `turnpike doctor` reads
+them back and says what is wrong. `setup` and `doctor` share the prompt module
+(`src/setup/prompt.rs`) and the discipline that goes with it, so they share a
+page — and `config` belongs here because it is the same concern, read-only, and
+because it is what the desktop shell consumes.
 
 ```text
 turnpike setup  [--config <path>]
+turnpike config [--config <path>] [--json]
 turnpike doctor [--config <path>] [--json] [--live] [--no-live]
 ```
 
@@ -180,6 +183,113 @@ Next: `turnpike serve`, then `turnpike launch claude-code`.
 The handoff **prints** commands. A wizard that silently becomes a server is a
 wizard nobody trusts.
 
+## `turnpike config`
+
+The config, read back as a *view*: what is configured, without the credentials.
+It exists for the desktop shell ([desktop.md](desktop.md)), which needs to show
+providers, routes, targets, search and key **tiers** and has no way to call
+turnpike's config loader in-process — turnpike has no `[lib]` target. A
+subcommand that prints JSON is also the only way to get that data out of a
+gateway whose HTTP API is loopback-guarded and holds no config surface at all.
+
+```text
+$ turnpike config
+config:    /Users/aslam/.config/turnpike/config.toml
+listen:    127.0.0.1:8710
+providers: 2
+routes:    5
+search:    exa (max 5 loops)
+```
+
+The human form is deliberately a **summary, not a tree** — `turnpike routes`
+already renders the route listing, and duplicating it here would give the two a
+chance to disagree. `--json` is the real interface:
+
+```json
+{
+  "config_path": "/Users/aslam/.config/turnpike/config.toml",
+  "listen": "127.0.0.1:8710",
+  "providers": [
+    {
+      "id": "zen",
+      "spec": "anthropic",
+      "base_url": "https://opencode.ai/zen",
+      "api_key_env": "OPENCODE_API_KEY",
+      "key": { "tier": "env OPENCODE_API_KEY", "missing": false },
+      "extra_header_names": []
+    }
+  ],
+  "routes": [
+    {
+      "id": "claude-sonnet-5",
+      "strategy": "failover",
+      "context_tokens": 200000,
+      "targets": [
+        { "provider": "zen", "model": "claude-sonnet-4-5", "spec": "anthropic" },
+        { "provider": "zen-go", "model": "v4-flash", "spec": "openai" }
+      ]
+    }
+  ],
+  "search": {
+    "provider": "exa",
+    "max_loops": 5,
+    "base_url": null,
+    "key": { "tier": "env EXA_API_KEY", "missing": false }
+  }
+}
+```
+
+### The redaction contract
+
+**`src/view.rs` is the boundary, and the `KeyView` struct has no `value` field
+by construction.** The key resolution path returns a `Secret`; the view reads
+only its *source* (`KeySource`'s `Display`: `env OPENCODE_API_KEY`, `store`,
+`inline (plaintext)`), or, for an unresolvable key, `missing: true` with the
+resolution error as `note`. `Secret::expose()` is never called anywhere reachable
+from this module — and that is the property the test suite pins with a sentinel
+value, not a convention.
+
+Two consequences worth stating plainly:
+
+- **`config.rs` derives only `Deserialize`.** No config struct is `Serialize`,
+  because `ProviderCfg.api_key` and `SearchCfg.api_key` are plaintext fields with
+  no `serde(skip)`. Adding `Serialize` to those types to serve a UI would leak
+  every inline key on the first read. Hence a purpose-built view instead.
+- **`extra_headers` are reported by name only** (`extra_header_names`). The
+  values are omitted, not blanked: `zen-go`'s `x-opencode-session` carries a
+  session token, so the names come off the map directly and a value is never even
+  copied into this module.
+
+A `searxng`/`searx` search config reports `"tier": "not required"` — those
+providers are keyless, and reporting `missing` for a key nothing needs would be a
+false alarm.
+
+### It reuses the resolution, it does not re-derive it
+
+Three things the view deliberately does *not* compute for itself:
+
+- **`RouteCfg::targets()`** for a route's chain, so target 0 is synthesized from
+  the route's flat `provider`/`model` exactly as resolution sees it — the window
+  cannot show a chain the gateway would not walk.
+- **`effective_context_tokens(route)`** for the route-level window, so the
+  displayed number is the one the gateway enforces.
+- **`SearchManager::from_config(cfg)`** to decide whether search is on, so the
+  view cannot claim a search provider that the gateway would refuse to build
+  (an `exa` entry with no resolvable key, say) and silently drop server tools.
+
+`resolve_config(path, ConfigMode::Required)` is what loads it, so the view is
+**hydrated** — the key tiers it reports are the live precedence result, not the
+raw TOML.
+
+### It does not write a starter config
+
+`ConfigMode::Required` is the mode `serve` also uses, and `resolve_config` writes
+a starter config **before** its mode match — so `turnpike config` on a missing
+file writes one and then bails. That is fine for a human at a shell and wrong for
+a GUI that starts on login, which is why the desktop shell pre-checks
+`config.exists()` and never invokes turnpike until the file is there. See
+[desktop.md](desktop.md#missing-config).
+
 ## `turnpike doctor`
 
 One question: *what is wrong with this installation, and what is the fix?* It is
@@ -347,7 +457,7 @@ Each command picks a default filter, and `RUST_LOG` still overrides both:
 | Command | Default |
 | --- | --- |
 | `setup`, `doctor` | `warn` |
-| `serve`, `launch`, `routes` | `info` |
+| `serve`, `launch`, `routes`, `config` | `info` |
 
 ### The prompt discipline
 
@@ -382,3 +492,5 @@ that it produced the right file.
 - [configuration.md](configuration.md) — the config file itself.
 - [launchers.md](launchers.md) — `turnpike launch`, invoked at the end of the
   setup handoff.
+- [desktop.md](desktop.md) — the desktop shell, which consumes
+  `turnpike config --json`.
