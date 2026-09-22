@@ -1,6 +1,6 @@
 [package]
 name = "turnpike"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "A minimal local gateway that proxies Claude/Anthropic and OpenAI-spec clients to any OpenAI- or Anthropic-compatible LLM provider, with model remapping and one-command launch integrations for Claude Code and Claude Desktop."
 license = "MIT"
