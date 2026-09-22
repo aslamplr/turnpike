@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "untrusted comment: minisign public key: 23C67D90B74E1802\nRWQCGE63kH3GI9xOqIxyYMYUf6+csA50tfX55znSxlv+eJHOpXrUAly6",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIzQzY3RDkwQjc0RTE4MDIKUldRQ0dFNjNrSDNHSTl4T3FJeHlZTVlVZjYrY3NBNTB0Zlg1NXpuU3hsditlSkhPcFhyVUFseTYK",
       "endpoints": [
         "https://github.com/aslamplr/turnpike/releases/latest/download/latest.json"
       ]
