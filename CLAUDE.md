@@ -64,9 +64,12 @@ cargo test        # inline #[cfg(test)] modules per file
   only, `extra_headers` by name only. The redaction boundary; see the invariant below.
 - `desktop/` — the desktop shell (Tauri v2 + Svelte/TS), a separate crate **outside** the root
   workspace (`exclude = ["desktop"]`, empty `[workspace]` in `desktop/src-tauri/Cargo.toml`).
-  It supervises the same `turnpike` binary; the CLI is untouched. Ships **ad-hoc signed** — no
-  Apple account, no notarization — from `.github/workflows/desktop.yml`, a workflow separate from
-  `release.yml` so a slow Tauri build cannot cost the CLI its release. Design in `docs/desktop.md`.
+  It supervises the same `turnpike` binary **and bundles a copy of it** as a `bundle.resources`
+  payload (`src/cli_install.rs` installs it to `PATH`; `src/update.rs` is the auto-updater) —
+  so the crate cannot be built until that payload is staged (`npm run stage-cli`), because
+  `tauri-build` hard-errors on the missing resource. Ships **ad-hoc signed** — no Apple account,
+  no notarization — from `release.yml`'s desktop jobs, which build after the CLI jobs and consume
+  their binaries, so a slow Tauri build cannot cost the CLI its assets. Design in `docs/desktop.md`.
 
 ## Key design invariants
 
@@ -145,6 +148,26 @@ cargo test        # inline #[cfg(test)] modules per file
 - **`Fail` vs `Warn` in `doctor`**: `Fail` means the gateway cannot serve the config at all — the
   three `config::validate` rules and nothing more. Everything else is a lint → `Warn`. Do not widen
   `validate` to cover a lint; it breaks working configs.
+- **The desktop bundle carries the CLI, and that payload is a build input**
+  (`desktop/src-tauri/src/cli_install.rs`): `binaries/turnpike-cli` is declared as a
+  `bundle.resources` entry, and `tauri-build` validates it at build-script time on **every** target — so
+  a fresh clone cannot `cargo check`/`test`/`clippy` the desktop crate until it is staged
+  (`npm run stage-cli`; `release.yml` gets it from `download-artifact`). It is an install *source*,
+  never a run candidate: `resolve` keeps the order `$TURNPIKE_BIN` → dev target → install dirs →
+  `$PATH`, and the payload is copied out only on an explicit install. That is what closes the
+  desktop-only dead end — without it, a bundle on a machine with no CLI has no in-app way forward.
+- **One release pipeline, and the desktop half sits downstream of the CLI half**
+  (`.github/workflows/release.yml`): `cli-macos`/`cli-windows` → `cli-sums`, and each desktop job
+  `needs:` **its own platform's CLI job** (not `cli-sums`) to consume the binary it bundles. The CLI
+  jobs upload their artifacts before any Tauri build starts, so a slow or broken desktop job cannot
+  cost the CLI its assets. The workflow does **not** create the GitHub Release — the maintainer
+  publishes it, firing `release: published`, and every job attaches with `gh release upload
+  --clobber`. Desktop assets carry the `turnpike_desktop-` prefix so the `turnpike-*` checksum glob
+  cannot match them. `desktop-sums` also assembles `latest.json` — the manifest the updater polls —
+  from the `.sig` files `createUpdaterArtifacts` emits, gated on **both** platforms' signatures being
+  present: Tauri validates the whole manifest before it compares versions, so a one-platform manifest
+  would disable updates on both. One version spans the whole repo (four manifests), with a CI drift
+  check.
 
 ## Documentation
 

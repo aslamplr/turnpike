@@ -66,3 +66,37 @@ export interface LogLine {
   stream: "stdout" | "stderr";
   line: string;
 }
+
+/// Mirrors `desktop/src-tauri/src/cli_install.rs::CliStatus`.
+///
+/// `version` is null when `turnpike --version` gave no answer — an unreadable
+/// version is not evidence of a wrong one, so that stays `ready`.
+export type CliStatus =
+  | { state: "ready"; path: string; version: string | null }
+  | {
+      state: "versionMismatch";
+      path: string;
+      found: string;
+      expected: string;
+      payload: string | null;
+    }
+  | { state: "missing"; payload: string }
+  | { state: "unavailable"; reason: string };
+
+/// Mirrors `cli_install.rs::Installed`: the status after an install, plus any
+/// advice the user still needs (on unix, whether to add the install dir to PATH).
+export interface Installed {
+  status: CliStatus;
+  note: string | null;
+}
+
+/// Mirrors `desktop/src-tauri/src/update.rs::UpdateStatus`.
+///
+/// `notes` is the release body, which a release may not carry.
+export type UpdateStatus =
+  | { state: "checking" }
+  | { state: "current"; version: string }
+  | { state: "available"; version: string; current: string; notes: string | null }
+  | { state: "downloading"; version: string }
+  | { state: "installing"; version: string }
+  | { state: "failed"; reason: string };

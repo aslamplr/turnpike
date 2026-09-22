@@ -19,6 +19,20 @@ pub const BIN: &str = "turnpike.exe";
 #[cfg(not(windows))]
 pub const BIN: &str = "turnpike";
 
+/// The CLI payload's file name inside the app bundle.
+///
+/// `turnpike-cli`, not `turnpike`: on Windows the resource directory *is* the
+/// app's own install directory, where `turnpike.exe` — the app itself — lives.
+#[cfg(windows)]
+pub const PAYLOAD: &str = "turnpike-cli.exe";
+#[cfg(not(windows))]
+pub const PAYLOAD: &str = "turnpike-cli";
+
+/// The payload's subdirectory inside the resource directory. Must match the
+/// destination `bundle.resources` names in `tauri.macos.conf.json` /
+/// `tauri.windows.conf.json` — the two are one fact written twice.
+pub const PAYLOAD_SUBDIR: &str = "bin";
+
 /// Every place the binary might be, in the order it should be tried. Pure.
 ///
 /// `manifest_dir` is this crate's directory (`desktop/src-tauri`), so the dev
@@ -28,6 +42,7 @@ pub const BIN: &str = "turnpike";
 pub fn candidate_paths(
     env_override: Option<&str>,
     home: &Path,
+    local_app_data: Option<&Path>,
     manifest_dir: &Path,
     path_var: Option<&str>,
 ) -> Vec<PathBuf> {
@@ -48,8 +63,9 @@ pub fn candidate_paths(
     }
 
     // 3. Fixed install locations, probed directly and never via PATH.
-    //    `$HOME/.local/bin` is install.sh's default (${TURNPIKE_INSTALL_DIR}).
-    out.push(home.join(".local").join("bin").join(BIN));
+    //    `install_dir` is where install.sh and install.ps1 put the binary — and
+    //    where `cli_install` puts the bundled payload, so all three agree.
+    out.push(install_dir(local_app_data, home).join(BIN));
     out.push(PathBuf::from("/opt/homebrew/bin").join(BIN));
     out.push(PathBuf::from("/usr/local/bin").join(BIN));
     out.push(home.join(".cargo").join("bin").join(BIN));
@@ -64,6 +80,41 @@ pub fn candidate_paths(
     }
 
     out
+}
+
+/// The directory the binary belongs in — `install.sh`'s default
+/// (`${TURNPIKE_INSTALL_DIR}`) on unix, `install.ps1`'s target on Windows.
+///
+/// One definition, read by resolution, by `cli_install`, and by the first-run
+/// prompt, so an in-app install and a shell install cannot land in two places
+/// and leave two CLIs competing on PATH.
+pub fn install_dir(local_app_data: Option<&Path>, home: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        // `%LOCALAPPDATA%` is always set on Windows; `%USERPROFILE%\AppData\Local`
+        // is its documented default if it somehow is not.
+        let base = local_app_data
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join("AppData").join("Local"));
+        base.join("turnpike").join("bin")
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = local_app_data;
+        home.join(".local").join("bin")
+    }
+}
+
+/// The payload this bundle ships, if it ships one — an install *source*,
+/// deliberately **not** a run candidate.
+///
+/// Keeping it out of `candidate_paths` is the point: the run order stays
+/// `$TURNPIKE_BIN` → dev target → install dirs → `$PATH`, so a bundled payload
+/// never shadows a CLI the user installed and keeps up to date themselves. The
+/// bundle is a fallback to install from, not a copy to run.
+pub fn bundled_payload(resource_dir: Option<&Path>) -> Option<PathBuf> {
+    let path = resource_dir?.join(PAYLOAD_SUBDIR).join(PAYLOAD);
+    path.is_file().then_some(path)
 }
 
 /// The first candidate that is a real, executable file.
@@ -100,15 +151,27 @@ fn home_dir() -> PathBuf {
 /// install turnpike while the app is running.
 pub fn resolve_binary() -> Option<PathBuf> {
     let home = home_dir();
+    let local = local_app_data_dir();
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path_var = std::env::var("PATH").ok();
     let override_ = std::env::var("TURNPIKE_BIN").ok();
     resolve(&candidate_paths(
         override_.as_deref(),
         &home,
+        local.as_deref(),
         &manifest,
         path_var.as_deref(),
     ))
+}
+
+/// The path `cli_install` writes the payload to, from the live environment.
+pub fn install_target() -> PathBuf {
+    let local = local_app_data_dir();
+    install_dir(local.as_deref(), &home_dir()).join(BIN)
+}
+
+fn local_app_data_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
 }
 
 /// The config path the CLI would resolve, minus its `--config` flag (the app has
@@ -145,10 +208,10 @@ mod tests {
 
     #[test]
     fn dev_target_comes_before_install_locations() {
-        let c = candidate_paths(None, &home(), &manifest(), None);
+        let c = candidate_paths(None, &home(), None, &manifest(), None);
         let dev = PathBuf::from("/repo/target/debug/turnpike");
         let release = PathBuf::from("/repo/target/release/turnpike");
-        let local = PathBuf::from("/Users/example/.local/bin/turnpike");
+        let local = install_dir(None, &home()).join(BIN);
 
         let at = |p: &PathBuf| {
             c.iter()
@@ -164,6 +227,7 @@ mod tests {
         let c = candidate_paths(
             Some("/custom/turnpike"),
             &home(),
+            None,
             &manifest(),
             Some("/usr/bin:/bin"),
         );
@@ -176,7 +240,7 @@ mod tests {
         // resolution would try to exec "" and fail with a worse message than
         // "not found anywhere".
         for blank in ["", "   "] {
-            let c = candidate_paths(Some(blank), &home(), &manifest(), None);
+            let c = candidate_paths(Some(blank), &home(), None, &manifest(), None);
             assert!(
                 !c.iter().any(|p| p.as_os_str().is_empty()),
                 "blank override produced a candidate: {c:?}"
@@ -186,20 +250,55 @@ mod tests {
     }
 
     #[test]
+    fn install_dir_matches_the_shell_installers() {
+        // install.sh's default is ${TURNPIKE_INSTALL_DIR:-$HOME/.local/bin};
+        // install.ps1's is %LOCALAPPDATA%\turnpike\bin. `cli_install` writes to
+        // this same path, so an in-app install and a shell install cannot land in
+        // two places and leave two CLIs competing on PATH.
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                install_dir(None, &home()),
+                PathBuf::from("/Users/example/.local/bin")
+            );
+            // On unix %LOCALAPPDATA% is meaningless and must not shift anything.
+            assert_eq!(
+                install_dir(Some(Path::new("/ignored")), &home()),
+                PathBuf::from("/Users/example/.local/bin")
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                install_dir(Some(Path::new("/AppData/Local")), &home()),
+                PathBuf::from("/AppData/Local/turnpike/bin")
+            );
+            // Absent %LOCALAPPDATA%, the documented default applies.
+            assert_eq!(
+                install_dir(None, &home()),
+                PathBuf::from("/Users/example/AppData/Local/turnpike/bin")
+            );
+        }
+    }
+
+    #[test]
     fn install_locations_are_expanded_and_ordered() {
-        let c = candidate_paths(None, &home(), &manifest(), None);
+        let c = candidate_paths(None, &home(), None, &manifest(), None);
+        // The first is this platform's own install dir; the rest are the same on
+        // both. Built from `BIN` rather than spelled out, so the Windows
+        // `turnpike.exe` extension is not a second place to keep in sync.
         let expected = [
-            "/Users/example/.local/bin/turnpike",
-            "/opt/homebrew/bin/turnpike",
-            "/usr/local/bin/turnpike",
-            "/Users/example/.cargo/bin/turnpike",
+            install_dir(None, &home()).join(BIN),
+            PathBuf::from("/opt/homebrew/bin").join(BIN),
+            PathBuf::from("/usr/local/bin").join(BIN),
+            home().join(".cargo").join("bin").join(BIN),
         ];
         let positions: Vec<usize> = expected
             .iter()
             .map(|p| {
                 c.iter()
-                    .position(|x| x == &PathBuf::from(p))
-                    .unwrap_or_else(|| panic!("{p} missing from {c:?}"))
+                    .position(|x| x == p)
+                    .unwrap_or_else(|| panic!("{p:?} missing from {c:?}"))
             })
             .collect();
         assert!(
@@ -210,20 +309,45 @@ mod tests {
 
     #[test]
     fn path_entries_are_last_and_split() {
-        let c = candidate_paths(None, &home(), &manifest(), Some("/usr/bin:/bin"));
+        let c = candidate_paths(None, &home(), None, &manifest(), Some("/usr/bin:/bin"));
         let n = c.len();
         assert_eq!(c[n - 2], PathBuf::from("/usr/bin/turnpike"));
         assert_eq!(c[n - 1], PathBuf::from("/bin/turnpike"));
 
         // An empty PATH segment (a trailing colon) must not yield a bare name.
-        let c = candidate_paths(None, &home(), &manifest(), Some("/usr/bin:"));
+        let c = candidate_paths(None, &home(), None, &manifest(), Some("/usr/bin:"));
         assert!(!c.iter().any(|p| p == &PathBuf::from("turnpike")), "{c:?}");
     }
 
     #[test]
     fn no_path_var_means_no_path_entries() {
-        let c = candidate_paths(None, &home(), &manifest(), None);
+        let c = candidate_paths(None, &home(), None, &manifest(), None);
+        // Two dev-target profiles plus four fixed install locations. The count is
+        // the same on both platforms — the Windows install dir *replaces*
+        // `~/.local/bin` in that block rather than being added to it, since
+        // nothing on Windows installs there.
         assert_eq!(c.len(), 6, "{c:?}");
+        assert_eq!(c[2], install_dir(None, &home()).join(BIN), "{c:?}");
+    }
+
+    #[test]
+    fn bundled_payload_is_the_resource_dir_payload_or_nothing() {
+        // No resource dir at all — a dev build with no bundle — is no payload.
+        assert_eq!(bundled_payload(None), None);
+
+        let dir = std::env::temp_dir().join(format!("tp-payload-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join(PAYLOAD_SUBDIR)).unwrap();
+
+        // A resource dir that exists but carries no payload is still nothing: a
+        // stale bundle must not be offered as something to install.
+        assert_eq!(bundled_payload(Some(&dir)), None);
+
+        let payload = dir.join(PAYLOAD_SUBDIR).join(PAYLOAD);
+        std::fs::write(&payload, b"payload").unwrap();
+        assert_eq!(bundled_payload(Some(&dir)), Some(payload));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

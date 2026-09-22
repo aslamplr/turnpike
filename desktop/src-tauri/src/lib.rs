@@ -7,10 +7,12 @@
 //! 403s a webview request (`Origin: tauri://localhost`), so every gateway
 //! interaction is Rust-side. See `docs/desktop.md`.
 
+mod cli_install;
 mod resolve;
 mod settings;
 mod supervisor;
 mod tray;
+mod update;
 
 use std::time::Duration;
 
@@ -105,6 +107,45 @@ fn autostart_set(app: AppHandle, enabled: bool) -> bool {
     apply_autostart(&app, enabled)
 }
 
+/// The directory Tauri unpacked this bundle's resources into — where the bundled
+/// CLI payload lives. `None` in a dev build, which has no bundle.
+fn resource_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().resource_dir().ok()
+}
+
+/// Whether a usable `turnpike` is on this machine, and what to offer if not.
+#[tauri::command]
+fn cli_status(app: AppHandle) -> cli_install::CliStatus {
+    cli_install::status(resource_dir(&app).as_deref())
+}
+
+/// Install the bundled CLI where `install.sh` / `install.ps1` put it.
+#[tauri::command]
+fn cli_install(app: AppHandle) -> Result<cli_install::Installed, String> {
+    cli_install::install(resource_dir(&app).as_deref())
+}
+
+/// The last thing the updater settled on, so a window that attached after the
+/// launch check finished still paints the right banner. `None` until then.
+#[tauri::command]
+fn update_status(state: tauri::State<'_, update::UpdateState>) -> Option<update::UpdateStatus> {
+    state.last()
+}
+
+/// Look for a newer release. Answers through `update://status` — including when
+/// there is nothing to report, because the user pressed a button.
+#[tauri::command]
+fn update_check(app: AppHandle) {
+    update::check(&app, update::Trigger::Explicit);
+}
+
+/// Fetch, verify and install the update a check found. On success the app is
+/// already restarting, so there is no return the caller can observe.
+#[tauri::command]
+async fn update_install(app: AppHandle) -> Result<(), String> {
+    update::install(&app).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
@@ -116,6 +157,8 @@ pub fn run() {
             // shown on launch today, including at login.
             Some(vec!["--minimized"]),
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(update::UpdateState::default())
         .invoke_handler(tauri::generate_handler![
             gateway_status,
             gateway_start,
@@ -125,6 +168,11 @@ pub fn run() {
             settings_config_path,
             autostart_enabled,
             autostart_set,
+            cli_status,
+            cli_install,
+            update_status,
+            update_check,
+            update_install,
         ])
         .setup(|app| {
             // A tray-first app must not also claim a Dock icon and an app menu.
@@ -139,6 +187,15 @@ pub fn run() {
             // login. `start` pre-checks the config, so a fresh machine gets a
             // message naming the path instead of a silently written starter file.
             app.state::<SupervisorHandle>().start();
+
+            // Only in a release build. A dev build has no bundle to replace, and
+            // checking on every `tauri dev` launch would offer a release over the
+            // working tree. `cfg!` rather than `#[cfg]` so the variant stays
+            // constructed in debug and does not read as dead code.
+            if !cfg!(debug_assertions) {
+                update::check(app.handle(), update::Trigger::Startup);
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {

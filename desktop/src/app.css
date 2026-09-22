@@ -207,6 +207,19 @@ label.check {
   padding: 12px 14px;
 }
 
+/* A row of buttons under a panel's message. */
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* A note may carry a shell command on its own line, so keep its newlines. */
+.note {
+  white-space: pre-wrap;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

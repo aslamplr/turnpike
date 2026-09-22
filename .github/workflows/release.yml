@@ -4,12 +4,31 @@ name: release
 # its version tag) fires this. A PR merge or a plain branch push produces no
 # binaries; a bare `git tag` push does not trigger it either.
 #
-# The two platforms are separate jobs on purpose. They run in parallel and each
-# uploads its own asset as soon as it is built, so one platform failing no
-# longer costs the other its release — on the v0.1.0 run the single-job version
-# died in `Cross-build Windows x64` and the already-built, already-packaged
-# macOS tarball was discarded with it. SHA256SUMS runs afterwards regardless
+# One workflow, two layers. The CLI jobs cross-build both platforms from
+# ubuntu-latest (cargo-zigbuild, cargo-xwin). The desktop jobs build natively on
+# macos-latest and windows-latest — a macOS bundle can only be assembled on
+# macOS, where `hdiutil` makes the dmg and the host's `codesign` signs the .app.
+# Each desktop job needs the *matching platform's* CLI job and downloads that
+# job's binary as an artifact, so the app ships the CLI it supervises and the
+# two cannot drift.
+#
+# Within the CLI layer the two platforms are separate jobs on purpose. They run
+# in parallel and each uploads its own asset as soon as it is built, so one
+# platform failing no longer costs the other its release — on the v0.1.0 run the
+# single-job version died in `Cross-build Windows x64` and the already-built,
+# already-packaged macOS tarball was discarded with it. The desktop layer sits
+# behind the CLI one for the same reason a step further out: every CLI job
+# uploads its binary before any desktop job starts, so a broken Tauri build
+# costs the CLI nothing. Both manifests run afterwards regardless
 # (`if: always()`), derived from whatever actually got attached.
+#
+# The desktop layer also produces the auto-updater's inputs. `createUpdaterArtifacts`
+# makes each bundle step emit a minisign `.sig` next to the artifact it signed —
+# `turnpike.app.tar.gz` on macOS, the NSIS `-setup.exe` on Windows — and
+# `desktop-sums` assembles those into `latest.json`, the manifest an installed app
+# polls. So the update manifest is derived from the assets the release actually
+# carries, never hand-written, and it is signed by the same key the app verifies
+# against (`plugins.updater.pubkey` in tauri.conf.json).
 on:
   release:
     types: [published]
@@ -26,8 +45,8 @@ permissions:
   contents: write
 
 jobs:
-  macos:
-    name: macOS aarch64
+  cli-macos:
+    name: CLI macOS aarch64
     runs-on: ubuntu-latest
     env:
       # A release event carries the tag; a manual dispatch is given one.
@@ -78,16 +97,36 @@ jobs:
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/turnpike dist/turnpike
           tar -czf dist/turnpike-aarch64-apple-darwin.tar.gz -C dist turnpike
-      # `gh release upload` rather than action-gh-release: two jobs publish to
-      # one release concurrently, and this only ever touches this job's own
+      # `gh release upload` rather than action-gh-release: the CLI jobs publish
+      # to one release concurrently, and this only ever touches this job's own
       # asset (no release metadata read-modify-write to race on).
       - name: Publish to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$TAG" dist/turnpike-aarch64-apple-darwin.tar.gz --clobber --repo "$GITHUB_REPOSITORY"
 
-  windows:
-    name: Windows x86_64
+      # Hand the binary to the desktop job as an artifact, under the name the
+      # bundle ships it as. Named `turnpike-cli` rather than `turnpike` because
+      # on Windows the resource directory is the app's own install directory,
+      # where `turnpike.exe` — the app itself — already lives.
+      #
+      # `upload-artifact` does not preserve the exec bit (everything downloads
+      # 0644). That is fine here precisely because this is an install *source*,
+      # not a binary run in place: the app copies it out with an explicit 0755.
+      - name: Stage the CLI binary for the desktop bundle
+        run: |
+          mkdir -p cli-bundle
+          cp target/aarch64-apple-darwin/release/turnpike cli-bundle/turnpike-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnpike-cli-aarch64-apple-darwin
+          path: cli-bundle/turnpike-cli
+          # A pass-through between two jobs in this run, not a deliverable: the
+          # release assets are the tarball and the dmg. Don't warehouse it.
+          retention-days: 1
+
+  cli-windows:
+    name: CLI Windows x86_64
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
@@ -123,9 +162,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$TAG" dist/turnpike-x86_64-pc-windows-msvc.zip --clobber --repo "$GITHUB_REPOSITORY"
 
-  sums:
+      # The same pass-through as the macOS job's, with the Windows extension.
+      - name: Stage the CLI binary for the desktop bundle
+        run: |
+          mkdir -p cli-bundle
+          cp target/x86_64-pc-windows-msvc/release/turnpike.exe cli-bundle/turnpike-cli.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnpike-cli-x86_64-pc-windows-msvc
+          path: cli-bundle/turnpike-cli.exe
+          retention-days: 1
+
+  cli-sums:
     name: SHA256SUMS
-    needs: [macos, windows]
+    needs: [cli-macos, cli-windows]
     # Publish the manifest even when a platform failed: whatever did reach the
     # release still has to be installable, since both installers verify against
     # this file. A cancelled run publishes nothing.
@@ -153,3 +203,293 @@ jobs:
             previous.txt fresh.txt | sort -k2 > SHA256SUMS
           cat SHA256SUMS
           gh release upload "$TAG" SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+
+  desktop-macos:
+    name: Desktop macOS aarch64 dmg
+    # The matching platform's CLI job, not `cli-sums`: the bundle needs the
+    # binary, and waiting on the manifest job would serialize the desktop build
+    # behind the other platform's cross-build for no reason.
+    needs: [cli-macos]
+    runs-on: macos-latest
+    # A cold LTO build of the Tauri stack is slow; a hung one should not sit on a
+    # macOS runner for hours.
+    timeout-minutes: 60
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      # The CLI binary this app ships, straight from the job that built it.
+      # `binaries/` is gitignored — it is a build input, not source.
+      - uses: actions/download-artifact@v4
+        with:
+          name: turnpike-cli-aarch64-apple-darwin
+          path: desktop/src-tauri/binaries
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      # The Tauri stack is a large dependency tree and the release profile is
+      # `lto = true, codegen-units = 1`, so without a cache a cold build dominates
+      # the job.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      # `@tauri-apps/cli` is a devDependency, so this is the whole toolchain
+      # install — there is no global `cargo install tauri-cli`.
+      - name: Install the frontend toolchain
+        run: npm ci
+        working-directory: desktop
+
+      # Ad-hoc signing is configured in tauri.conf.json
+      # (bundle.macOS.signingIdentity = "-"), deliberately not through
+      # APPLE_SIGNING_IDENTITY, so a local `npm run tauri build` and CI sign
+      # identically and there is no env-vs-config precedence to reason about.
+      # Nothing here notarizes: that needs a paid Apple Developer account.
+      #
+      # CI is set explicitly. tauri-bundler reads it to decide whether to pass
+      # --skip-jenkins to bundle_dmg.sh, which skips the Finder AppleScript — and
+      # that AppleScript is what fails on a headless runner (no Automation→Finder
+      # grant → -1743 → exit 64, leaving a 30 MB rw.*.dmg behind). GitHub already
+      # sets CI=true on every step; this makes the dependency visible rather than
+      # silent. Note the cost: --skip-jenkins means no custom dmg background or
+      # icon positioning.
+      #
+      # TAURI_SIGNING_PRIVATE_KEY is the *updater's* minisign key, a different
+      # thing from the code signature above: it signs the `.app.tar.gz` an
+      # installed app downloads, and that app verifies the download against the
+      # pubkey in tauri.conf.json. It cannot live in the repo, so it is a
+      # repository secret. Without it `createUpdaterArtifacts` emits no `.sig` and
+      # the update manifest step below is skipped. Losing it means existing
+      # installs can never be updated again — see docs/desktop.md.
+      - name: Bundle the app and dmg
+        env:
+          CI: "true"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --target aarch64-apple-darwin --bundles app,dmg
+        working-directory: desktop
+
+      - name: Publish to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: desktop
+        run: |
+          set -euo pipefail
+          bundle=src-tauri/target/aarch64-apple-darwin/release/bundle
+          shopt -s nullglob
+          dmgs=("$bundle"/dmg/*.dmg)
+          if [ ${#dmgs[@]} -ne 1 ]; then
+            echo "expected one .dmg under $bundle/dmg, found ${#dmgs[@]}"
+            exit 1
+          fi
+          # A stable name with no version in it, so
+          # releases/latest/download/<name> keeps working across releases.
+          cp "${dmgs[0]}" turnpike_desktop-aarch64-apple-darwin.dmg
+          gh release upload "$TAG" turnpike_desktop-aarch64-apple-darwin.dmg \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
+          # The updater's artifact, and not the dmg: an installed app swaps in the
+          # .app it unpacks from this tarball, so the dmg is for a human's first
+          # install and this is for every update after it. createUpdaterArtifacts
+          # puts the minisign `.sig` beside it, signed by
+          # TAURI_SIGNING_PRIVATE_KEY; `desktop-sums` reads that file's *content*
+          # into latest.json.
+          #
+          # Absent `.sig` is a warning, not a failure: it means the secret is not
+          # configured, and the release is still perfectly installable by hand.
+          # What it costs is the manifest, and the manifest step says so.
+          tarballs=("$bundle"/macos/*.app.tar.gz)
+          if [ ${#tarballs[@]} -ne 1 ]; then
+            echo "expected one .app.tar.gz under $bundle/macos, found ${#tarballs[@]}"
+            exit 1
+          fi
+          cp "${tarballs[0]}" turnpike_desktop-aarch64-apple-darwin.app.tar.gz
+          gh release upload "$TAG" turnpike_desktop-aarch64-apple-darwin.app.tar.gz \
+            --clobber --repo "$GITHUB_REPOSITORY"
+          if [ -f "${tarballs[0]}.sig" ]; then
+            cp "${tarballs[0]}.sig" turnpike_desktop-aarch64-apple-darwin.app.tar.gz.sig
+            gh release upload "$TAG" turnpike_desktop-aarch64-apple-darwin.app.tar.gz.sig \
+              --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            echo "::warning::no .sig beside ${tarballs[0]} — is TAURI_SIGNING_PRIVATE_KEY set? skipping the updater signature"
+          fi
+
+  desktop-windows:
+    name: Desktop Windows x86_64 installer
+    needs: [cli-windows]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: turnpike-cli-x86_64-pc-windows-msvc
+          path: desktop/src-tauri/binaries
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install the frontend toolchain
+        run: npm ci
+        working-directory: desktop
+
+      # No certificate is configured, so Tauri invokes no *code* signing step and
+      # the installer ships unsigned; SmartScreen warns on first run. NSIS over
+      # msi: one self-contained .exe and no WiX download.
+      #
+      # TAURI_SIGNING_PRIVATE_KEY is a different signature entirely — the
+      # updater's minisign key, over the same .exe an installed app downloads, so
+      # that app can verify it against the pubkey in tauri.conf.json. Unsigned by
+      # Authenticode and signed by minisign is a coherent pair, not a
+      # contradiction.
+      - name: Bundle the NSIS installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
+        working-directory: desktop
+
+      - name: Publish to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: desktop
+        run: |
+          set -euo pipefail
+          bundle=src-tauri/target/x86_64-pc-windows-msvc/release/bundle
+          shopt -s nullglob
+          setups=("$bundle"/nsis/*-setup.exe)
+          if [ ${#setups[@]} -ne 1 ]; then
+            echo "expected one *-setup.exe under $bundle/nsis, found ${#setups[@]}"
+            exit 1
+          fi
+          cp "${setups[0]}" turnpike_desktop-x86_64-pc-windows-msvc-setup.exe
+          gh release upload "$TAG" turnpike_desktop-x86_64-pc-windows-msvc-setup.exe \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
+          # Windows reuses the NSIS installer as the updater artifact — the
+          # updater hands it to the installer and exits — so the `.sig` sits
+          # beside the very file just uploaded. Same warning-not-failure as the
+          # macOS job's: no secret, no signature, and `desktop-sums` says so.
+          if [ -f "${setups[0]}.sig" ]; then
+            cp "${setups[0]}.sig" turnpike_desktop-x86_64-pc-windows-msvc-setup.exe.sig
+            gh release upload "$TAG" turnpike_desktop-x86_64-pc-windows-msvc-setup.exe.sig \
+              --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            echo "::warning::no .sig beside ${setups[0]} — is TAURI_SIGNING_PRIVATE_KEY set? skipping the updater signature"
+          fi
+
+  desktop-sums:
+    name: SHA256SUMS-desktop
+    needs: [desktop-macos, desktop-windows]
+    # Publish the manifest even when a platform failed: whatever did reach the
+    # release still needs a checksum. A cancelled run publishes nothing.
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+    steps:
+      - name: Derive the manifest from the release and publish it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist && cd dist
+          # Hash the assets actually attached to the release, never the local
+          # build tree, so the manifest cannot name a file that isn't there.
+          #
+          # The desktop prefix is `turnpike_desktop-` with an underscore on
+          # purpose: the CLI manifest above globs `turnpike-*`, and
+          # `turnpike-desktop-*` would match it, letting the two manifests see
+          # each other's assets depending on which finished first. The
+          # underscore is load-bearing — `turnpike-*` requires a hyphen.
+          gh release download "$TAG" --pattern 'turnpike_desktop-*' --clobber --repo "$GITHUB_REPOSITORY" || true
+          sha256sum turnpike_desktop-* > fresh.txt
+          # A manifest from an earlier partial upload may already exist: keep its
+          # lines for assets this run did not rebuild, letting the freshly
+          # computed line win for any asset in both.
+          gh release download "$TAG" --pattern SHA256SUMS-desktop -O previous.txt --clobber --repo "$GITHUB_REPOSITORY" || true
+          [ -f previous.txt ] || : > previous.txt
+          awk '{ lines[$2] = $0 } END { for (a in lines) print lines[a] }' \
+            previous.txt fresh.txt | sort -k2 > SHA256SUMS-desktop
+          cat SHA256SUMS-desktop
+          gh release upload "$TAG" SHA256SUMS-desktop --clobber --repo "$GITHUB_REPOSITORY"
+
+      # The auto-updater's manifest. `plugins.updater.endpoints` points at
+      # releases/latest/download/latest.json, so whatever is attached to the
+      # newest non-prerelease release is what every installed app polls.
+      #
+      # Gated on *both* `.sig` files, and not on either one: Tauri deserializes
+      # and validates the whole manifest before it compares versions, so a
+      # manifest that names one platform fails the parse on the other and
+      # disables updates everywhere — worse than publishing nothing, which just
+      # leaves the previous release's manifest in place.
+      #
+      # The URLs are tag-pinned rather than `releases/latest/download/`, because
+      # `latest` is a moving target: an app that checked while this release was
+      # current must still be able to fetch *this* release's bundle after a newer
+      # one is published.
+      - name: Assemble and publish latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist && cd dist
+          gh release download "$TAG" --pattern 'turnpike_desktop-*.sig' --clobber --repo "$GITHUB_REPOSITORY" || true
+
+          darwin=turnpike_desktop-aarch64-apple-darwin.app.tar.gz.sig
+          windows=turnpike_desktop-x86_64-pc-windows-msvc-setup.exe.sig
+          missing=()
+          [ -f "$darwin" ] || missing+=("$darwin")
+          [ -f "$windows" ] || missing+=("$windows")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::warning::skipping latest.json — no signature for: ${missing[*]}. Set TAURI_SIGNING_PRIVATE_KEY and re-dispatch this tag to publish an update manifest."
+            exit 0
+          fi
+
+          # The tag is the version, minus its `v`: tags in this repo are
+          # `v0.1.5`, and the updater compares its own Cargo.toml version against
+          # a bare semver.
+          version="${TAG#v}"
+          # RFC 3339, which is what the updater parses.
+          pub_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+
+          # `--rawfile` (not `--arg`) so the signature's newlines survive as real
+          # JSON escapes: the `.sig` is minisign's multi-line format, and the
+          # updater verifies the whole file, comment lines included.
+          jq -n \
+            --arg version "$version" \
+            --arg pub_date "$pub_date" \
+            --rawfile darwin_sig "$darwin" \
+            --rawfile windows_sig "$windows" \
+            --arg darwin_url "$base/turnpike_desktop-aarch64-apple-darwin.app.tar.gz" \
+            --arg windows_url "$base/turnpike_desktop-x86_64-pc-windows-msvc-setup.exe" \
+            '{
+              version: $version,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-aarch64": { signature: $darwin_sig, url: $darwin_url },
+                "windows-x86_64": { signature: $windows_sig, url: $windows_url }
+              }
+            }' > latest.json
+          cat latest.json
+          gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"

@@ -39,6 +39,8 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
         .checked(autostart_is_enabled(app))
         .build(app)?;
     let settings = MenuItemBuilder::with_id("settings", "Settings…").build(app)?;
+    let check_updates =
+        MenuItemBuilder::with_id("check-updates", "Check for Updates…").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit turnpike").build(app)?;
 
     let menu = Menu::with_items(
@@ -53,6 +55,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             &autostart,
             &PredefinedMenuItem::separator(app)?,
             &settings,
+            &check_updates,
             &quit,
         ],
     )?;
@@ -95,6 +98,18 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
 }
 
 fn on_menu(app: &AppHandle, id: &str) {
+    // Handled before the supervisor lookup: none of these touch the gateway, so
+    // they must keep working on a machine where it never came up.
+    match id {
+        "settings" => return show_settings(app),
+        "check-updates" => return check_updates(app),
+        "autostart" => return toggle_autostart(app),
+        // The tray is the app's only chrome, so Quit is the only way out: closing
+        // the window just hides it.
+        "quit" => return app.exit(0),
+        _ => {}
+    }
+
     let Some(sup) = app.try_state::<SupervisorHandle>() else {
         return;
     };
@@ -102,13 +117,17 @@ fn on_menu(app: &AppHandle, id: &str) {
         "start" => sup.start(),
         "stop" => sup.stop(),
         "restart" => sup.restart(),
-        "settings" => show_settings(app),
-        "autostart" => toggle_autostart(app),
-        // The tray is the app's only chrome, so Quit is the only way out: closing
-        // the window just hides it.
-        "quit" => app.exit(0),
         _ => {}
     }
+}
+
+/// Show the window, then check.
+///
+/// The window comes first because the answer arrives as a banner *in* it — with
+/// the window hidden, a click that found nothing would look like a dead menu item.
+fn check_updates(app: &AppHandle) {
+    show_settings(app);
+    crate::update::check(app, crate::update::Trigger::Explicit);
 }
 
 fn show_settings(app: &AppHandle) {

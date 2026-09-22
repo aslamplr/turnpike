@@ -14,8 +14,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # NOTE: no `cargo fmt --check` gate — the codebase is not rustfmt-clean
-      # today, so a fmt gate would fail on the first push. Run `cargo fmt`
-      # repo-wide in its own change if that's wanted.
+        with:
+          components: rustfmt, clippy
+
+      # One version for the whole repo: the CLI and the desktop shell ship from
+      # one tag, so they must carry one version number. `tauri.conf.json` has no
+      # top-level `version` on purpose — Tauri derives it from
+      # desktop/src-tauri/Cargo.toml, and a second copy there is exactly the
+      # drift this step exists to catch.
+      - name: Check the version is single-sourced
+        run: |
+          set -euo pipefail
+          version_of_cargo() {
+            sed -n 's/^version = "\(.*\)"/\1/p' "$1" | head -1
+          }
+          root=$(version_of_cargo Cargo.toml)
+          tauri=$(version_of_cargo desktop/src-tauri/Cargo.toml)
+          npm=$(sed -n 's/.*"version": "\(.*\)".*/\1/p' desktop/package.json | head -1)
+          echo "Cargo.toml=$root"
+          echo "desktop/src-tauri/Cargo.toml=$tauri"
+          echo "desktop/package.json=$npm"
+          if [ -z "$root" ] || [ "$root" != "$tauri" ] || [ "$root" != "$npm" ]; then
+            echo "::error::version drift — Cargo.toml=$root, desktop/src-tauri/Cargo.toml=$tauri, desktop/package.json=$npm"
+            exit 1
+          fi
+          if grep -qE '^[[:space:]]*"version"[[:space:]]*:' desktop/src-tauri/tauri.conf.json; then
+            echo "::error::desktop/src-tauri/tauri.conf.json pins a version — Tauri derives it from desktop/src-tauri/Cargo.toml, so delete it"
+            exit 1
+          fi
+
       - run: cargo test --locked
       - run: cargo build --locked
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # The desktop crate is its own workspace (see its Cargo.toml), so the root
+      # `cargo fmt` above never sees it. rustfmt does not compile, so this is
+      # cheap. Lint, test and compile coverage for that crate is deliberately not
+      # here: it needs WebKitGTK, and `tauri-build` hard-errors unless the bundle
+      # resource `binaries/turnpike-cli` is staged first (see its Cargo.toml).
+      # release.yml's macOS and Windows jobs build it natively, which is a compile
+      # check on release but not a `cargo clippy`.
+      - run: cargo fmt --check --manifest-path desktop/src-tauri/Cargo.toml

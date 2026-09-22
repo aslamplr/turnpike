@@ -11,10 +11,13 @@ untouched. It owns the process the way a service manager would: it starts it,
 watches its output, restarts it when it crashes, and kills it on quit.
 
 **The shell ships unsigned.** Each release publishes a macOS `.dmg` and a Windows
-installer from `.github/workflows/desktop.yml` — **ad-hoc signed** on macOS, no
+installer from `release.yml`'s desktop jobs — **ad-hoc signed** on macOS, no
 certificate on Windows, no Apple Developer account. Nothing is notarized:
-notarization is an Apple service with no self-hosted form. The CLI release path is
-unchanged, and the bundle does not contain the CLI — see [Shipping](#shipping).
+notarization is an Apple service with no self-hosted form. The app **carries the
+CLI inside the bundle** and installs it on request, and it **checks for a newer
+release** on launch and installs it on request — see
+[The bundled CLI](#the-bundled-cli), [Auto-update](#auto-update) and
+[Shipping](#shipping).
 
 ## What it does
 
@@ -25,6 +28,7 @@ unchanged, and the bundle does not contain the CLI — see [Shipping](#shipping)
 | Start at login | optional, off until you turn it on |
 | Show the config | read-only: providers, routes, targets, search, key **tiers** |
 | Show the gateway's output | a log panel; stderr marked as diagnostics |
+| Check for a newer release | on launch, and from the tray |
 | **Edit the config** | **no** — `turnpike setup` is the only writer |
 
 The last row is the boundary this shell draws. It is a window onto the config, not
@@ -39,17 +43,23 @@ worse than none of it.
 desktop/
   package.json  vite.config.ts  svelte.config.js  tsconfig.json  index.html
   icons.py                      # one-shot generator for the icon set and tray.png
+  scripts/stage-cli.mjs         # stages the CLI payload the bundle carries
   src/                          # Svelte + TS
     main.ts  App.svelte  app.css
     lib/{api.ts,types.ts,stores.ts}
     routes/{Settings.svelte,Logs.svelte}
   src-tauri/
     Cargo.toml  build.rs  tauri.conf.json  capabilities/default.json  icons/
+    tauri.macos.conf.json       # the CLI payload's name, per platform
+    tauri.windows.conf.json
+    binaries/                   # the staged payload — gitignored, a build input
     src/main.rs                 # thin: calls turnpike_desktop_lib::run()
-    src/lib.rs                  # app setup, the 8 commands, quit
+    src/lib.rs                  # app setup, the commands, quit
     src/supervisor.rs           # the process state machine
     src/resolve.rs              # where the binary and config.toml are
     src/settings.rs             # consumes `turnpike config --json`
+    src/cli_install.rs          # puts the bundled CLI on the user's PATH
+    src/update.rs               # checks for a newer release, installs on request
     src/tray.rs                 # the menu-bar item
 ```
 
@@ -186,6 +196,49 @@ call: turnpike has no `[lib]` target. The drift is visible rather than silent �
 `turnpike config --json` reports the path *it* resolved, and the settings window
 shows both.
 
+## The bundled CLI
+
+The app carries a copy of the CLI at `Resources/bin/turnpike-cli`
+(`bin\turnpike-cli.exe` on Windows) — a `bundle.resources` **map** entry, declared
+per platform in `tauri.macos.conf.json` / `tauri.windows.conf.json` so each names
+its own extension. The payload is `turnpike-cli`, **not** `turnpike`: on Windows
+the resources land beside the app's own `turnpike.exe`, and a payload sharing that
+name would collide with it.
+
+**It is an install source, not a run candidate.** `resolve::bundled_payload()`
+returns its path to `cli_install` only — the run order above is unchanged, so a CLI
+the user installed themselves always wins over the one in the bundle. That is what
+keeps the payload from becoming a second `turnpike` the user cannot see or update.
+
+`src/cli_install.rs` reports and installs. `status()` classifies the machine into
+`ready`, `versionMismatch`, `missing` or `unavailable`, comparing the resolved
+binary's `--version` against `env!("CARGO_PKG_VERSION")`; the app and the CLI ship
+from one tag, so a mismatch means the installed CLI predates the app. An
+**unreadable** version is not evidence of a wrong one — `--version` that gives no
+answer leaves the state `ready`, because reporting a working CLI as stale over an
+unparsed string is worse than saying nothing.
+
+`install()` copies the bundle's copy to the same place `install.sh` / `install.ps1`
+already use — `~/.local/bin/turnpike` at mode 0755, or
+`%LOCALAPPDATA%\turnpike\bin\turnpike.exe` — so an in-app install and a shell
+install cannot land in two places and leave two CLIs competing on `PATH`.
+
+On Windows the install also adds that directory to the **User** `PATH`, the registry
+write `install.ps1` does: a GUI app does not inherit the shell's `PATH`, so there is
+no other way to make the CLI reachable. On unix it does **not** touch shell rc files;
+if `~/.local/bin` is not on `PATH`, the window shows the same `export PATH=` advice
+`install.sh` prints, worded as guidance rather than a diagnosis.
+
+The window offers the install when the state is `missing`, and a reinstall when it is
+`versionMismatch` with a payload to fix it from. Both are inline panels driven by the
+`cli_status` / `cli_install` commands, so `capabilities/default.json` stays at
+`core:default`. A dismissal is session-only: the next launch offers again.
+
+A macOS detail: the installed copy has `com.apple.quarantine` cleared if it is
+present. It never is in practice — the payload travels inside the bundle, not through
+a browser — but the app is installing a file it shipped with, so the attribute has no
+business surviving if some future path sets it.
+
 ## The tray
 
 `src/tray.rs`. A `TrayIconBuilder` with a template image
@@ -203,6 +256,7 @@ Restart
 Start at login
 ──────────
 Settings…
+Check for Updates…
 Quit turnpike
 ```
 
@@ -252,6 +306,55 @@ Two limits worth stating:
 The plugin is registered with `Some(vec!["--minimized"])`. That flag is recorded
 for phase 2 and is **not honored** — the window is shown on launch, including at
 login.
+
+## Auto-update
+
+`src/update.rs`, over `tauri-plugin-updater`. The app checks for a newer release on
+launch and offers it; it downloads and installs only when the user says so.
+
+The check runs **only in a release build** (`!cfg!(debug_assertions)`). A dev build has
+no bundle to replace, and checking on every `cargo tauri dev` launch would offer a
+release over the working tree. It is spawned rather than awaited, because `setup` must
+not block on the network for the app to finish starting.
+
+**A launch check is silent unless it finds an update.** An offline machine must not get
+an error banner on every launch, so only an *explicit* check — the tray item — answers
+with "you're up to date" or with a failure. That distinction is the `Trigger` enum, and
+it is why the frontend needs no busy flag of its own: `Checking` is emitted for explicit
+checks only, so a `checking` banner never appears behind the user's back.
+
+The tray item shows the window **before** it checks, because the answer arrives as a
+banner *in* that window — with the window hidden, a click that found nothing would look
+like a dead menu item.
+
+`download` and `install` are called separately rather than through
+`download_and_install`, so the banner gets a `downloading` phase and an `installing`
+phase instead of one opaque pause. `install` is **synchronous**, and it verifies the
+minisign signature over the downloaded bytes before it touches anything — a bundle that
+does not match the configured pubkey stops there.
+
+What happens after that is platform-specific, and the plugin documents it: **Windows**
+installs by launching the NSIS installer and exiting the process, so there is nothing
+left to relaunch; **macOS** swaps the bundle in place, so the running process is still
+the old one and `app.restart()` is what starts the new. `relaunch()` is split on
+`cfg(windows)` for exactly that reason, and its Windows arm is deliberately empty.
+
+The webview gets **no** `updater:default` permission — `capabilities/default.json` stays
+at `core:default`, like the CLI install path. The window drives this through
+`update_check` / `update_install` and renders whatever arrives on `update://status`;
+`update_status` is the catch-up read for a window that attached after the launch check
+had already finished.
+
+The endpoint is `releases/latest/download/latest.json`, assembled by `release.yml`'s
+`desktop-sums` job from the `.sig` files the release actually carries — see
+[Shipping](#shipping). The key it verifies against is in
+[The updater key](#the-updater-key).
+
+**One part of this is not verified end-to-end:** whether the install step succeeds on an
+**ad-hoc signed** macOS build. The check, the download and the signature verification
+involve no code-signing identity, so they are unaffected; the open question is the swap
+itself. If macOS turns out to refuse it, the fallback is for macOS to notify and open the
+download page while Windows keeps auto-update.
 
 ## The settings window
 
@@ -324,23 +427,40 @@ default enable mode is `LocalMachine`, enabling would need admin. The fix, if it
 bites, is to build `AutoLaunchBuilder` with `WindowsEnableMode::CurrentUser`
 instead of using the plugin's `init` convenience.
 
-**The desktop workflow is unexercised end-to-end.** Its commands and output paths
-were verified by running them locally (a `CI=true` bundle produces
-`bundle/dmg/*.dmg`, which is what the copy step globs), but the workflow itself has
-not run on a runner, and the Windows job cannot be exercised on a macOS machine.
-The first release after it lands is the real check.
+**The merged release pipeline is unexercised end-to-end.** The two-workflow pipeline
+it replaced shipped v0.1.5's six assets, so its commands and output paths are verified
+(a `CI=true` bundle produces `bundle/dmg/*.dmg`, which is what the copy step globs).
+What has not run on a runner is the merged shape — the desktop jobs consuming the CLI
+artifacts through `download-artifact`, and the reordered `needs:` — and the Windows job
+cannot be exercised on a macOS machine at all. The next release is the real check.
+
+**The desktop crate has no lint or test coverage in CI.** `ci.yml` runs `cargo fmt
+--check` on it — which does not compile — and nothing else. Checking it there would need
+WebKitGTK (or, for the Windows target, the same `cargo-xwin` setup the CLI's Windows job
+uses) **and** the staged CLI payload its bundle resources require, so it is left to
+`release.yml`'s native macOS and Windows builds. Those give the crate a **compile check**
+on release, but no `cargo clippy` — so a lint regression reaches `main` and is only
+caught locally.
 
 ## Building and running
 
 ```bash
 cd desktop
 npm install
+npm run stage-cli      # builds the CLI and stages it as the bundle's payload
 npm run tauri dev      # dev window + tray, watching src/ and src-tauri/
 ```
 
+`npm run stage-cli` is **required, not optional**: `tauri-build` hard-errors on a bundle
+resource that is not there, so `cargo check`, `cargo test`, `cargo clippy` and `tauri
+build` all fail inside `src-tauri/` until `src-tauri/binaries/turnpike-cli` exists. The
+release workflow gets that same file from its `download-artifact` step, so a CI build
+never needs a local one.
+
 `@tauri-apps/cli` is a devDependency, so there is no global `cargo install
 tauri-cli`. A **`turnpike` binary must exist** — the supervisor resolves it from
-the list above, and `TURNPIKE_BIN` overrides everything.
+the list above, and `TURNPIKE_BIN` overrides everything. `stage-cli` leaves one at
+`<repo>/target/release/turnpike`, which resolution finds in a dev build.
 
 `npm run check` runs `svelte-check`; `npm run build` builds the frontend alone. To
 build a bundle by hand:
@@ -352,36 +472,63 @@ npm run tauri build -- --bundles app,dmg
 
 ## Shipping
 
-`.github/workflows/desktop.yml` runs on the same `release: published` event as the
-CLI, as a **separate workflow**. A Tauri build is an npm install plus a full LTO
-Rust build of the whole Tauri stack, and `release.yml`'s `SHA256SUMS` job waits on
-`needs: [macos, windows]` — so folding these jobs in would either delay every CLI
-release's manifest by that build or leave the desktop assets out of it. Two
-pipelines, two manifests, and a broken Tauri build cannot cost the CLI its release.
+One workflow: `.github/workflows/release.yml`, on `release: published`. The CLI jobs run
+first and publish their artifacts; each desktop job consumes the binary for its own
+platform and publishes its own; two checksum jobs close it.
 
-Two build jobs, because a macOS bundle can only be assembled on macOS: unlike the
-CLI, which cross-builds both platforms from `ubuntu-latest` with `cargo-zigbuild`
-and `cargo-xwin`, `hdiutil` makes the dmg and the bundler signs the `.app` with the
-host's `codesign`. Both runners are free on a public repo.
+```
+cli-macos   ──→ desktop-macos     ─┐
+cli-windows ──→ desktop-windows   ─┴─→ desktop-sums   (if: always())
+      └──────→ cli-sums                              (if: always())
+```
 
-| job | runner | artifact |
+The two halves stay **separate jobs**, and every CLI job uploads its binary before any
+desktop job starts. A Tauri build is an npm install plus a full LTO Rust build of the
+whole Tauri stack, so a broken one must cost the desktop its assets and nothing else —
+that is the v0.1.0 lesson kept. Two manifests, `SHA256SUMS` and `SHA256SUMS-desktop`, so
+neither half's failure can blank the other's.
+
+The desktop jobs build **natively**, because a macOS bundle can only be assembled on
+macOS: unlike the CLI, which cross-builds both platforms from `ubuntu-latest` with
+`cargo-zigbuild` and `cargo-xwin`, `hdiutil` makes the dmg and the bundler signs the
+`.app` with the host's `codesign`. Both runners are free on a public repo.
+
+| job | runner | artifacts |
 | --- | --- | --- |
-| macOS aarch64 dmg | `macos-latest` | `turnpike_desktop-aarch64-apple-darwin.dmg` |
-| Windows x86_64 installer | `windows-latest` | `turnpike_desktop-x86_64-pc-windows-msvc-setup.exe` |
+| macOS aarch64 | `macos-latest` | `turnpike_desktop-aarch64-apple-darwin.dmg`; `…-darwin.app.tar.gz` + `.sig` |
+| Windows x86_64 | `windows-latest` | `turnpike_desktop-x86_64-pc-windows-msvc-setup.exe` (+ `.sig`) |
 
-A third job hashes whatever reached the release into `SHA256SUMS-desktop`, running
-on `if: always() && !cancelled()` so a platform that failed does not cost the other
-its checksum.
+Each desktop job's first step is `actions/download-artifact` for its platform's CLI
+binary, placed at `src-tauri/binaries/turnpike-cli` and `.exe` respectively. That is not
+a convenience: `tauri-build` hard-errors on a bundle resource that is missing, so the
+build cannot start without it. It is also why `needs:` points at the matching **CLI** job
+rather than at `cli-sums` — the desktop job needs one binary, not the manifest.
+
+A third job hashes whatever reached the release into `SHA256SUMS-desktop`, running on
+`if: always() && !cancelled()` so a platform that failed does not cost the other its
+checksum. It then assembles **`latest.json`**, the manifest the updater polls, out of the
+`.sig` files the release carries — the signature's *content*, not a URL to it.
+
+That manifest is gated on **both** platforms' `.sig` files existing, and not on either one
+alone. Tauri deserializes and validates the whole file before it compares versions, so a
+manifest naming only one platform fails to parse on the other and disables updates
+everywhere — worse than publishing nothing, which leaves the previous release's manifest
+in place. Its asset URLs are tag-pinned rather than `releases/latest/download/`, because
+`latest` is a moving target: an app that checked while this release was current must still
+be able to fetch *this* release's bundle after a newer one is published. The version comes
+from the tag, minus its `v`.
 
 The asset prefix is `turnpike_desktop-` with an **underscore** on purpose:
-`release.yml`'s own manifest globs `turnpike-*`, and `turnpike-desktop-*` would
-match it, letting the two manifests see each other's assets depending on which
-pipeline finished first. The underscore is load-bearing — `turnpike-*` requires a
-hyphen.
+`release.yml`'s own manifest globs `turnpike-*`, and `turnpike-desktop-*` would match it,
+letting the two manifests see each other's assets depending on which job finished first.
+The underscore is load-bearing — `turnpike-*` requires a hyphen.
 
-**The bundle does not contain the CLI.** The shell supervises an externally
-installed `turnpike`, resolved at runtime from the list above — so installing the
-desktop app is not a substitute for `install.sh`.
+No job here creates the GitHub Release. The maintainer publishes it, and every job
+attaches to it with `gh release upload --clobber`.
+
+**The bundle contains the CLI** — see [The bundled CLI](#the-bundled-cli) — so installing
+the app is enough to run the gateway; `install.sh` puts the same binary in the same
+place.
 
 ### Signing
 
@@ -401,6 +548,26 @@ a warning, not an error.
 Windows has no certificate configured, so no signing step runs and the NSIS
 installer ships unsigned. NSIS over msi: one self-contained `.exe` and no WiX
 download.
+
+### The updater key
+
+A second and unrelated keypair signs the **update payload**, not the app:
+`tauri signer generate` produces a minisign pair. The public half is
+`plugins.updater.pubkey` in `tauri.conf.json` — the whole two-line file's content,
+not just the base64 line. The private half is `TAURI_SIGNING_PRIVATE_KEY` in this
+repo's Actions secrets, plus `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if it was
+generated with one. Note that a `.env` file does **not** work here: the Tauri CLI
+reads the process environment.
+
+This is the signature that actually matters for updates. The app verifies every
+download against that pubkey before it writes anything to disk, so a tampered
+release asset is rejected — and that check has nothing to do with the ad-hoc code
+signature above.
+
+It is also the one thing here that is **unrecoverable if lost**. The pubkey is
+compiled into every shipped build and the only way to change it is to install a
+build by hand, so losing the private key does not merely stop new signatures: it
+means existing installs can never be updated again, only replaced.
 
 ### The Gatekeeper wart
 
@@ -447,7 +614,16 @@ mutation and no fixtures on disk:
 - `settings.rs` — the `SettingsPayload` tags, the stderr message cleanup, and a
   deserialize of a real `turnpike config --json` payload, so a rename on either
   side of the boundary fails in a test rather than in the window.
+- `cli_install.rs` — `classify` over all four states (including an unparsed version
+  staying `ready`), `parse_version` against the shapes `turnpike --version` actually
+  prints, the pure PATH arithmetic (`path_has_entry` / `path_with_entry`, including
+  case-insensitivity and a trailing separator), and `install_payload` against a temp
+  directory rather than a real install.
 - `tray.rs` — the status labels.
+- `update.rs` — the `UpdateStatus` wire shape, variant by variant, against the union in
+  `desktop/src/lib/types.ts`, so a rename on either side of the boundary fails in a test
+  rather than in a banner that silently never appears; and that a release with no body
+  still serializes the `notes` key as `null`.
 
 **Manual only**, because they need a GUI and a real process: tray rendering, plist
 creation, the real spawn/kill, readiness timing, log streaming, and

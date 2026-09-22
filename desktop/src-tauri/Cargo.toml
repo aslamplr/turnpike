@@ -10,8 +10,13 @@ publish = false
 # can never be absorbed into the turnpike workspace if the root ever grows one.
 # The root deliberately has none: CI runs `cargo test --locked` on ubuntu-latest,
 # and a root workspace would make it try to build this crate and fail on missing
-# WebKitGTK. The desktop ships from its own workflow instead:
-# `.github/workflows/desktop.yml`, which builds on macOS and Windows runners.
+# WebKitGTK. The desktop ships from `release.yml`'s desktop jobs instead, which
+# build natively on macOS and Windows runners and consume the binaries the CLI
+# jobs publish.
+#
+# Building this crate needs `binaries/turnpike-cli` (`.exe` on Windows) staged
+# first — `tauri-build` hard-errors on the missing bundle resource, so a fresh
+# clone cannot `cargo check` here until it is. `npm run stage-cli` writes it.
 [workspace]
 
 [lib]
@@ -26,6 +31,9 @@ tauri-build = { version = "2", features = [] }
 # `image-png` lets the tray load its own template image from bytes.
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = "2"
+# Drives update.rs. Rust-side only: the webview gets no `updater:default`
+# permission, so `capabilities/default.json` keeps its `core:default` surface.
+tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [
@@ -41,12 +49,19 @@ tokio = { version = "1", features = [
 [target."cfg(unix)".dependencies]
 libc = "0.2"
 
-# `CREATE_NO_WINDOW` for the spawned `turnpike serve`. The app is a GUI binary
-# (`windows_subsystem = "windows"` in main.rs) but `turnpike` is a console-subsystem
-# exe, so Windows would otherwise give the child a console window of its own — and
-# closing that window kills the gateway. See supervisor.rs.
+# `CREATE_NO_WINDOW` for the spawned `turnpike serve` and for the `--version`
+# probe. The app is a GUI binary (`windows_subsystem = "windows"` in main.rs) but
+# `turnpike` is a console-subsystem exe, so Windows would otherwise give the child
+# a console window of its own — and closing that window kills the gateway. See
+# supervisor.rs and cli_install.rs.
+#
+# `Win32_System_Registry` is the User PATH write in cli_install.rs. It enables
+# `Win32_System` and `Win32_Foundation` transitively, so those need no entry.
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+] }
 
 [profile.release]
 codegen-units = 1

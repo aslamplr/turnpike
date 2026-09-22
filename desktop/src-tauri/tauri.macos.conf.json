@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "binaries/turnpike-cli": "bin/turnpike-cli"
+    }
+  }
+}

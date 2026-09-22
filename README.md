@@ -112,8 +112,11 @@ There is also a **desktop shell** (menu-bar item, a supervisor that runs the
 gateway for you, and a read-only settings window) in [desktop/](desktop/) — Tauri
 v2 + Svelte, published on each release as an **ad-hoc signed** macOS `.dmg` and an
 unsigned Windows installer (`cd desktop && npm run tauri dev` to hack on it). It
-supervises the same `turnpike` binary; nothing about the CLI changes. See
-[docs/desktop.md](docs/desktop.md).
+supervises the same `turnpike` binary and **carries a copy of it**, offering to
+install that copy to `PATH` when no CLI is found — so the app works on its own,
+without `install.sh`. It also **checks for a newer release on launch** and
+installs it when you accept, verifying each download against a key compiled into
+the app. See [docs/desktop.md](docs/desktop.md).
 
 ## Configuration
 
