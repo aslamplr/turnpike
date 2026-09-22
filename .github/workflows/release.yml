@@ -29,6 +29,13 @@ name: release
 # polls. So the update manifest is derived from the assets the release actually
 # carries, never hand-written, and it is signed by the same key the app verifies
 # against (`plugins.updater.pubkey` in tauri.conf.json).
+#
+# That key is therefore *required*, not optional. With `createUpdaterArtifacts` on,
+# tauri-bundler exits 1 when `TAURI_SIGNING_PRIVATE_KEY` is unset — and it does so
+# *after* writing the bundles, so the failure costs the whole desktop job rather
+# than just the signature. A release with no secret therefore has no desktop assets
+# at all; `desktop-sums` still runs (`if: always()`) and its `latest.json` step is
+# what reports the absence.
 on:
   release:
     types: [published]
@@ -247,6 +254,19 @@ jobs:
         run: npm ci
         working-directory: desktop
 
+      # Fail here rather than at the end of the build: tauri-bundler only
+      # discovers the missing key after it has written the bundles, which is
+      # ~15 minutes into this job on a cold runner.
+      - name: Check the updater signing key is set
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY is not set. The desktop bundle cannot be built without the updater's minisign key — see docs/desktop.md."
+            exit 1
+          fi
+
       # Ad-hoc signing is configured in tauri.conf.json
       # (bundle.macOS.signingIdentity = "-"), deliberately not through
       # APPLE_SIGNING_IDENTITY, so a local `npm run tauri build` and CI sign
@@ -265,9 +285,11 @@ jobs:
       # thing from the code signature above: it signs the `.app.tar.gz` an
       # installed app downloads, and that app verifies the download against the
       # pubkey in tauri.conf.json. It cannot live in the repo, so it is a
-      # repository secret. Without it `createUpdaterArtifacts` emits no `.sig` and
-      # the update manifest step below is skipped. Losing it means existing
-      # installs can never be updated again — see docs/desktop.md.
+      # repository secret — and it is required: with `createUpdaterArtifacts` on,
+      # tauri-bundler exits 1 when the key is absent ("A public key has been
+      # found, but no private key") *after* writing the bundles, so a missing
+      # secret costs the artifacts, not merely the signature. Losing the key means
+      # existing installs can never be updated again — see docs/desktop.md.
       - name: Bundle the app and dmg
         env:
           CI: "true"
@@ -302,24 +324,25 @@ jobs:
           # TAURI_SIGNING_PRIVATE_KEY; `desktop-sums` reads that file's *content*
           # into latest.json.
           #
-          # Absent `.sig` is a warning, not a failure: it means the secret is not
-          # configured, and the release is still perfectly installable by hand.
-          # What it costs is the manifest, and the manifest step says so.
+          # The signature is not optional at this point: the bundle step cannot
+          # succeed without the key, so a missing `.sig` means bundler behaviour
+          # changed, not that a secret is unset. Fail with a name rather than let
+          # the `cp` below die on a bare "No such file".
           tarballs=("$bundle"/macos/*.app.tar.gz)
           if [ ${#tarballs[@]} -ne 1 ]; then
             echo "expected one .app.tar.gz under $bundle/macos, found ${#tarballs[@]}"
             exit 1
           fi
+          if [ ! -f "${tarballs[0]}.sig" ]; then
+            echo "no .sig beside ${tarballs[0]} — createUpdaterArtifacts is on, so the build signs the tarball or fails"
+            exit 1
+          fi
           cp "${tarballs[0]}" turnpike_desktop-aarch64-apple-darwin.app.tar.gz
           gh release upload "$TAG" turnpike_desktop-aarch64-apple-darwin.app.tar.gz \
             --clobber --repo "$GITHUB_REPOSITORY"
-          if [ -f "${tarballs[0]}.sig" ]; then
-            cp "${tarballs[0]}.sig" turnpike_desktop-aarch64-apple-darwin.app.tar.gz.sig
-            gh release upload "$TAG" turnpike_desktop-aarch64-apple-darwin.app.tar.gz.sig \
-              --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            echo "::warning::no .sig beside ${tarballs[0]} — is TAURI_SIGNING_PRIVATE_KEY set? skipping the updater signature"
-          fi
+          cp "${tarballs[0]}.sig" turnpike_desktop-aarch64-apple-darwin.app.tar.gz.sig
+          gh release upload "$TAG" turnpike_desktop-aarch64-apple-darwin.app.tar.gz.sig \
+            --clobber --repo "$GITHUB_REPOSITORY"
 
   desktop-windows:
     name: Desktop Windows x86_64 installer
@@ -351,6 +374,17 @@ jobs:
       - name: Install the frontend toolchain
         run: npm ci
         working-directory: desktop
+
+      # Same check as the macOS job's, and for the same reason.
+      - name: Check the updater signing key is set
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY is not set. The desktop bundle cannot be built without the updater's minisign key — see docs/desktop.md."
+            exit 1
+          fi
 
       # No certificate is configured, so Tauri invokes no *code* signing step and
       # the installer ships unsigned; SmartScreen warns on first run. NSIS over
@@ -388,15 +422,16 @@ jobs:
 
           # Windows reuses the NSIS installer as the updater artifact — the
           # updater hands it to the installer and exits — so the `.sig` sits
-          # beside the very file just uploaded. Same warning-not-failure as the
-          # macOS job's: no secret, no signature, and `desktop-sums` says so.
-          if [ -f "${setups[0]}.sig" ]; then
-            cp "${setups[0]}.sig" turnpike_desktop-x86_64-pc-windows-msvc-setup.exe.sig
-            gh release upload "$TAG" turnpike_desktop-x86_64-pc-windows-msvc-setup.exe.sig \
-              --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            echo "::warning::no .sig beside ${setups[0]} — is TAURI_SIGNING_PRIVATE_KEY set? skipping the updater signature"
+          # beside the very file just uploaded. Same hard requirement as the
+          # macOS job's, for the same reason: the bundle step cannot succeed
+          # without the key, so the signature is always here.
+          if [ ! -f "${setups[0]}.sig" ]; then
+            echo "no .sig beside ${setups[0]} — createUpdaterArtifacts is on, so the build signs the installer or fails"
+            exit 1
           fi
+          cp "${setups[0]}.sig" turnpike_desktop-x86_64-pc-windows-msvc-setup.exe.sig
+          gh release upload "$TAG" turnpike_desktop-x86_64-pc-windows-msvc-setup.exe.sig \
+            --clobber --repo "$GITHUB_REPOSITORY"
 
   desktop-sums:
     name: SHA256SUMS-desktop
@@ -443,6 +478,10 @@ jobs:
       # disables updates everywhere — worse than publishing nothing, which just
       # leaves the previous release's manifest in place.
       #
+      # A signature can only be missing because that platform's job failed: the
+      # bundle step exits 1 when the signing key is unset, so an unsigned
+      # artifact never reaches the release.
+      #
       # The URLs are tag-pinned rather than `releases/latest/download/`, because
       # `latest` is a moving target: an app that checked while this release was
       # current must still be able to fetch *this* release's bundle after a newer
@@ -461,7 +500,7 @@ jobs:
           [ -f "$darwin" ] || missing+=("$darwin")
           [ -f "$windows" ] || missing+=("$windows")
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::warning::skipping latest.json — no signature for: ${missing[*]}. Set TAURI_SIGNING_PRIVATE_KEY and re-dispatch this tag to publish an update manifest."
+            echo "::warning::skipping latest.json — no signature for: ${missing[*]}. That platform's job did not publish one; fix it and re-dispatch this tag to publish an update manifest."
             exit 0
           fi
 
