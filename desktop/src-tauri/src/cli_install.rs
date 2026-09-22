@@ -228,14 +228,19 @@ fn make_executable(_p: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Strip `com.apple.quarantine` from the installed copy.
+/// Strip `com.apple.quarantine` from `p`.
 ///
-/// A payload extracted from a downloaded dmg can carry the attribute, and a
-/// quarantined binary is refused by Gatekeeper. The user ran this app to get
-/// here, so the payload is one they have effectively already trusted — the copy
-/// they will actually execute should not carry the mark.
+/// A binary carrying the attribute is SIGKILLed by the code-signing monitor at
+/// dyld load (`CODESIGNING` / `Invalid Page`) before `main()` runs — regardless of
+/// whether its signature is valid, so re-signing is not a fix. `removexattr` is.
+///
+/// Called twice for the same reason: on the installed copy (a payload out of a
+/// downloaded dmg inherits the mark, and `fs::copy` carries xattrs across), and by
+/// the supervisor on the resolved binary immediately before each spawn — a copy
+/// already on disk may carry the mark from whatever put it there, including an
+/// older install that predates this.
 #[cfg(target_os = "macos")]
-fn clear_quarantine(p: &Path) {
+pub(crate) fn clear_quarantine(p: &Path) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -250,7 +255,7 @@ fn clear_quarantine(p: &Path) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn clear_quarantine(_p: &Path) {}
+pub(crate) fn clear_quarantine(_p: &Path) {}
 
 /// Make the install dir findable, and say what the user still has to do. Split by
 /// platform because only one of them has anything to write.

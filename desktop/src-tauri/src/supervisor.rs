@@ -462,6 +462,14 @@ impl Supervisor {
             return;
         };
 
+        // A quarantined binary is SIGKILLed at dyld load by the code-signing
+        // monitor — `CODESIGNING` / `Invalid Page`, before `main()` — and the
+        // signature's quality makes no difference, so this is the fix rather than
+        // re-signing. Stripping at the install site is not enough on its own: the
+        // resolved binary may already be on disk carrying the mark from an older
+        // install, or from a path resolution never touched. Cheap and idempotent.
+        crate::cli_install::clear_quarantine(&bin);
+
         let mut cmd = Command::new(&bin);
         cmd.arg("serve")
             .arg("--config")

@@ -233,6 +233,11 @@ jobs:
         with:
           name: turnpike-cli-aarch64-apple-darwin
           path: desktop/src-tauri/binaries
+      # `download-artifact` does not carry the unix exec bit — every file lands
+      # 0644 — so the payload would ship non-executable, and `fs::copy` would
+      # carry that mode into the installed copy. Restore it here.
+      - run: chmod +x desktop/src-tauri/binaries/turnpike-cli
+        shell: bash
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -359,6 +364,9 @@ jobs:
         with:
           name: turnpike-cli-x86_64-pc-windows-msvc
           path: desktop/src-tauri/binaries
+      # No exec bit on Windows — but `bundled_payload` uses `is_file()` there, and
+      # `make_executable` is a no-op, so nothing else is needed. This comment is
+      # the record of why the macOS job has a `chmod` step and this one does not.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
