@@ -16,8 +16,10 @@
 //! result, and `fs::copy` carries the source's mark across besides. `curl` is not
 //! such a process, so a download it performs lands unmarked; that is why
 //! `install.sh` has always worked. macOS therefore shells out to `curl`, the same
-//! way the script does, and the bundle keeps its payload only as the Windows
-//! source. See `download_for_macos`.
+//! way the script does. The bundle still carries the payload on both platforms
+//! (`bundle.resources` is a build input, and `resolve` reads it for the
+//! `versionMismatch` report) — it is just not the file macOS installs from. See
+//! `download_for_macos`.
 //!
 //! The decision (`classify`) and the PATH arithmetic (`normalize`,
 //! `path_has_entry`, `path_with_entry`) are pure and platform-independent, so

@@ -65,7 +65,8 @@ cargo test        # inline #[cfg(test)] modules per file
 - `desktop/` — the desktop shell (Tauri v2 + Svelte/TS), a separate crate **outside** the root
   workspace (`exclude = ["desktop"]`, empty `[workspace]` in `desktop/src-tauri/Cargo.toml`).
   It supervises the same `turnpike` binary **and bundles a copy of it** as a `bundle.resources`
-  payload (`src/cli_install.rs` installs it to `PATH`; `src/update.rs` is the auto-updater) —
+  payload (`src/cli_install.rs` installs a CLI to `PATH` — from that payload on Windows, from a
+  release download on macOS; `src/update.rs` is the auto-updater) —
   so the crate cannot be built until that payload is staged (`npm run stage-cli`), because
   `tauri-build` hard-errors on the missing resource. Ships **ad-hoc signed** — no Apple account,
   no notarization — from `release.yml`'s desktop jobs, which build after the CLI jobs and consume
@@ -154,8 +155,13 @@ cargo test        # inline #[cfg(test)] modules per file
   a fresh clone cannot `cargo check`/`test`/`clippy` the desktop crate until it is staged
   (`npm run stage-cli`; `release.yml` gets it from `download-artifact`). It is an install *source*,
   never a run candidate: `resolve` keeps the order `$TURNPIKE_BIN` → dev target → install dirs →
-  `$PATH`, and the payload is copied out only on an explicit install. That is what closes the
-  desktop-only dead end — without it, a bundle on a machine with no CLI has no in-app way forward.
+  `$PATH`, and the payload is copied out only on an explicit install — and then only on **Windows**,
+  where `install()` copies it; macOS `install()` shells out to `curl` for the release tarball instead,
+  because installing a copy the app wrote itself is what produced a binary the code-signing monitor
+  SIGKILLed at dyld load (`CODESIGNING` / `Invalid Page`). The payload is therefore still shipped and
+  still a build input on both platforms, but on macOS it is not the file the install path reads.
+  That is what closes the desktop-only dead end — without it, a bundle on a machine with no CLI has
+  no in-app way forward.
 - **One release pipeline, and the desktop half sits downstream of the CLI half**
   (`.github/workflows/release.yml`): `cli-macos`/`cli-windows` → `cli-sums`, and each desktop job
   `needs:` **its own platform's CLI job** (not `cli-sums`) to consume the binary it bundles. The CLI

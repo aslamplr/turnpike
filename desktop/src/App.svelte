@@ -36,22 +36,25 @@
   }
 
   /// What to offer, if anything. `null` means there is nothing to do: a CLI is
-  /// ready, or a mismatch has no payload to fix it from (a dev build).
+  /// ready, or there is no install source at all (`Unavailable` — a dev build).
+  ///
+  /// A mismatch is offered regardless of `payload`: on macOS the install
+  /// downloads from the release rather than copying the bundle's payload, so a
+  /// stale CLI is still fixable there. Gating on `payload` hid the only way to
+  /// fix one.
   function offerFor(s: CliStatus | null): { text: string; action: string } | null {
     if (s === null) return null;
     switch (s.state) {
       case "missing":
         return {
-          text: "The turnpike CLI is not installed on this machine. This app carries a copy of it.",
+          text: "The turnpike CLI is not installed on this machine.",
           action: "Install",
         };
       case "versionMismatch":
-        return s.payload
-          ? {
-              text: `The turnpike CLI here is ${s.found}, but this app carries ${s.expected}.`,
-              action: "Reinstall",
-            }
-          : null;
+        return {
+          text: `The turnpike CLI here is ${s.found}, but this app needs ${s.expected}.`,
+          action: "Reinstall",
+        };
       default:
         return null;
     }

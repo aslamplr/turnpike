@@ -114,15 +114,31 @@ fn resource_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
 }
 
 /// Whether a usable `turnpike` is on this machine, and what to offer if not.
+///
+/// `spawn_blocking` for the same reason as `cli_install`: both walk the
+/// filesystem and run `turnpike --version`.
 #[tauri::command]
-fn cli_status(app: AppHandle) -> cli_install::CliStatus {
-    cli_install::status(resource_dir(&app).as_deref())
+async fn cli_status(app: AppHandle) -> cli_install::CliStatus {
+    let dir = resource_dir(&app);
+    tauri::async_runtime::spawn_blocking(move || cli_install::status(dir.as_deref()))
+        .await
+        .unwrap_or(cli_install::CliStatus::Unavailable {
+            reason: "the CLI status check did not finish".to_string(),
+        })
 }
 
-/// Install the bundled CLI where `install.sh` / `install.ps1` put it.
+/// Install the CLI where `install.sh` / `install.ps1` put it.
+///
+/// `spawn_blocking`, not a bare `async fn`: the body is `curl`, `shasum` and
+/// `tar` through `std::process::Command`, which would block the runtime worker
+/// it landed on rather than the webview. Blocking the invoking path this way is
+/// what froze the Settings window mid-install with no `Installing…` feedback.
 #[tauri::command]
-fn cli_install(app: AppHandle) -> Result<cli_install::Installed, String> {
-    cli_install::install(resource_dir(&app).as_deref())
+async fn cli_install(app: AppHandle) -> Result<cli_install::Installed, String> {
+    let dir = resource_dir(&app);
+    tauri::async_runtime::spawn_blocking(move || cli_install::install(dir.as_deref()))
+        .await
+        .map_err(|e| format!("the install did not finish: {e}"))?
 }
 
 /// The last thing the updater settled on, so a window that attached after the

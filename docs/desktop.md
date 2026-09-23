@@ -205,10 +205,14 @@ its own extension. The payload is `turnpike-cli`, **not** `turnpike`: on Windows
 the resources land beside the app's own `turnpike.exe`, and a payload sharing that
 name would collide with it.
 
-**It is an install source, not a run candidate.** `resolve::bundled_payload()`
-returns its path to `cli_install` only — the run order above is unchanged, so a CLI
-the user installed themselves always wins over the one in the bundle. That is what
-keeps the payload from becoming a second `turnpike` the user cannot see or update.
+**It is an install source, not a run candidate, and on macOS it is not even that.**
+`resolve::bundled_payload()` returns its path to `cli_install` only — the run order
+above is unchanged, so a CLI the user installed themselves always wins over the one
+in the bundle. That is what keeps the payload from becoming a second `turnpike` the
+user cannot see or update. The payload is still shipped and still a `bundle.resources`
+entry on both platforms (that entry is a build input), but Windows is the only
+platform whose install path reads it: macOS downloads instead, for the code-signing
+reason below.
 
 `src/cli_install.rs` reports and installs. `status()` classifies the machine into
 `ready`, `versionMismatch`, `missing` or `unavailable`, comparing the resolved
@@ -218,11 +222,22 @@ from one tag, so a mismatch means the installed CLI predates the app. An
 answer leaves the state `ready`, because reporting a working CLI as stale over an
 unparsed string is worse than saying nothing.
 
-`install()` copies the bundle's copy to the same place `install.sh` / `install.ps1`
-already use — `~/.local/bin/turnpike` at mode 0755, or
-`%LOCALAPPDATA%\turnpike\bin\turnpike.exe` — so an in-app install and a shell
-install cannot land in two places and leave two CLIs competing on `PATH`.
-
+`install()` puts a CLI in the same place `install.sh` / `install.ps1` already use —
+`~/.local/bin/turnpike` at mode 0755, or `%LOCALAPPDATA%\turnpike\bin\turnpike.exe`
+— so an in-app install and a shell install cannot land in two places and leave two
+CLIs competing on `PATH`. **Two sources, one per platform:** Windows copies the
+bundle's payload, since quarantine is a macOS mechanism and there is no artifact
+download to consider; macOS shells out to `curl` to download the release tarball,
+verifies it against the same `SHA256SUMS` `install.sh` uses, and unpacks it with
+`tar`. Shelling out rather than downloading in-process is the point, not a shortcut:
+`com.apple.quarantine` is applied by Launch Services when a *quarantine-eligible*
+process — one that was itself downloaded — writes a file from network data, so an
+in-process `reqwest` download would mark its own output and reproduce the crash this
+avoids. `curl` is not eligible. (Measured on macOS 25.6.0 with Apple's
+`/usr/bin/curl` 8.7.1: a file it wrote from `https://github.com/...` carried only
+`com.apple.provenance`, no `com.apple.quarantine`.) `curl` and `tar` are used rather
+than reimplementing HTTP and gzip because both ship with macOS and the pipeline then
+mirrors `install.sh` line for line, so the two install paths cannot drift.
 On Windows the install also adds that directory to the **User** `PATH`, the registry
 write `install.ps1` does: a GUI app does not inherit the shell's `PATH`, so there is
 no other way to make the CLI reachable. On unix it does **not** touch shell rc files;
@@ -230,14 +245,27 @@ if `~/.local/bin` is not on `PATH`, the window shows the same `export PATH=` adv
 `install.sh` prints, worded as guidance rather than a diagnosis.
 
 The window offers the install when the state is `missing`, and a reinstall when it is
-`versionMismatch` with a payload to fix it from. Both are inline panels driven by the
-`cli_status` / `cli_install` commands, so `capabilities/default.json` stays at
-`core:default`. A dismissal is session-only: the next launch offers again.
+`versionMismatch` — unconditionally, **not** gated on a payload being present. macOS
+has no payload to offer (it downloads), so gating on one hid the only way to fix a
+stale CLI there. Both are inline panels driven by the `cli_status` / `cli_install`
+commands, so `capabilities/default.json` stays at `core:default`. A dismissal is
+session-only: the next launch offers again.
+
+**Both commands are `async` and run their bodies on `spawn_blocking`.** A
+`#[tauri::command]` on a plain `fn` defaults to `ExecutionContext::Blocking` and runs
+inline on the invoking path, so the `curl` download blocked the IPC thread: the
+window set `cliBusy = true`, nothing repainted (no `Installing…`), and the install
+had actually succeeded underneath. A bare `async fn` is not the fix either — the body
+is `std::process::Command`, which would then block whichever runtime worker it landed
+on. `spawn_blocking` is what moves it off both.
 
 A macOS detail: the installed copy has `com.apple.quarantine` cleared if it is
-present. It never is in practice — the payload travels inside the bundle, not through
-a browser — but the app is installing a file it shipped with, so the attribute has no
-business surviving if some future path sets it.
+present, and the supervisor strips it again on the resolved binary immediately before
+each spawn. `curl`'s output does not carry the mark (above), so this is belt-and-braces
+for a copy that arrived some other way. **What is not explained is why a copy spawned
+in the field was quarantined at that moment** — the download path routes around the
+question rather than answering it, and the spawn-site strip is a cheap idempotent
+guard against the symptom, not a diagnosis.
 
 ## The tray
 

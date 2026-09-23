@@ -23,7 +23,8 @@ export const autostartSet = (enabled: boolean) =>
 /// Whether a usable `turnpike` is on this machine. Re-probed on every call, so
 /// the answer follows an install the user made outside the app.
 export const cliStatus = () => invoke<CliStatus>("cli_status");
-/// Install the CLI this bundle carries, where the shell installers put it.
+/// Install the CLI where the shell installers put it: a download on macOS, the
+/// bundle's copy on Windows. Takes as long as the download does.
 export const cliInstall = () => invoke<Installed>("cli_install");
 
 /// The last thing the updater settled on, for the first paint after a launch
