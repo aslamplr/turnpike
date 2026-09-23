@@ -3,6 +3,7 @@
 //! * `edit` — comment-preserving `toml_edit` mutations.
 //! * `prompt` — the sole stdout prompt module, plus the `Prompter` trait that
 //!   makes the wizard drivable from tests.
+//! * `cli` — the non-interactive twin of this wizard, for the desktop shell.
 //! * this file — the menu, the staged `Plan`, and `commit()`.
 //!
 //! ## Staged, then committed
@@ -28,6 +29,7 @@
 //! not: it is the remediation tool, so a store it cannot open is a hard error
 //! up front rather than something to discover at the first write.
 
+pub mod cli;
 pub mod edit;
 pub mod prompt;
 
@@ -805,82 +807,106 @@ impl WizardState {
     // --- commit ------------------------------------------------------------
 
     /// Write everything staged, in the order that keeps a crash recoverable.
+    ///
+    /// A one-line adapter over [`commit_doc`], which is the single definition of
+    /// how a config is written: `turnpike config-edit` saves through the same
+    /// function, so the desktop UI and the wizard cannot drift.
     fn commit(
         &mut self,
         path: &Path,
         store: &mut secrets::StoreCtx,
         no_validate: bool,
     ) -> Result<()> {
-        // Validate the rendered document *before* anything is written, so a
-        // document the wizard built but that is not a valid config is caught
-        // while the file on disk is still the old one.
-        //
-        // `no_validate` is not a CLI flag: `SetupOptions` carries it so the
-        // wizard's own tests can drive the write path past the gate, and
-        // `run()` always passes false. So the message must not offer it as a
-        // way out — naming a flag that does not exist is worse than saying
-        // plainly that the save was refused.
-        if !no_validate {
-            self.doc.validated().context(
-                "the config being saved is not valid — nothing was written; \
-                 fix it above, or `turnpike serve --init` writes a known-good \
-                 starter to compare against",
-            )?;
-        }
-
-        // 1. Back up the current config, outside the directory being written.
-        //    Write-once per namespace, so the backup is the pre-turnpike state
-        //    and a second `setup` does not overwrite it with a wizard-written
-        //    file.
-        if path.exists() && store.is_open() && !store.root.as_os_str().is_empty() {
-            match crate::secrets::file::backup_config_once(&store.root, &store.ns, path) {
-                Ok(Some(dest)) => println!("  backed up the current config to {}", dest.display()),
-                Ok(None) => {}
-                Err(e) => println!("  (could not back up the config: {e})"),
-            }
-        }
-
-        // 2 & 3. Secrets: create `master.key` on first write, stage, save.
-        if !self.plan.is_empty() {
-            let Some(store_impl) = store.store_mut() else {
-                anyhow::bail!(
-                    "the secret store is not usable, so the keys you entered cannot be \
-                     saved — nothing was written"
-                );
-            };
-            for (name, secret) in &self.plan.secret_writes {
-                store_impl.put(name, secret.clone());
-            }
-            for name in &self.plan.secret_deletes {
-                store_impl.delete(name);
-            }
-            store_impl
-                .save()
-                .map_err(|e| anyhow::anyhow!("writing the secret store: {e}"))?;
-            let n = self.plan.secret_writes.len();
-            if n > 0 {
-                println!(
-                    "  stored {n} secret{} encrypted",
-                    if n == 1 { "" } else { "s" }
-                );
-            }
-        }
-
-        // 4. The config itself, atomically: temp file in the same directory,
-        //    then rename. This is the only critical step, and rename makes it
-        //    all-or-nothing.
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-        }
-        write_atomic(path, &self.doc.as_str())
-            .with_context(|| format!("writing {}", path.display()))?;
-        println!("  wrote {}", path.display());
-
-        Ok(())
+        commit_doc(&self.doc, &self.plan, path, store, no_validate)
     }
+}
+
+/// Write `doc` and `plan` to `path`, in the order that keeps a crash recoverable.
+///
+/// **The single write point.** `WizardState::commit` calls it, and so does
+/// `config-edit`'s save op; there is deliberately no second implementation, so
+/// the desktop UI cannot save a document the wizard would not have.
+///
+/// The order is not negotiable — see the module docs on the migration invariant:
+///
+/// 1. Validate the rendered document *before* anything is written, so a
+///    document that is not a valid config is caught while the file on disk is
+///    still the old one.
+/// 2. Back up the current config, write-once per namespace.
+/// 3. Encrypt and write to the store first. `store_mut()` returning `None` is a
+///    hard bail that aborts before the config is touched.
+/// 4. Only then the config itself, atomically.
+///
+/// `no_validate` is not a CLI flag: `SetupOptions` carries it so the wizard's
+/// own tests can drive the write path past the gate, and `run()` always passes
+/// false. So the message must not offer it as a way out — naming a flag that
+/// does not exist is worse than saying plainly that the save was refused.
+pub(crate) fn commit_doc(
+    doc: &Doc,
+    plan: &Plan,
+    path: &Path,
+    store: &mut secrets::StoreCtx,
+    no_validate: bool,
+) -> Result<()> {
+    if !no_validate {
+        doc.validated().context(
+            "the config being saved is not valid — nothing was written; \
+             fix it above, or `turnpike serve --init` writes a known-good \
+             starter to compare against",
+        )?;
+    }
+
+    // 1. Back up the current config, outside the directory being written.
+    //    Write-once per namespace, so the backup is the pre-turnpike state
+    //    and a second `setup` does not overwrite it with a wizard-written
+    //    file.
+    if path.exists() && store.is_open() && !store.root.as_os_str().is_empty() {
+        match crate::secrets::file::backup_config_once(&store.root, &store.ns, path) {
+            Ok(Some(dest)) => println!("  backed up the current config to {}", dest.display()),
+            Ok(None) => {}
+            Err(e) => println!("  (could not back up the config: {e})"),
+        }
+    }
+
+    // 2 & 3. Secrets: create `master.key` on first write, stage, save.
+    if !plan.is_empty() {
+        let Some(store_impl) = store.store_mut() else {
+            anyhow::bail!(
+                "the secret store is not usable, so the keys you entered cannot be \
+                 saved — nothing was written"
+            );
+        };
+        for (name, secret) in &plan.secret_writes {
+            store_impl.put(name, secret.clone());
+        }
+        for name in &plan.secret_deletes {
+            store_impl.delete(name);
+        }
+        store_impl
+            .save()
+            .map_err(|e| anyhow::anyhow!("writing the secret store: {e}"))?;
+        let n = plan.secret_writes.len();
+        if n > 0 {
+            println!(
+                "  stored {n} secret{} encrypted",
+                if n == 1 { "" } else { "s" }
+            );
+        }
+    }
+
+    // 4. The config itself, atomically: temp file in the same directory,
+    //    then rename. This is the only critical step, and rename makes it
+    //    all-or-nothing.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
+    write_atomic(path, &doc.as_str()).with_context(|| format!("writing {}", path.display()))?;
+    println!("  wrote {}", path.display());
+
+    Ok(())
 }
 
 /// Report a `Doc` mutation's outcome without swallowing it.

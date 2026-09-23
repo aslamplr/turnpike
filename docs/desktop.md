@@ -29,13 +29,22 @@ release** on launch and installs it on request — see
 | Show the config | read-only: providers, routes, targets, search, key **tiers** |
 | Show the gateway's output | a log panel; stderr marked as diagnostics |
 | Check for a newer release | on launch, and from the tray |
-| **Edit the config** | **no** — `turnpike setup` is the only writer |
+| **Edit the config** | **yes** — the Settings window is a second front-end onto the same mutation core (`turnpike config-edit`); `turnpike setup` remains the terminal one |
 
-The last row is the boundary this shell draws. It is a window onto the config, not
-an editor for it: writing config means the comment-preserving `toml_edit` wizard
-and the secret-store commit ordering in
-[setup-and-doctor.md](setup-and-doctor.md), and half of that from a GUI would be
-worse than none of it.
+The last row used to be drawn the other way, and the argument for drawing it there
+was about **fidelity**, not about GUIs: writing config means comment preservation
+through `toml_edit` and the secret-store commit ordering in
+[setup-and-doctor.md](setup-and-doctor.md), and a window that wrote a *degraded*
+config — one that dropped comments, skipped the inline-key migration, or reordered
+the commit — would be worse than no window at all.
+
+The window is therefore not a second implementation of config editing. It is a
+second front-end onto the same one: the same `setup::edit::Doc` mutations, the same
+`setup::Plan`, and the single `commit_doc` the wizard also calls. The work happens
+in the CLI (`turnpike config-edit`), which the Rust side shells out to exactly as it
+already shells out to `turnpike config --json`; the app holds the staged document
+as an **opaque string** and never round-trips it through `Config`/`toml::Value`. The
+detail is in [setup-and-doctor.md](setup-and-doctor.md#turnpike-config-edit).
 
 ## Layout
 
@@ -48,6 +57,7 @@ desktop/
     main.ts  App.svelte  app.css
     lib/{api.ts,types.ts,stores.ts}
     routes/{Settings.svelte,Logs.svelte}
+    routes/config/{Providers.svelte,Routes.svelte,Doctor.svelte,kit.svelte}
   src-tauri/
     Cargo.toml  build.rs  tauri.conf.json  capabilities/default.json  icons/
     tauri.macos.conf.json       # the CLI payload's name, per platform
@@ -58,6 +68,8 @@ desktop/
     src/supervisor.rs           # the process state machine
     src/resolve.rs              # where the binary and config.toml are
     src/settings.rs             # consumes `turnpike config --json`
+    src/config_edit.rs          # the editable session: shells out to `turnpike config-edit`
+    src/config_edit.rs          # the editable session: shells out to `turnpike config-edit`
     src/cli_install.rs          # puts the bundled CLI on the user's PATH
     src/update.rs               # checks for a newer release, installs on request
     src/tray.rs                 # the menu-bar item
@@ -386,19 +398,51 @@ download page while Windows keeps auto-update.
 
 ## The settings window
 
-Read-only, in two tabs.
+Two tabs. **Settings** is an editor; **Logs** is a reader.
 
-- **Settings** — a gateway summary (listen, route count, provider count, search
-  on/off, and the resolved config path) and three tables: providers (`id`,
-  `spec`, `base_url`, and the key's **tier** as a badge), routes (`id`,
-  `strategy`, the effective context window, and the whole target chain with each
-  target's spec and window), and search. A route's target chain comes from
-  `RouteCfg::targets()`, so target 0 is synthesized from the route's flat pair and
-  the window shows the same chain resolution walks.
-- **Logs** — the `gateway://log` stream, capped at 500 lines and following the
-  tail unless the reader has scrolled up. stderr lines are marked; stdout is the
-  gateway's program output and stderr is diagnostics, the same split the CLI
-  keeps.
+### Settings
+
+A gateway summary (listen, route count, provider count, search on/off, the resolved
+config path) above three editable groups — providers, routes, and search — and a
+read-only Doctor panel at the foot.
+
+**Nothing is written until Save.** The window holds a *session*, not the file: the
+staged document lives as an opaque TOML string on the Rust side
+(`src/config_edit.rs`), and every panel action is one op against it. Save runs the
+one `commit_doc`; Discard forgets the session and re-seeds from the unchanged file.
+The bar between them says which state you are in, and Save is disabled while no edit
+is pending.
+
+- **Providers** — add, remove, and the wizard's exact three key homes: name an env
+  var (which also strips any inline key, one edit), paste a key (staged into the
+  session and never rendered back), or leave it unset. The badge shows the key's
+  **tier**, as in the read-only view.
+- **Routes** — all three strategies. The target chain renders target 0 as the
+  route's own flat `provider`/`model` with **no remove button** (removing it is
+  "edit the route," and `targets()` synthesizes it); chain index `i` removes
+  **array index `i - 1`**, which is the argument the CLI takes. The strategy select
+  **disables** the non-`static` options below two targets, so the window cannot ask
+  for the state `set_strategy` refuses.
+- **Doctor** — `turnpike doctor --json`, read-only, `Fail` toned `bad` and `Warn`
+  toned `warn`. Advisory: a failure here is an empty list, never a broken window.
+
+A refusal — a strategy on a one-target route, or removing a provider a route still
+references — surfaces the CLI's **own** message and leaves the session untouched.
+The window has no force-delete the wizard does not have.
+
+### Logs
+
+The `gateway://log` stream, capped at 500 lines and following the tail unless the
+reader has scrolled up. stderr lines are marked; stdout is the gateway's program
+output and stderr is diagnostics, the same split the CLI keeps.
+
+### Why the window does not freeze
+
+Every new command shells out to `turnpike`. A plain `#[tauri::command] fn` body runs
+inline on the invoking IPC path, so a `std::process::Command` there blocks the
+window — which is exactly what `b54a838` fixed for the install path. The config-edit
+commands are therefore `async fn`s whose bodies run on
+`tauri::async_runtime::spawn_blocking`, the same shape `cli_install.rs` uses.
 
 ### The redaction boundary
 
@@ -423,9 +467,14 @@ That is not incidental. `resolve_config` in the turnpike crate writes a starter
 config *before* its mode match, so `turnpike serve` (and `turnpike config`) on a
 missing file writes one and then exits. A GUI must not trigger that, so both
 `Supervisor::start` and `settings::load` check `config.exists()` **first** and
-never invoke turnpike until it does. The settings window then shows the "No
-configuration yet" empty state, which says the window deliberately does not create
-a config file — the wizard is the only thing that should.
+never invoke turnpike until it does.
+
+The Settings window is the other half of that dead end, and it now closes it. With
+no file it shows the "No configuration yet" empty state and offers the **fresh
+setup** path: the session seeds from the same starter text the wizard starts from
+in memory, not from disk, and the file is written for the first time on Save. The
+gateway's own start still refuses until that happens — the window creates the file,
+the supervisor does not.
 
 ## Why the webview never calls the gateway
 
@@ -642,6 +691,14 @@ mutation and no fixtures on disk:
 - `settings.rs` — the `SettingsPayload` tags, the stderr message cleanup, and a
   deserialize of a real `turnpike config --json` payload, so a rename on either
   side of the boundary fails in a test rather than in the window.
+- `config_edit.rs` — that a CLI session round-trips through this side unchanged,
+  that what this side sends parses as the CLI's session shape (the contract that
+  would otherwise only fail in the window), and that the staged slots come back
+  sorted so a badge does not flap between repaints.
+- `config_edit.rs` — that a CLI session round-trips through this side unchanged,
+  that what this side sends parses as the CLI's session shape (the contract that
+  would otherwise only fail in the window), and that the staged slots come back
+  sorted so a badge does not flap between repaints.
 - `cli_install.rs` — `classify` over all four states (including an unparsed version
   staying `ready`), `parse_version` against the shapes `turnpike --version` actually
   prints, the pure PATH arithmetic (`path_has_entry` / `path_with_entry`, including
@@ -660,7 +717,8 @@ quit-kills-child.
 ## See also
 
 - [setup-and-doctor.md](setup-and-doctor.md) — `turnpike config`, the view this
-  window consumes, and its redaction contract.
+  window consumes, its redaction contract, and `turnpike config-edit`, the writer
+  its Settings tab drives.
 - [gateway.md](gateway.md) — the loopback and `Origin` guards.
 - [secrets.md](secrets.md) — the store whose keys the view reports the *tier* of.
 - [configuration.md](configuration.md) — the config file itself.

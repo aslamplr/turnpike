@@ -8,6 +8,7 @@
 //! interaction is Rust-side. See `docs/desktop.md`.
 
 mod cli_install;
+mod config_edit;
 mod resolve;
 mod settings;
 mod supervisor;
@@ -175,6 +176,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(update::UpdateState::default())
+        .manage(config_edit::EditState::default())
         .invoke_handler(tauri::generate_handler![
             gateway_status,
             gateway_start,
@@ -189,6 +191,13 @@ pub fn run() {
             update_status,
             update_check,
             update_install,
+            config_edit::config_edit_load,
+            config_edit::config_edit_apply,
+            config_edit::config_edit_stage_key,
+            config_edit::config_edit_unstage_key,
+            config_edit::config_edit_save,
+            config_edit::config_edit_discard,
+            config_edit::doctor_view,
         ])
         .setup(|app| {
             // A tray-first app must not also claim a Dock icon and an app menu.

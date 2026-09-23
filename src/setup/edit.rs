@@ -195,6 +195,19 @@ impl Doc {
         Ok(())
     }
 
+    /// Set a scalar on `[search]`, creating the table if absent and preserving
+    /// the line's decor. The search-side twin of `set_provider_scalar`.
+    pub fn set_search_scalar(&mut self, key: &str, value: impl Into<Value>) -> Result<()> {
+        self.ensure_table("search")?;
+        self.set_scalar(&["search"], key, value)
+    }
+
+    /// Drop an inline search key while keeping the comment that introduces it.
+    /// The search-side twin of `remove_provider_inline_key_keeping_comment`.
+    pub fn remove_search_inline_key_keeping_comment(&mut self) -> bool {
+        self.remove_scalar_keeping_comment(&["search"], "api_key")
+    }
+
     /// Parse one provider back out of the document, so the wizard can show a
     /// live view of what it has staged rather than what it read at startup.
     pub fn provider(&self, id: &str) -> Option<ProviderCfg> {

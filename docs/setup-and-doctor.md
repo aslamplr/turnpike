@@ -1,21 +1,27 @@
-# `setup`, `config` and `doctor`: writing, reading and auditing turnpike
+# `setup`, `config`, `config-edit` and `doctor`: writing, reading and auditing turnpike
 
-Three commands, one shared concern. `turnpike setup` writes a config and its
-secrets; `turnpike config` reads them back as a view; `turnpike doctor` reads
-them back and says what is wrong. `setup` and `doctor` share the prompt module
-(`src/setup/prompt.rs`) and the discipline that goes with it, so they share a
-page — and `config` belongs here because it is the same concern, read-only, and
-because it is what the desktop shell consumes.
+Four commands, one shared concern. `turnpike setup` writes a config and its
+secrets; `turnpike config-edit` does the same writing, non-interactively, one
+operation at a time; `turnpike config` reads them back as a view; `turnpike doctor`
+reads them back and says what is wrong. `setup`, `config-edit` and `doctor` share
+the mutation core (`src/setup/edit.rs`, and the `commit_doc` below) and the prompt
+discipline where they prompt at all, so they share a page — and `config` belongs
+here because it is the same concern, read-only, and because it is what the desktop
+shell consumes.
 
 ```text
-turnpike setup  [--config <path>]
-turnpike config [--config <path>] [--json]
-turnpike doctor [--config <path>] [--json] [--live] [--no-live]
+turnpike setup       [--config <path>]
+turnpike config-edit --load [--config <path>]
+turnpike config-edit --op <name> [--config <path>]   # session JSON on stdin and stdout
+turnpike config      [--config <path>] [--json]
+turnpike doctor      [--config <path>] [--json] [--live] [--no-live]
 ```
 
-Neither takes a `--storage` or `--no-validate` flag. There is one secret store
-(encrypted, in `~/.turnpike/` — see [secrets.md](secrets.md)) and no way to
-select a different one at the command line.
+None of them takes a `--storage` flag. There is one secret store (encrypted, in
+`~/.turnpike/` — see [secrets.md](secrets.md)) and no way to select a different one
+at the command line. `config-edit` takes no `--no-validate` either: the flag exists
+on the wizard as a hidden test hook, and the write surface the desktop shell drives
+always runs the gate.
 
 ## `turnpike setup`
 
@@ -45,6 +51,10 @@ Every edit accumulates in one in-memory `toml_edit::DocumentMut` plus a
 exit."** That is what makes "quit without saving" real rather than aspirational,
 gives the whole run a single write point, and reduces partial-failure recovery
 to a question of ordering.
+
+`config-edit` keeps the same shape across process boundaries: the session document
+travels on stdin and stdout, and the writer is only reached by an explicit `save`
+op. See [`turnpike config-edit`](#turnpike-config-edit) below.
 
 ### The menu
 
@@ -155,16 +165,21 @@ reports which provider did not migrate.
 
 ### Commit sequence
 
-Ordered so any failure is recoverable. `commit()` runs after the validation
-gate, which renders the document and reparses it — so what is saved is what was
-checked.
+Ordered so any failure is recoverable. The **validation gate** runs first — it
+renders the document and reparses it — so what is saved is what was checked.
+
+This is one function, `commit_doc(doc, plan, path, store, no_validate)` in
+`src/setup/mod.rs`, and it is the **single write point** in the crate. `WizardState::
+commit` is a one-line call to it, and so is `config-edit`'s `save` op — a second
+copy of this ordering is exactly the drift the shape exists to prevent.
 
 1. **Back up** the current config to `~/.turnpike/backups/<ns>-config.toml`,
    write-once per namespace, and deliberately *outside* the directory being
    written. The earliest snapshot is the pre-turnpike state; a second `setup`
    does not overwrite it with a wizard-written file.
 2. **Write secrets** — create `master.key` on first write, then stage and save
-   `secrets.toml`.
+   `secrets.toml`. A `StoreStatus::Unavailable` is checked **before** this, so a
+   run that cannot write secrets fails up front rather than at the last step.
 3. **Write `config.toml` atomically** — temp file in the same directory, then
    `fs::rename`.
 
@@ -172,6 +187,10 @@ A crash between 2 and 3 leaves secrets with an unchanged config: orphaned but
 harmless. Step 3 is the only critical one, and `rename` makes it all-or-nothing.
 The rename changes the inode, which breaks hardlinks and any editor holding the
 file open; crash safety is worth more, and nothing here promises otherwise.
+
+The inline-key migration's ordering is enforced *inside* this sequence, not around
+it: the `plan.secret_writes` are applied and `store.save()` must return `Ok` before
+the document that strips `api_key` is written.
 
 ### End of run
 
@@ -182,6 +201,94 @@ Next: `turnpike serve`, then `turnpike launch claude-code`.
 
 The handoff **prints** commands. A wizard that silently becomes a server is a
 wizard nobody trusts.
+
+## `turnpike config-edit`
+
+The same writer, non-interactive, one operation at a time. It exists so the
+desktop shell can be a real editor without becoming a second implementation of
+config editing: every op goes through the same `edit::Doc` mutations the wizard
+calls, and `save` goes through the same `commit_doc`. A GUI that wrote a *degraded*
+config — dropped comments, skipped the inline-key migration, reordered the commit —
+would be worse than no GUI, so it does not write config at all; it drives this.
+
+```text
+turnpike config-edit --load [--config <path>]
+turnpike config-edit --op <name> [--config <path>]
+```
+
+It is a filter, and it is deliberately **stateless**. Each invocation reads a
+*session document* on stdin and writes the new one on stdout:
+
+```json
+{ "doc": "<the whole config.toml as text>", "plan": { "writes": {}, "deletes": [] } }
+```
+
+`doc` is raw TOML text — the same thing `Doc::parse` consumes and `Doc::as_str`
+produces. It is the session's state, so it has to cross the process boundary; what
+must *not* cross is a round-trip through `Config`/`toml::Value`, which is the
+operation that deletes every comment. `--load` seeds it: the existing file if there
+is one, else the starter text the wizard starts from in memory, and it **writes
+nothing** — so opening a session is free, and the file appears only on `save`.
+
+The callers hold the session between invocations. The desktop shell's Rust side
+does; there is no lock file, no daemon, no temp session directory, and no state on
+disk between two ops. That is what keeps the write surface a pure function of its
+input and testable without a tty.
+
+### The ops
+
+| Op | Arguments | Through |
+| --- | --- | --- |
+| `add-provider` | `id`, `spec`, `base_url` | `add_provider` |
+| `remove-provider` | `id` | `remove_provider` |
+| `set-provider-key-env` | `id`, `env_var` | `set_provider_key_env` |
+| `add-route` | `id`, `provider`, `model`, … | `add_route` |
+| `remove-route` | `id` | `remove_route` |
+| `set-route` | `id`, `key`, `value` | `set_route_scalar` |
+| `set-strategy` | `id`, `strategy` | `set_strategy` |
+| `add-target` | `id`, `provider`, `model`, … | `add_route_target` |
+| `remove-target` | `id`, `index` | `remove_route_target` |
+| `set-search` | `provider`, … | `set_search` |
+| `stage-key` | `slot`, `value` | `Plan::secret_writes` |
+| `unstage-key` | `slot` | `Plan::secret_deletes` |
+| `save` | — | `commit_doc` |
+
+Every op that changes anything returns the **whole new session**, so a caller never
+reconstructs state and the two sides cannot drift.
+
+Three conventions the callers must respect, all of them the wizard's:
+
+- **`strategy = "static"` is written by removing the key**, not by writing the
+  value (`remove_route_scalar_keeping_comment`).
+- **Target 0 is the route's flat `provider`/`model` and is never written as a
+  `[[routes.<id>.target]]` block.** `add-target` appends to the array (so chain
+  index `i` is array index `i - 1`), `remove-target` takes the **array** index, and
+  changing target 0 is `set-route`, not `remove-target`.
+- **A key's slot is `provider.<id>` or `search.exa`** — the plan key it is staged
+  under, and the only thing a caller ever learns about a staged secret.
+
+### Refusals
+
+A refused op is not an error: it returns `{"error": "..."}` with exit 0 and the
+session **byte-identical**. Refusals are cases where the wizard declines rather
+than producing a config it would not have produced, and the caller is expected to
+show the message rather than work around it:
+
+- a non-`static` strategy on a route with fewer than two targets (`set_strategy`);
+- removing a provider that any route still references — the message names the
+  route ids (`routes_using`).
+
+There is no force-delete. A UI that offered one would be writing a config the
+wizard would not.
+
+### Where a secret lives during a session
+
+A staged key's plaintext is in the session JSON for the life of the session and has
+no op that returns it. A caller that keeps the session in memory — the desktop
+shell does — holds the plaintext, so it must not hand that session back to a
+frontend that renders it. What crosses to the desktop's webview is the *slot list*
+(`staged_keys: ["provider.zen"]`), never a value; see
+[desktop.md](desktop.md#the-redaction-boundary).
 
 ## `turnpike config`
 
@@ -457,6 +564,7 @@ Each command picks a default filter, and `RUST_LOG` still overrides both:
 | Command | Default |
 | --- | --- |
 | `setup`, `doctor` | `warn` |
+| `config-edit` | `warn` |
 | `serve`, `launch`, `routes`, `config` | `info` |
 
 ### The prompt discipline
@@ -470,6 +578,13 @@ prompt-that-never-appears.
 
 `launch::claude_code::confirm` is deliberately *not* part of this: it neither
 flushes nor retries, and that is `launch`'s UX, not the wizard's.
+
+`config-edit` prompts for nothing — every op arrives as arguments and a session on
+stdin — so it is not a second writer to stdout either. It shares the discipline in
+the negative direction that matters most: **its JSON reply goes to stdout and
+everything else through `tracing`**, which is why `src/main.rs` puts
+`Commands::ConfigEdit(_)` in the same `"warn"` arm as `Setup` and `Doctor`. An
+`INFO` on stdout would be spliced into the JSON the desktop side parses.
 
 `ask_secret` turns terminal echo off via `libc::tcgetattr`/`tcsetattr` on Unix,
 restoring it on `Drop`. When the terminal cannot be switched — a redirected
@@ -486,6 +601,13 @@ never a mutated `HOME`). `ScriptedPrompt` queues answers and records everything
 **asked**, so a test can assert the wizard asked the right question, not merely
 that it produced the right file.
 
+`config-edit` is tested the same way, driving both writers over one script of
+edits and comparing the resulting `config.toml` **byte for byte**
+(`wizard_and_cli_produce_the_same_bytes`). That is the test that makes "the UI is
+the same writer" a fact rather than an intention: a divergence fails here, not in
+a window nobody can assert on. The op layer has no environment mutation either —
+`TURNPIKE_HOME` points at a temp root.
+
 ## See also
 
 - [secrets.md](secrets.md) — the store both commands read and write.
@@ -493,4 +615,4 @@ that it produced the right file.
 - [launchers.md](launchers.md) — `turnpike launch`, invoked at the end of the
   setup handoff.
 - [desktop.md](desktop.md) — the desktop shell, which consumes
-  `turnpike config --json`.
+  `turnpike config --json` and drives `turnpike config-edit`.

@@ -7,6 +7,7 @@
 //! Desktop (configLibrary gateway profile) to use the gateway.
 
 mod config;
+mod config_edit;
 mod doctor;
 mod launch;
 mod proxy;
@@ -90,6 +91,12 @@ enum Commands {
     Setup(SetupArgs),
     /// Check the config, the secret store, and (with --live) the providers.
     Doctor(DoctorArgs),
+    /// Apply one edit to a config session on stdin, and print the new session.
+    ///
+    /// The non-interactive twin of `setup`, for the desktop shell: it holds the
+    /// session between clicks and never parses the document itself. See
+    /// `src/setup/cli.rs`.
+    ConfigEdit(config_edit::ConfigEditArgs),
 }
 
 #[derive(clap::Args)]
@@ -175,6 +182,7 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        Commands::ConfigEdit(args) => config_edit::run(args),
     }
 }
 
@@ -193,12 +201,14 @@ fn init_tracing(command: &Commands) {
         .init();
 }
 
-/// `warn` for the two commands that own stdout: a wizard sharing its descriptor
-/// with an `INFO` from the search manager is a wizard that looks broken, and
-/// `doctor`'s report is the output, not the log. `RUST_LOG` still overrides both.
+/// `warn` for the commands that own stdout: a wizard sharing its descriptor
+/// with an `INFO` from the search manager is a wizard that looks broken,
+/// `doctor`'s report is the output not the log, and `config-edit`'s stdout is
+/// JSON the desktop shell parses — an `INFO` interleaved with it is a session it
+/// cannot read. `RUST_LOG` still overrides all three.
 fn default_log_filter(command: &Commands) -> &'static str {
     match command {
-        Commands::Setup(_) | Commands::Doctor(_) => "warn",
+        Commands::Setup(_) | Commands::Doctor(_) | Commands::ConfigEdit(_) => "warn",
         Commands::Serve { .. }
         | Commands::Launch { .. }
         | Commands::Routes { .. }

@@ -141,7 +141,10 @@ pub async fn load() -> SettingsPayload {
 
 /// `anyhow`'s bail out of `main` prints as `Error: <message>` on the last line,
 /// which is the one worth showing.
-fn message_from_stderr(stderr: &[u8]) -> String {
+///
+/// Shared with `config_edit`: a `config-edit` failure is the same `anyhow` bail
+/// out of `main`, so it reads the same way in the window.
+pub(crate) fn message_from_stderr(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     let line = text
         .lines()

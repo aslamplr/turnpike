@@ -285,6 +285,69 @@ td.num {
   color: var(--bad);
 }
 
+/* ---- the config editor ---- */
+
+/* A quiet button: the row actions that are not the row's point. */
+button.ghost {
+  background: none;
+  color: var(--ink-dim);
+}
+
+button.ghost:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--ink);
+}
+
+/* A destructive action, named in its tone but not filled — the click that
+   removes a provider should not look like the click that saves one. */
+button.bad {
+  color: var(--bad);
+}
+
+/* The editor's field grid, shared by every panel so the labels line up. */
+.edit-fields {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 12px;
+  align-items: center;
+}
+
+.edit-fields > label {
+  color: var(--ink-dim);
+}
+
+.edit-fields input,
+.edit-fields select {
+  font: inherit;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 3px 7px;
+  min-width: 0;
+}
+
+.edit-fields select:disabled,
+.edit-fields input:disabled {
+  color: var(--ink-dim);
+  background: var(--panel-2);
+}
+
+/* A refusal or a failure, in the CLI's own words. */
+.refusal {
+  color: var(--bad);
+  white-space: pre-wrap;
+}
+
+/* A panel's bar: a line of buttons over a message, flush to the panel edges. */
+.pad.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .sub {
   color: var(--ink-dim);
   font-size: 12px;
