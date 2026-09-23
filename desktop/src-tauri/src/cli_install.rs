@@ -3,14 +3,27 @@
 //! A desktop-only install dead-ends: `resolve_binary()` finds nothing, the
 //! supervisor reports `could not find the \`turnpike\` binary`, and there is no
 //! in-app way forward. This module is that way forward — it reports whether a CLI
-//! is usable, and installs the bundled one where `install.sh` / `install.ps1`
-//! already put it, so an in-app install and a shell install cannot land in two
-//! places and leave two CLIs competing on PATH.
+//! is usable, and installs one where `install.sh` / `install.ps1` already put it,
+//! so an in-app install and a shell install cannot land in two places and leave
+//! two CLIs competing on PATH.
+//!
+//! **macOS installs by downloading; Windows installs the bundled payload.**
+//! Installing the bundled copy on macOS produced a binary the code-signing
+//! monitor SIGKILLed at dyld load (`CODESIGNING` / `Invalid Page`), and stripping
+//! the attribute at install time did not prevent it. `com.apple.quarantine` is
+//! applied by Launch Services to files written by a *quarantine-eligible* process
+//! — one that was itself downloaded — so an app writing its own payload marks the
+//! result, and `fs::copy` carries the source's mark across besides. `curl` is not
+//! such a process, so a download it performs lands unmarked; that is why
+//! `install.sh` has always worked. macOS therefore shells out to `curl`, the same
+//! way the script does, and the bundle keeps its payload only as the Windows
+//! source. See `download_for_macos`.
 //!
 //! The decision (`classify`) and the PATH arithmetic (`normalize`,
 //! `path_has_entry`, `path_with_entry`) are pure and platform-independent, so
-//! they are table-testable on any host. Only the version probe, the file copy,
-//! the macOS xattr call and the Windows registry write touch the machine.
+//! they are table-testable on any host. Only the version probe, the download, the
+//! file copy, the macOS xattr call and the Windows registry write touch the
+//! machine.
 
 use std::path::{Path, PathBuf};
 
@@ -182,10 +195,14 @@ fn probe_version(bin: &Path) -> Option<String> {
 /// Copy `payload` to `target`, make it runnable there, and report the directory it
 /// landed in.
 ///
+/// The Windows install path. Unused on macOS — which downloads instead, see the
+/// module docs — so it is gated rather than left to trip `-D dead-code`.
+///
 /// Both paths are parameters rather than read from the environment, so this half
 /// is exercisable against a temporary directory. That matters: `install` writes to
 /// the user's real install dir, which on a machine that already has a `turnpike`
 /// there would overwrite it — not something a test may do.
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn install_payload(payload: &Path, target: &Path) -> Result<PathBuf, String> {
     let dir = target
         .parent()
@@ -201,16 +218,180 @@ pub fn install_payload(payload: &Path, target: &Path) -> Result<PathBuf, String>
     Ok(dir.to_path_buf())
 }
 
-/// Install the bundled payload, then report the status afterwards.
+/// The release this app installs from: its own version, since the app ships the
+/// CLI built from the same tag and CI's drift check keeps the numbers agreeing.
+const RELEASE_TAG: &str = env!("CARGO_PKG_VERSION");
+
+/// The repository the CLI is published from — the same one `install.sh` names.
+const REPO: &str = "aslamplr/turnpike";
+
+/// Install a CLI, then report the status afterwards.
+///
+/// Two sources, one per platform. macOS downloads (see the module docs for why the
+/// bundled copy cannot be used there); Windows copies the bundled payload, since
+/// the quarantine mechanism is macOS-only and the artifact download is not a
+/// consideration.
 pub fn install(resource_dir: Option<&Path>) -> Result<Installed, String> {
-    let payload = resolve::bundled_payload(resource_dir)
-        .ok_or_else(|| "this bundle carries no turnpike binary to install".to_string())?;
-    let dir = install_payload(&payload, &resolve::install_target())?;
+    #[cfg(target_os = "macos")]
+    let dir = download_for_macos(&resolve::install_target())?;
+
+    #[cfg(not(target_os = "macos"))]
+    let dir = {
+        let payload = resolve::bundled_payload(resource_dir)
+            .ok_or_else(|| "this bundle carries no turnpike binary to install".to_string())?;
+        install_payload(&payload, &resolve::install_target())?
+    };
 
     Ok(Installed {
         status: status(resource_dir),
         note: register_on_path(&dir)?,
     })
+}
+
+/// Download the CLI from the latest release with `curl` and install it, the way
+/// `install.sh` does.
+///
+/// Shelling out to `curl` rather than downloading in-process is the point, not a
+/// shortcut: `com.apple.quarantine` is applied by Launch Services when a
+/// quarantine-eligible process — one that was itself downloaded — writes a file
+/// from network data, so an in-process `reqwest` download would mark the result
+/// and reproduce the very crash this exists to avoid. `curl` is not eligible, so
+/// what it writes is unmarked. The same reasoning is why `install.sh` works on a
+/// machine where the in-app install did not.
+///
+/// `curl` and `tar` are used rather than reimplementing HTTP and gzip: both ship
+/// with macOS, and the pipeline mirrors `install.sh` line for line, so the two
+/// install paths cannot drift.
+#[cfg(target_os = "macos")]
+fn download_for_macos(target: &Path) -> Result<PathBuf, String> {
+    let dir = target
+        .parent()
+        .ok_or_else(|| format!("{}: no parent directory", target.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+
+    let asset = macos_asset();
+    let base = format!("https://github.com/{REPO}/releases/download/v{RELEASE_TAG}");
+
+    let tmp = std::env::temp_dir().join(format!("turnpike-install-{}", std::process::id()));
+    std::fs::remove_dir_all(&tmp).ok();
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+
+    let result = fetch_and_unpack(&base, &asset, &tmp, target, dir);
+    std::fs::remove_dir_all(&tmp).ok();
+    result
+}
+
+/// The macOS asset name for this machine's architecture.
+///
+/// `install.sh` only ever installs on Apple Silicon; an Intel Mac has no published
+/// asset, so it is refused rather than handed a broken URL. The name is composed
+/// here rather than read from `install.sh`, which is not shipped in the bundle.
+#[cfg(target_os = "macos")]
+fn macos_asset() -> String {
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    format!("turnpike-{arch}-apple-darwin.tar.gz")
+}
+
+/// The download, checksum, unpack and install steps, with the temp dir left to the
+/// caller to clean up.
+#[cfg(target_os = "macos")]
+fn fetch_and_unpack(
+    base: &str,
+    asset: &str,
+    tmp: &Path,
+    target: &Path,
+    dir: &Path,
+) -> Result<PathBuf, String> {
+    run_curl(&format!("{base}/{asset}"), &tmp.join(asset))?;
+    run_curl(&format!("{base}/SHA256SUMS"), &tmp.join("SHA256SUMS"))?;
+
+    // Verified the way `install.sh` does, and for the same reason: an install
+    // button that fetches a binary off the network must check it against the
+    // published digest, or it is a downgrade in trust over the shell script.
+    verify_checksum(tmp, asset)?;
+
+    let status = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(tmp.join(asset))
+        .arg("-C")
+        .arg(tmp)
+        .status()
+        .map_err(|e| format!("running tar: {e}"))?;
+    if !status.success() {
+        return Err(format!("tar failed on {asset} with {status}"));
+    }
+
+    // `install -m 0755`, as the script does: the archive's own mode is not trusted,
+    // and `resolve_binary` requires the exec bit.
+    let extracted = tmp.join(resolve::BIN);
+    std::fs::copy(&extracted, target)
+        .map_err(|e| format!("{} → {}: {e}", extracted.display(), target.display()))?;
+    make_executable(target)?;
+
+    Ok(dir.to_path_buf())
+}
+
+/// `curl -fsSL <url> -o <dest>` — the flags `install.sh` passes, for the same
+/// reasons: `-f` turns an HTTP error into a non-zero exit rather than a saved
+/// error page, and `-L` follows the redirect to the release asset.
+#[cfg(target_os = "macos")]
+fn run_curl(url: &str, dest: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("curl")
+        .args(["-fsSL", url, "-o"])
+        .arg(dest)
+        .output()
+        .map_err(|e| format!("running curl: {e}"))?;
+    if !out.status.success() {
+        // curl's stderr is the useful part — "404" and "Could not resolve host" are
+        // different problems for the user.
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim();
+        return Err(if err.is_empty() {
+            format!("curl {url} failed with {}", out.status)
+        } else {
+            format!("curl {url} failed: {err}")
+        });
+    }
+    Ok(())
+}
+
+/// Check the downloaded archive against the published `SHA256SUMS`.
+///
+/// `shasum -a 256 -c` is used rather than hashing in-process so the verification is
+/// the same code path `install.sh` runs — one implementation of the trust check,
+/// not two that can disagree.
+#[cfg(target_os = "macos")]
+fn verify_checksum(tmp: &Path, asset: &str) -> Result<(), String> {
+    // The manifest lists both platforms' assets; the pattern picks out this one,
+    // exactly as the script's `grep -E "[[:space:]]$ASSET$"` does.
+    let manifest = std::fs::read_to_string(tmp.join("SHA256SUMS"))
+        .map_err(|e| format!("reading SHA256SUMS: {e}"))?;
+    let line = manifest
+        .lines()
+        .find(|l| l.split_whitespace().last() == Some(asset))
+        .ok_or_else(|| format!("SHA256SUMS has no entry for {asset}"))?;
+
+    let sums = tmp.join("SHA256SUMS.one");
+    std::fs::write(&sums, format!("{line}\n")).map_err(|e| format!("{}: {e}", sums.display()))?;
+
+    let out = std::process::Command::new("shasum")
+        .args(["-a", "256", "-c"])
+        .arg(&sums)
+        .current_dir(tmp)
+        .output()
+        .map_err(|e| format!("running shasum: {e}"))?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stdout);
+        return Err(format!(
+            "the downloaded {asset} does not match its published checksum: {}",
+            msg.trim()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
