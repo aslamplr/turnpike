@@ -13,6 +13,8 @@
     search,
     stagedKeys,
     busy,
+    changed,
+    searchChanged,
     onAdd,
     onRemove,
     onKeyEnv,
@@ -26,6 +28,14 @@
     search: SearchView | null;
     stagedKeys: string[];
     busy: boolean;
+    /// Whether this panel is holding an unsaved edit. A panel, not a row: one op
+    /// can touch several document keys (`set-provider-key-env` writes
+    /// `api_key_env` *and* strips an inline key), so anything finer would be a
+    /// claim the window cannot back. `settings.svelte` owns the answer.
+    changed: boolean;
+    /// The same, for the `[search]` heading. A sibling panel inside this
+    /// component, so it needs its own flag rather than a second component.
+    searchChanged: boolean;
     onAdd: (id: string, spec: string, baseUrl: string) => Promise<void>;
     onRemove: (id: string) => Promise<void>;
     onKeyEnv: (id: string, envVar: string) => Promise<void>;
@@ -85,7 +95,10 @@
 {/if}
 
 <div class="panel">
-  <h2>Providers</h2>
+  <h2>
+    Providers
+    {#if changed}<span class="badge warn">unsaved</span>{/if}
+  </h2>
 
   {#if providers.length === 0}
     <div class="empty">None configured. A route cannot point anywhere without one.</div>
@@ -186,7 +199,10 @@
 </div>
 
 <div class="panel">
-  <h2>Search</h2>
+  <h2>
+    Search
+    {#if searchChanged}<span class="badge warn">unsaved</span>{/if}
+  </h2>
   {#if !search}
     <div class="empty">
       Off — server tools are stripped from bridged requests. Adding it needs an

@@ -403,7 +403,10 @@ Two tabs. **Settings** is an editor; **Logs** is a reader.
 
 A gateway summary (listen, route count, provider count, search on/off, the resolved
 config path) above three editable groups — providers, routes, and search — and a
-read-only Doctor panel at the foot.
+read-only Doctor panel at the foot. `[search]` is the third group for the bar's
+purposes even though it renders as a sibling heading inside `Providers.svelte`: its
+key slot is the fixed literal `search.exa`, so its edits are attributable to it and
+to nothing else.
 
 **Nothing is written until Save.** The window holds a *session*, not the file: the
 staged document lives as an opaque TOML string on the Rust side
@@ -411,6 +414,35 @@ staged document lives as an opaque TOML string on the Rust side
 one `commit_doc`; Discard forgets the session and re-seeds from the unchanged file.
 The bar between them says which state you are in, and Save is disabled while no edit
 is pending.
+
+**The bar names the panels holding the edit**, and each named panel's heading carries
+an `unsaved` badge. `dirty` alone could only say "somewhere", so a user who scrolled
+past the edit had no way back to it short of reading every row — and Discard, the one
+escape, throws away the edits they *did* mean. The window already knows which ops it
+sent, so the attribution rides on the seam that sends them: `apply(op, args, panel)`
+names a panel, `stageKey` derives one from the slot it staged, and both set `touched`
+(the set, not a log) on their success path beside `dirty`. The bar reads
+`PANELS.filter(...)` so three provider edits then a route edit say `Providers, Routes`
+— screen order, never arrival order. One helper, `reloaded()`, clears `dirty` and
+`touched` together on every path that re-seeds the session from the file (load, save,
+discard), the same way `take()` is the one place a payload lands: a marker surviving a
+document that was just re-read would point at an edit that no longer exists.
+
+**The attribution stops at the panel, deliberately.** It is not per-row and not
+per-field, because neither claim can be backed from this side of the boundary — and a
+marker that guesses is worse than one that says less. One op can touch several
+document keys (`set-provider-key-env` writes `api_key_env` *and* strips an inline key);
+a single `Edit details` submit is two round trips (`display_name`, `context_tokens`,
+each its own `set-route`); emptying an optional is a *deletion* rather than a change
+to a value; and a redacted view cannot see a change to a key *value* at all.
+`config_edit.rs`'s module doc is the boundary — `doc` is never parsed, rendered or
+diffed here — so a finer marker would be a guess dressed as a fact, and the op's own
+name is the level at which the sentence is true.
+
+The marker is a badge, not a new signal: `.badge.warn` already means "worth a look,
+not an error" everywhere else in this window. Because `[search]` is a third panel
+rendering inside `Providers.svelte` rather than as its own component, it takes its
+own `searchChanged` flag beside `changed` — one component, two headings, two flags.
 
 - **Providers** — add, remove, and the wizard's exact three key homes: name an env
   var (which also strips any inline key, one edit), paste a key (staged into the
@@ -737,10 +769,13 @@ a suite starts passing for the wrong reason.
 Covered today, six suites: `kit.svelte`'s `keyTone`/`windows` and the shape of the
 `noAutofill` opt-out every editor field spreads; `Doctor.svelte`'s `notable` filter
 and its fail/warn tallies; `Routes.svelte`'s strategy gate, the `i - 1` array index
-its remove buttons send, and a `noAutofill` assertion per text field; `Settings.svelte`'s
-session lifecycle — the `dirty`-only-on-success rule (a refusal arrives as a thrown
-string and must not light up Save), the `config_edit_apply` op/args wire shape,
-and the save and discard paths; `Providers.svelte`'s three key homes, the slot each
+its remove buttons send, and a `noAutofill` assertion per text field; each panel's
+`unsaved` marker rendering from its own flag and not its sibling's; `Settings.svelte`'s
+session lifecycle — the `dirty`-and-`touched`-only-on-success rule (a refusal arrives
+as a thrown string and must not light up Save), the `config_edit_apply` op/args wire
+shape, the save and discard paths, and which panel each op is attributed to (including
+the ordering rule: the bar reads `Providers, Routes` off the panel list, never off the
+order the edits arrived in); `Providers.svelte`'s three key homes, the slot each
 one files under (`provider.<id>`, and the literal `search.exa`), and the same
 `noAutofill` assertion per text field; and `App.svelte`'s two banners and the status
 bar. Edits are driven by the click a user makes, not by calling a panel's internals,

@@ -22,6 +22,7 @@
     routes,
     providers,
     busy,
+    changed,
     onAdd,
     onRemove,
     onSetScalar,
@@ -33,6 +34,11 @@
     routes: RouteView[];
     providers: ProviderView[];
     busy: boolean;
+    /// Whether this panel is holding an unsaved edit. A panel, not a row: one op
+    /// can touch several document keys, and a single `Edit details` submit sends
+    /// two (`display_name`, `context_tokens`), so a per-row marker would claim
+    /// more than the window knows. `Settings.svelte` owns the answer.
+    changed: boolean;
     onAdd: (args: Record<string, unknown>) => Promise<void>;
     onRemove: (id: string) => Promise<void>;
     onSetScalar: (id: string, key: string, value: string | null) => Promise<void>;
@@ -118,7 +124,10 @@
 {/if}
 
 <div class="panel">
-  <h2>Routes</h2>
+  <h2>
+    Routes
+    {#if changed}<span class="badge warn">unsaved</span>{/if}
+  </h2>
 
   {#if routes.length === 0}
     <div class="empty">None configured. Nothing can resolve a model without one.</div>

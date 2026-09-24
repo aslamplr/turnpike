@@ -12,6 +12,12 @@
   import Providers from "./config/Providers.svelte";
   import Routes from "./config/Routes.svelte";
 
+  /// The three panels that can hold an edit, in the order they appear on
+  /// screen. The heading markers and the bar's sentence both read this list, so
+  /// the two cannot disagree about spelling or order.
+  const PANELS = ["Providers", "Search", "Routes"] as const;
+  type Panel = (typeof PANELS)[number];
+
   /// The staged session, and everything the window knows about it.
   ///
   /// `session` is the opaque id the Rust side holds; the *document* never comes
@@ -23,6 +29,13 @@
   let payload = $state<SettingsPayload | null>(null);
   let checks = $state<CheckView[]>([]);
   let dirty = $state(false);
+  /// Which panels are holding an edit, so the window can say *where* rather than
+  /// only *that*. A panel, never a row or a field: one op can touch several
+  /// document keys (`set-provider-key-env` writes `api_key_env` *and* strips an
+  /// inline key) and the redacted view cannot see a key *value* change at all, so
+  /// anything finer would be a guess. The op's own name is the level at which the
+  /// claim is true.
+  let touched = $state<Panel[]>([]);
   let busy = $state(false);
   /// The slots a key is staged for, never values. Kept beside `payload` rather
   /// than derived from it: `staged_keys` is a sibling of `view` on the session
@@ -41,6 +54,44 @@
     p && p.kind === "view" ? p.view : null;
 
   const v = $derived(view(payload));
+
+  /// The panels holding an edit, in `PANELS` order and deduped.
+  ///
+  /// Derived from the set, not from arrival order: three provider edits then a
+  /// route edit must read `Providers, Routes`, not `Routes, Providers`.
+  const touchedList = $derived(PANELS.filter((p) => touched.includes(p)));
+
+  /// The bar's first sentence. Naming the panels is the whole point: `dirty` and
+  /// `touched` are set on the same success path and cleared by the same
+  /// `reloaded()`, so a dirty session always has at least one panel to name and
+  /// there is no bare-sentence case to fall back to — `mark` is what makes the
+  /// sentence specific, and nothing can set `dirty` without it.
+  const status = $derived(
+    !dirty
+      ? "No unsaved changes."
+      : `Unsaved changes in ${touchedList.join(", ")}.`,
+  );
+
+  /// Remember that a panel is holding an edit.
+  ///
+  /// Append-only: nothing unmarks here, because the only thing that clears a
+  /// marker is a reload — see `reloaded()`.
+  function mark(panel: Panel) {
+    if (!touched.includes(panel)) touched = [...touched, panel];
+  }
+
+  /// Every path that re-seeds the session from the file — load, save, discard —
+  /// lands here. A marker surviving a document that was just re-read would be a
+  /// claim about an edit that no longer exists.
+  function reloaded() {
+    dirty = false;
+    touched = [];
+  }
+
+  /// Which panel a staged slot belongs to. The slot names it: `provider.zen` is
+  /// Providers, the fixed literal `search.exa` is Search.
+  const panelForSlot = (slot: string): Panel =>
+    slot.startsWith("search.") ? "Search" : "Providers";
 
   /// One place the whole session payload lands, so `view` and `staged_keys`
   /// cannot be updated out of step with each other.
@@ -65,7 +116,7 @@
     } catch (e) {
       payload = { kind: "error", message: String(e) };
     } finally {
-      dirty = false;
+      reloaded();
       busy = false;
     }
   }
@@ -87,7 +138,12 @@
   /// leaves the session untouched — so `dirty` is only set on the path that
   /// actually changed something. That distinction is the reason this is one
   /// helper rather than a `try` in each handler.
-  async function apply(op: string, args: Record<string, unknown>) {
+  ///
+  /// `panel` is the panel the op belongs to, which is the finest claim this side
+  /// can honestly make: one op may touch several document keys (`set-provider-
+  /// key-env` writes `api_key_env` *and* strips an inline key) and the view it
+  /// gets back is redacted, so a per-row attribution would be a guess.
+  async function apply(op: string, args: Record<string, unknown>, panel: Panel) {
     if (!session) return;
     busy = true;
     problem = null;
@@ -95,6 +151,7 @@
       const next = await api.configEditApply(session, op, args);
       take(next);
       dirty = true;
+      mark(panel);
     } catch (e) {
       problem = String(e);
     } finally {
@@ -110,6 +167,7 @@
       const next = await api.configEditStageKey(session, slot, value);
       take(next);
       dirty = true;
+      mark(panelForSlot(slot));
     } catch (e) {
       problem = String(e);
     } finally {
@@ -139,7 +197,7 @@
       const outcome = await api.configEditSave(session);
       if (outcome.kind === "saved") {
         take(outcome.session);
-        dirty = false;
+        reloaded();
         await refreshDoctor();
       } else {
         // `refused` and `error` read the same to the user: the CLI said no and
@@ -159,7 +217,7 @@
     if (!session) return;
     const old = session;
     session = null;
-    dirty = false;
+    reloaded();
     problem = null;
     try {
       await api.configEditDiscard(old);
@@ -170,34 +228,40 @@
   }
 
   // --- op shims: the panels speak the CLI's argument names, nothing more ---
+  //
+  // Each one names its own panel, which is what the heading markers and the
+  // bar's sentence read. The op table is fixed, so this mapping is total.
 
   const addProvider = (id: string, spec: string, baseUrl: string) =>
-    apply("add-provider", { id, spec, base_url: baseUrl });
+    apply("add-provider", { id, spec, base_url: baseUrl }, "Providers");
 
-  const removeProvider = (id: string) => apply("remove-provider", { id });
+  const removeProvider = (id: string) =>
+    apply("remove-provider", { id }, "Providers");
 
   /// Naming an env var also strips any inline key, in the one edit the CLI has.
   const setKeyEnv = (id: string, envVar: string) =>
-    apply("set-provider-key-env", { id, env_var: envVar });
+    apply("set-provider-key-env", { id, env_var: envVar }, "Providers");
 
   const setRouteScalar = (id: string, key: string, value: string | null) =>
-    apply("set-route", { id, key, value });
+    apply("set-route", { id, key, value }, "Routes");
 
   const setStrategy = (id: string, strategy: string) =>
-    apply("set-strategy", { id, strategy });
+    apply("set-strategy", { id, strategy }, "Routes");
 
   const addTarget = (id: string, args: Record<string, unknown>) =>
-    apply("add-target", { id, ...args });
+    apply("add-target", { id, ...args }, "Routes");
 
   /// The **array** index: the chain's target 0 is the route's flat
   /// provider/model and is not in the array, so chain index `i` is array `i-1`.
   const removeTarget = (id: string, index: number) =>
-    apply("remove-target", { id, index });
+    apply("remove-target", { id, index }, "Routes");
 
+  /// `[search]` has no provider id, so both of its edits are the same op.
   const setSearch = (args: Record<string, unknown>) =>
-    apply("set-search", args);
+    apply("set-search", args, "Search");
 
-  const addSearch = (provider: string) => apply("set-search", { provider });
+  const addSearch = (provider: string) =>
+    apply("set-search", { provider }, "Search");
 </script>
 
 <div class="panel">
@@ -242,7 +306,7 @@
   <div class="panel">
     <div class="pad bar">
       <span class="sub">
-        {dirty ? "Unsaved changes." : "No unsaved changes."}
+        {status}
         Nothing is written until you save.
       </span>
       <div class="actions">
@@ -257,6 +321,8 @@
     search={v.search}
     {stagedKeys}
     {busy}
+    changed={touched.includes("Providers")}
+    searchChanged={touched.includes("Search")}
     onAdd={addProvider}
     onRemove={removeProvider}
     onKeyEnv={setKeyEnv}
@@ -271,8 +337,9 @@
     routes={v.routes}
     providers={v.providers as ProviderView[]}
     {busy}
-    onAdd={(args) => apply("add-route", args)}
-    onRemove={(id) => apply("remove-route", { id })}
+    changed={touched.includes("Routes")}
+    onAdd={(args) => apply("add-route", args, "Routes")}
+    onRemove={(id) => apply("remove-route", { id }, "Routes")}
     onSetScalar={setRouteScalar}
     onStrategy={setStrategy}
     onAddTarget={addTarget}

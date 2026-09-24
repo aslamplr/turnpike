@@ -40,6 +40,8 @@ function mount(
     search?: SearchView | null;
     stagedKeys?: string[];
     busy?: boolean;
+    changed?: boolean;
+    searchChanged?: boolean;
     error?: string | null;
   } = {},
   handlers: Partial<Record<string, unknown>> = {},
@@ -50,6 +52,8 @@ function mount(
       search: null,
       stagedKeys: [],
       busy: false,
+      changed: false,
+      searchChanged: false,
       error: null,
       onAdd: async () => {},
       onRemove: async () => {},
@@ -179,6 +183,33 @@ describe("Providers — the three key homes", () => {
     await userEvent.type(screen.getByLabelText("value"), "   ");
     expect(submit).toBeDisabled();
     expect(seen).toEqual([]);
+  });
+});
+
+/// The `unsaved` marker is the one thing in this panel that is driven by the
+/// parent's state rather than the panel's own, so both directions get pinned:
+/// the flag renders a marker on *its own* heading and no other, and its absence
+/// renders nothing. Read off the `h2`, because the `[search]` row already
+/// carries a `staged` badge in the same style — a bare `getByText("unsaved")`
+/// could not tell the panel heading from that row.
+describe("Providers — the unsaved marker", () => {
+  it("marks the Providers heading when the parent says so", () => {
+    mount({ providers: [provider()], changed: true });
+    expect(screen.getByRole("heading", { name: /Providers unsaved/ })).toBeInTheDocument();
+    // `changed` is the *Providers* flag and must not reach the sibling heading:
+    // the two panels share a component, so crossing the wires is one keystroke.
+    expect(screen.queryByRole("heading", { name: /Search unsaved/ })).not.toBeInTheDocument();
+  });
+
+  it("marks the Search heading off its own flag, not Providers'", () => {
+    mount({ search: search(), searchChanged: true });
+    expect(screen.getByRole("heading", { name: /Search unsaved/ })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /Providers unsaved/ })).not.toBeInTheDocument();
+  });
+
+  it("marks neither heading when nothing is unsaved", () => {
+    mount({ providers: [provider()], search: search() });
+    expect(screen.queryByRole("heading", { name: /unsaved/ })).not.toBeInTheDocument();
   });
 });
 

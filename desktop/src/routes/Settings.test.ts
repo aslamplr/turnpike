@@ -3,7 +3,14 @@ import { render, screen, waitFor } from "@testing-library/svelte";
 import { userEvent } from "@testing-library/user-event";
 import { callCount, fake, lastCall } from "../test/tauri";
 import Settings from "./Settings.svelte";
-import type { CheckView, ConfigView, RouteView, SessionPayload } from "../lib/types";
+import type {
+  CheckView,
+  ConfigView,
+  ProviderView,
+  RouteView,
+  SearchView,
+  SessionPayload,
+} from "../lib/types";
 
 /// The session lifecycle, which is the whole reason this component exists.
 ///
@@ -37,6 +44,24 @@ const route = (over: Partial<RouteView> = {}): RouteView => ({
   ...over,
 });
 
+const provider = (over: Partial<ProviderView> = {}): ProviderView => ({
+  id: "zen",
+  spec: "anthropic",
+  base_url: "https://opencode.ai/zen",
+  api_key_env: null,
+  extra_header_names: [],
+  key: { tier: "env OPENCODE_API_KEY", missing: false },
+  ...over,
+});
+
+const searchView = (over: Partial<SearchView> = {}): SearchView => ({
+  provider: "exa",
+  base_url: "https://api.exa.ai",
+  max_loops: 5,
+  key: { tier: "env EXA_API_KEY", missing: false },
+  ...over,
+});
+
 const session = (over: Partial<SessionPayload> = {}): SessionPayload => ({
   id: "s1",
   view: { kind: "view", view: configView({ routes: [route()] }) },
@@ -66,13 +91,25 @@ const saveButton = () => screen.getByRole("button", { name: "Save" });
 const discardButton = () => screen.getByRole("button", { name: "Discard changes" });
 
 /// The status line is a single `<span>` carrying both sentences
-/// (`{dirty ? … } Nothing is written until you save.`), and its ancestors hold
-/// the same prefix, so a substring match would hit several elements. Anchor on
-/// the span's full text, which is the one thing only it has.
+/// (`{status} Nothing is written until you save.`), and its ancestors hold the
+/// same prefix, so a substring match would hit several elements. Anchor on the
+/// span's full text, which is the one thing only it has.
+///
+/// `dirtyLine` takes the panel clause verbatim, because the first sentence names
+/// the panels holding the edit — `Unsaved changes in Providers.` — and a helper
+/// that hard-coded one panel name would pass while the attribution was wrong.
 const clean = () =>
   screen.getByText(/^No unsaved changes\. Nothing is written until you save\.$/);
-const dirtyLine = () =>
-  screen.getByText(/^Unsaved changes\. Nothing is written until you save\.$/);
+const dirtyLine = (panels: string) =>
+  screen.getByText(
+    new RegExp(`^Unsaved changes${panels}[^.]*\\. Nothing is written until you save\\.$`),
+  );
+
+/// The heading marker, as rendered. Read off the `h2` rather than a bare
+/// `getByText("unsaved")`, because `[search]`'s row already carries a `staged`
+/// badge in the same style — a panel-scoped query is what keeps the two apart.
+const marked = (panel: string) =>
+  screen.getByRole("heading", { name: new RegExp(`${panel} unsaved`) });
 
 describe("Settings — the first load", () => {
   it("seeds a session and leaves everything clean", async () => {
@@ -127,9 +164,154 @@ describe("Settings — an edit that succeeds", () => {
       op: "remove-route",
       args: { id: "claude-sonnet-5" },
     });
-    await waitFor(() => expect(dirtyLine()).toBeInTheDocument());
+    await waitFor(() => expect(dirtyLine(" in Routes")).toBeInTheDocument());
     expect(saveButton()).toBeEnabled();
     expect(discardButton()).toBeEnabled();
+  });
+});
+
+/// The whole point of the attribution: `dirty` alone can only say "somewhere",
+/// and a user who scrolled past the edit has no way back to it. Every test here
+/// drives a real click, so the panel name travels the shim → `apply` → `mark`
+/// path the user's click does.
+describe("Settings — which panel is holding the edit", () => {
+  it("marks the panel whose op ran, and only that one", async () => {
+    await mount();
+    fake("config_edit_apply", () => session());
+
+    await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
+
+    await waitFor(() => expect(marked("Routes")).toBeInTheDocument());
+    expect(screen.queryByRole("heading", { name: /Providers unsaved/ })).not.toBeInTheDocument();
+    expect(dirtyLine(" in Routes")).toBeInTheDocument();
+  });
+
+  it("names the panels in screen order, not the order they were edited", async () => {
+    // Both panels stocked, and — the part that matters — the *same* session
+    // handed back by `apply`. A bare `session()` here would re-seed the view
+    // without the provider and the Providers `Remove` below would vanish from
+    // under the test.
+    const seeded = session({
+      view: {
+        kind: "view",
+        view: configView({ providers: [provider()], routes: [route()] }),
+      },
+    });
+    await mount(seeded);
+    fake("config_edit_apply", () => seeded);
+
+    // Routes first, then Providers — the reverse of the order they render in.
+    // `Remove` is unambiguous against this fixture: the one route has a single
+    // target, and target 0 renders no remove button at all, so the only button
+    // by that name is the provider's.
+    await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
+    await waitFor(() => expect(marked("Routes")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(marked("Providers")).toBeInTheDocument());
+
+    // `PANELS.filter(...)`, not an append log: a join over arrival order would
+    // read `Routes, Providers` here, which is not the order on screen.
+    expect(dirtyLine(" in Providers, Routes")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Providers unsaved/ })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Routes unsaved/ })).toBeInTheDocument();
+  });
+
+  it("marks Providers for a staged key, which is a plan edit not a document one", async () => {
+    await mount(session({ view: { kind: "view", view: configView({ providers: [provider()] }) } }));
+    // `stage-key` has its own command, not an `apply` op, so the fake that
+    // matters is this one. Leaving `config_edit_apply` unfaked is deliberate:
+    // a stray `apply` would reject loudly instead of quietly passing.
+    fake("config_edit_stage_key", () => session({ staged_keys: ["provider.zen"] }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Change key" }));
+    await userEvent.selectOptions(screen.getByLabelText("key home"), "paste");
+    await userEvent.type(screen.getByLabelText("value"), "sk-secret");
+    await userEvent.click(screen.getByRole("button", { name: "Stage it" }));
+
+    // `stage-key` touches no document key at all, so it never reaches `apply`'s
+    // op table — the slot's own name is what says which panel it belongs to.
+    await waitFor(() => expect(marked("Providers")).toBeInTheDocument());
+  });
+
+  it("marks Search for the fixed `search.exa` slot", async () => {
+    await mount(
+      session({
+        view: { kind: "view", view: configView({ search: searchView() }) },
+      }),
+    );
+    fake("config_edit_stage_key", () => session({ staged_keys: ["search.exa"] }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Change key" }));
+    await userEvent.selectOptions(screen.getByLabelText("key home"), "paste");
+    await userEvent.type(screen.getByLabelText("value"), "exa-secret");
+    await userEvent.click(screen.getByRole("button", { name: "Stage it" }));
+
+    // The regression this pins: `provider.<id>` and `search.exa` are both slots,
+    // and a `slot.startsWith("provider")` test would file Search's key under
+    // Providers — the one panel that can never resolve it.
+    await waitFor(() => expect(marked("Search")).toBeInTheDocument());
+    expect(screen.queryByRole("heading", { name: /Providers unsaved/ })).not.toBeInTheDocument();
+    expect(dirtyLine(" in Search")).toBeInTheDocument();
+  });
+
+  it("marks nothing for an edit the CLI refused", async () => {
+    await mount();
+    fake("config_edit_apply", () => {
+      throw "a failover strategy needs at least two targets";
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
+
+    await screen.findByText("a failover strategy needs at least two targets");
+    // `mark` is on the success path only, the same as `dirty`: a marker on a
+    // panel nothing changed in would be the exact lie this feature exists to fix.
+    expect(clean()).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /unsaved/ })).not.toBeInTheDocument();
+  });
+
+  it("clears every marker on save", async () => {
+    await mount();
+    fake("config_edit_apply", () => session());
+    await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
+    await waitFor(() => expect(marked("Routes")).toBeInTheDocument());
+
+    fake("config_edit_save", () => ({ kind: "saved", session: session() }));
+    await userEvent.click(saveButton());
+
+    await waitFor(() => expect(clean()).toBeInTheDocument());
+    expect(screen.queryByRole("heading", { name: /unsaved/ })).not.toBeInTheDocument();
+  });
+
+  it("clears every marker on discard", async () => {
+    await mount();
+    fake("config_edit_apply", () => session());
+    await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
+    await waitFor(() => expect(marked("Routes")).toBeInTheDocument());
+
+    fake("config_edit_discard", () => undefined);
+    await userEvent.click(discardButton());
+
+    // Discard re-seeds the session from the file, so the document the marker
+    // described no longer exists — a survivor here would point at an edit that
+    // was just thrown away.
+    await waitFor(() => expect(callCount("config_edit_load")).toBe(2));
+    await waitFor(() => expect(clean()).toBeInTheDocument());
+    expect(screen.queryByRole("heading", { name: /unsaved/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps a session error from being read as a marker", async () => {
+    await mount();
+    // A session can come back carrying an `error` — `take()` copies it into
+    // `problem` — and that is a complaint about the document, not an edit to it.
+    // Here the op *succeeds* (the fake resolves), so `dirty` and the Routes
+    // marker are both right; what must not happen is the error text retracting
+    // the marker or the bar naming a panel that did not hold the edit.
+    fake("config_edit_apply", () => session({ error: "the seed is already editable" }));
+    await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
+
+    await screen.findByText("the seed is already editable");
+    await waitFor(() => expect(dirtyLine(" in Routes")).toBeInTheDocument());
+    expect(marked("Routes")).toBeInTheDocument();
   });
 });
 
@@ -198,9 +380,10 @@ describe("Settings — save", () => {
     await userEvent.click(saveButton());
 
     await screen.findByText("config-parse: unparseable");
-    // Still dirty: the edits are still only staged, so the user can fix and
-    // retry rather than losing them to a failed save.
-    expect(dirtyLine()).toBeInTheDocument();
+    // Still dirty, and still attributed: the edits are still only staged, so the
+    // user can fix and retry rather than losing them to a failed save, and the
+    // panel that holds them is still the one to look in.
+    expect(dirtyLine(" in Routes")).toBeInTheDocument();
     expect(saveButton()).toBeEnabled();
   });
 });

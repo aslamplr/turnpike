@@ -40,12 +40,17 @@ const route = (over: Partial<RouteView> = {}): RouteView => ({
   ...over,
 });
 
-function mount(routes: RouteView[], handlers: Partial<Record<string, unknown>> = {}) {
+function mount(
+  routes: RouteView[],
+  handlers: Partial<Record<string, unknown>> = {},
+  changed = false,
+) {
   return render(Routes, {
     props: {
       routes,
       providers: [provider("zen"), provider("zen-go")],
       busy: false,
+      changed,
       error: null,
       onAdd: async () => {},
       onRemove: async () => {},
@@ -57,6 +62,27 @@ function mount(routes: RouteView[], handlers: Partial<Record<string, unknown>> =
     },
   });
 }
+
+/// The `unsaved` marker is parent-driven, so both directions get pinned. The
+/// panel deliberately claims no more than the heading: a single `Edit details`
+/// submit sends two ops (`display_name`, `context_tokens`), so a per-row marker
+/// could not be backed by anything this component knows.
+describe("Routes — the unsaved marker", () => {
+  it("marks the heading only when the parent says the panel is holding an edit", () => {
+    const { unmount } = mount([route()], {}, false);
+    // A clean panel claims nothing. This is the half that matters: a marker that
+    // renders unconditionally would pass a "something is marked" test while
+    // telling the user every reload that they have unsaved work.
+    expect(screen.queryByText("unsaved")).not.toBeInTheDocument();
+    unmount();
+
+    mount([route()], {}, true);
+    // Read off the `h2` rather than a bare `getByText("unsaved")`, which is what
+    // keeps this assertion about the heading and not about some future row-level
+    // badge in the same style.
+    expect(screen.getByRole("heading", { name: /Routes unsaved/ })).toBeInTheDocument();
+  });
+});
 
 describe("Routes — the strategy gate", () => {
   it("offers load-balance and failover only at two or more targets", () => {
@@ -210,6 +236,7 @@ describe("Routes — empty and refusal states", () => {
         routes: [route()],
         providers: [],
         busy: false,
+        changed: false,
         error: null,
         onAdd: async () => {},
         onRemove: async () => {},
