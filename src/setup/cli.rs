@@ -124,7 +124,7 @@ impl Reply {
 /// One flat enum of *every* operation rather than a nested subcommand tree: the
 /// caller sends a JSON object either way, and a flat list keeps the desktop
 /// side's dispatch table and this one lined up one-to-one.
-pub const OPS: [&str; 16] = [
+pub const OPS: [&str; 17] = [
     "add-provider",
     "remove-provider",
     "set-provider",
@@ -137,6 +137,7 @@ pub const OPS: [&str; 16] = [
     "remove-target",
     "set-target",
     "set-search",
+    "remove-search",
     "stage-key",
     "stage-delete",
     "unstage-key",
@@ -230,7 +231,19 @@ struct SetTarget {
     value: Option<String>,
 }
 
+/// `deny_unknown_fields` here is the fix for the *class* of bug, not just its
+/// instance: serde ignores what it does not know, so `api_key_env` — sent by the
+/// window, absent from this struct — was dropped with a `rc=0`, `error: null`
+/// reply, and a later Save reported success for a setting that never reached the
+/// file. The window cannot notice what the parser silently discards; refusing
+/// the call is what makes the next such gap visible.
+///
+/// Scoped to this struct deliberately. Widening it to all seventeen arg structs
+/// is a behavior change of its own — a caller sending a stray field would move
+/// from silently-ignored to refused — and this is the one with a demonstrated
+/// drop.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetSearch {
     #[serde(default)]
     provider: Option<String>,
@@ -238,11 +251,26 @@ struct SetSearch {
     max_loops: Option<usize>,
     #[serde(default)]
     base_url: Option<String>,
+    /// Name an env var for the key. Outranks the inline key, so
+    /// `set_search_key_env` writes this and strips `api_key` in one edit.
+    #[serde(default)]
+    api_key_env: Option<String>,
     /// Remove the inline key instead of setting one. `stage-delete` is the
     /// other half — this only touches the document.
     #[serde(default)]
     clear_inline_key: bool,
 }
+
+/// `remove-search`'s arguments: there are none.
+///
+/// A real struct rather than a bare "is it `{}`" check, so the op goes through
+/// `parse_args` like every sibling — an empty or malformed argument string is
+/// then a refusal, not a silent no-op, which is the class of bug this op exists
+/// to close. `deny_unknown_fields` on an empty struct means any field at all is
+/// refused rather than dropped.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveSearch {}
 
 #[derive(Debug, Deserialize)]
 struct StageKey {
@@ -318,6 +346,39 @@ pub fn apply(op: &str, session: &Session, args: &str) -> Result<Reply> {
                     // The key has no home without the provider. The wizard
                     // stages the same delete.
                     plan.stage_delete(&secrets::provider_key_name(&a.id));
+                    None
+                }
+                Err(e) => Some(e.to_string()),
+            }
+        }
+        "remove-search" => {
+            // Parsed for real, not skipped. This op takes no fields, but going
+            // through `parse_args` is what makes an empty or malformed argument
+            // string an *error* rather than a silent no-op — the exact class of
+            // drop this op was added to close. `ops_are_all_dispatched` sends it
+            // `""` and relies on this refusing.
+            let _: RemoveSearch = parse_args(args)?;
+            // The slot is `search.<provider>`, so the provider has to be read
+            // off the document — and read *before* the removal, because
+            // afterwards the table is gone and the read would silently fall back
+            // to the default, staging the wrong slot.
+            //
+            // This is where it differs from `remove-provider`, which reads
+            // `a.id` from the *parsed args*. This op has no args, so the
+            // document is the only thing left to read. `load_from_str` runs full
+            // validation and can fail; the fallback is the wizard's own line for
+            // the same read (`setup::mod`), and staging a delete for a slot that
+            // does not exist is harmless. Reading it eagerly is safe because it
+            // is only *used* on the `Ok` branch — a refused removal stages
+            // nothing.
+            let provider = crate::config::load_from_str(&doc.as_str())
+                .map(|c| c.search.provider)
+                .unwrap_or_else(|_| super::edit::search_defaults().provider);
+            match doc.remove_search() {
+                Ok(()) => {
+                    // The key has no home without the block. The wizard stages
+                    // the same delete.
+                    plan.stage_delete(&secrets::search_key_name(&provider));
                     None
                 }
                 Err(e) => Some(e.to_string()),
@@ -565,6 +626,16 @@ fn set_search(doc: &mut Doc, a: &SetSearch) -> Option<String> {
     }
     if let Some(base) = &a.base_url {
         if let Err(e) = doc.set_search_scalar("base_url", base.as_str()) {
+            return Some(e.to_string());
+        }
+    }
+    // Last, and through `set_search_key_env` rather than `set_search_scalar`:
+    // `api_key_env` outranks the inline key, so writing it as a plain scalar
+    // would leave an `api_key` behind to shadow it. Last because the provider is
+    // what makes the env-var name *mean* something — pinning the order keeps a
+    // same-op `provider` change from landing after the key that belongs to it.
+    if let Some(var) = &a.api_key_env {
+        if let Err(e) = doc.set_search_key_env(var) {
             return Some(e.to_string());
         }
     }
@@ -998,6 +1069,135 @@ mod tests {
         let cfg = crate::config::load_from_str(&session.doc).unwrap();
         assert_eq!(cfg.search.max_loops, 3);
         assert_eq!(cfg.search.provider, "searxng");
+    }
+
+    /// **The regression test for the live bug.** The window sent
+    /// `onSearch({ api_key_env })`, `SetSearch` had no such field, serde dropped
+    /// it, and the reply came back `error: null` — so the assertion has to be on
+    /// the *reloaded config*, not on the reply's error. Asserting on the error
+    /// would have passed throughout, which is exactly how this hid.
+    #[test]
+    fn set_search_env_var_lands_in_the_document() {
+        let session = chain(
+            &starter_session("search-env"),
+            &[("set-search", r#"{"api_key_env":"EXA_API_KEY"}"#)],
+        );
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        assert_eq!(
+            cfg.search.api_key_env.as_deref(),
+            Some("EXA_API_KEY"),
+            "api_key_env did not reach the document"
+        );
+    }
+
+    /// And it strips a stale inline key in the same edit: `api_key_env` outranks
+    /// `api_key`, so leaving one behind would shadow the var just named — and
+    /// leave a plaintext secret in the file.
+    #[test]
+    fn set_search_env_var_strips_an_inline_key() {
+        let mut session = starter_session("search-env-strip");
+        session.doc = "[server]\nlisten = \"127.0.0.1:8710\"\n\n\
+                       [providers.zen]\nspec = \"anthropic\"\nbase_url = \"https://x\"\n\n\
+                       [search]\nprovider = \"exa\"\napi_key = \"sk-inline\"\n"
+            .to_string();
+
+        let session = chain(
+            &session,
+            &[("set-search", r#"{"api_key_env":"EXA_API_KEY"}"#)],
+        );
+        assert!(!session.doc.contains("sk-inline"), "{}", session.doc);
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        assert_eq!(cfg.search.api_key_env.as_deref(), Some("EXA_API_KEY"));
+        assert!(cfg.search.api_key.is_none());
+    }
+
+    /// The regression test for the *mechanism*, where the test above is the one
+    /// for the instance: serde ignores what it does not know, so any field the
+    /// window sends that this struct lacks vanishes with a clean-looking reply.
+    ///
+    /// Asserts on `{e:#}` — the whole anyhow chain — not `{e}`. The outer
+    /// context is only "parsing the op arguments"; the field name serde
+    /// reported is one link down, and `{e}` alone would let this test pass over
+    /// a refusal that never named the offender.
+    #[test]
+    fn set_search_refuses_an_unknown_field() {
+        let err = format!(
+            "{:#}",
+            apply(
+                "set-search",
+                &starter_session("search-unknown"),
+                r#"{"api_key_env":"EXA_API_KEY","bogus":1}"#,
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("bogus"), "unexpected: {err}");
+    }
+
+    /// Removing `[search]` drops the table, and the doc still validates — the
+    /// point being that no server tool had a reference to strand.
+    #[test]
+    fn remove_search_drops_the_table_and_leaves_a_valid_config() {
+        let session = chain(
+            &starter_session("remove-search"),
+            &[(
+                "set-search",
+                r#"{"provider":"exa","api_key_env":"EXA_API_KEY"}"#,
+            )],
+        );
+        assert!(session.doc.contains("[search]"));
+
+        let session = chain(&session, &[("remove-search", "{}")]);
+        assert!(!session.doc.contains("[search]"), "{}", session.doc);
+        crate::config::load_from_str(&session.doc).expect("the result should still validate");
+    }
+
+    /// A document with no `[search]` has nothing to remove, and the refusal must
+    /// leave the session untouched — the same shape as an unknown route id.
+    #[test]
+    fn remove_search_is_refused_when_there_is_no_table() {
+        let session = starter_session("remove-search-absent");
+        assert!(!session.doc.contains("[search]"));
+
+        let reply = apply("remove-search", &session, "{}").unwrap();
+        assert!(
+            reply.error.as_deref().unwrap_or("").contains("[search]"),
+            "expected the absent-table refusal, got {:?}",
+            reply.error
+        );
+        assert_eq!(reply.session.unwrap().doc, session.doc);
+    }
+
+    /// The chain the plan promised: `set-search {api_key_env}` followed by
+    /// `remove-search` leaves **one** delete for `search.<provider>`, not two —
+    /// which is `stage_delete`'s `any()` guard doing its job.
+    ///
+    /// The slot is read off the *document*, `search.exa` from the provider
+    /// `set-search` just wrote — not the default. A `remove-search` that read the
+    /// table after removing it would stage `search.searxng` here, the default
+    /// provider, and this assertion is what pins the read ordering.
+    #[test]
+    fn remove_search_stages_the_document_provider_slot() {
+        let session = chain(
+            &starter_session("search-slot"),
+            &[(
+                "set-search",
+                r#"{"provider":"exa","api_key_env":"EXA_API_KEY"}"#,
+            )],
+        );
+        let session = chain(&session, &[("remove-search", "{}")]);
+        assert_eq!(session.plan.deletes, vec!["search.exa".to_string()]);
+        assert!(session.plan.deletes.len() == 1, "a delete was staged twice");
+    }
+
+    /// A refusal stages nothing: the provider read happens before the removal so
+    /// the slot is right, but it must only be *used* on the success branch.
+    #[test]
+    fn refused_remove_search_stages_no_delete() {
+        let session = starter_session("search-refused");
+        assert!(!session.doc.contains("[search]"));
+        let reply = apply("remove-search", &session, "{}").unwrap();
+        assert!(reply.error.is_some());
+        assert!(reply.session.unwrap().plan.deletes.is_empty());
     }
 
     #[test]

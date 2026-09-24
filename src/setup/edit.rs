@@ -208,6 +208,41 @@ impl Doc {
         self.remove_scalar_keeping_comment(&["search"], "api_key")
     }
 
+    /// Remove the whole `[search]` table.
+    ///
+    /// Deliberately check-free, unlike `remove_provider`: there is no
+    /// referential check to reproduce, because server tools are stripped from
+    /// bridged requests whenever `[search]` is absent, so removing the table is
+    /// always legal.
+    ///
+    /// `Result<()>` rather than `bool`, deliberately: a `bool` would be a fine
+    /// signature in isolation, but returning the sibling's type is what lets the
+    /// dispatch arm keep the one uniform removal shape, and "there is no
+    /// `[search]`" is the same class of answer as "no route named X".
+    ///
+    /// The `#` comment that introduces the header lives in the *table's* decor,
+    /// which `comment_above` cannot reach (it is scoped to a `[table]` block and
+    /// stops at `\n[`). That loss is accepted, exactly as `remove_route_target`
+    /// accepts it for a target block's introducing comment: recovering it would
+    /// take a new decor helper for one caller, and `default_config_text()`'s
+    /// `[search]` comment sits above the header where a user is unlikely to have
+    /// annotated it.
+    pub fn remove_search(&mut self) -> Result<()> {
+        // `as_table_like` is `None` for a missing `[search]` *and* for a
+        // malformed one (`search = 1`); both mean "there is nothing here to
+        // remove", and neither should be silently turned into a write.
+        let present = self
+            .doc
+            .get("search")
+            .and_then(|s| s.as_table_like())
+            .is_some();
+        if !present {
+            anyhow::bail!("there is no [search] table");
+        }
+        self.doc.remove("search");
+        Ok(())
+    }
+
     /// Parse one provider back out of the document, so the wizard can show a
     /// live view of what it has staged rather than what it read at startup.
     pub fn provider(&self, id: &str) -> Option<ProviderCfg> {
@@ -978,6 +1013,48 @@ mod tests {
         assert!(doc.as_str().contains("[search]"), "got:\n{}", doc.as_str());
         assert!(doc.as_str().contains("api_key_env = \"EXA_API_KEY\""));
         doc.validated().unwrap();
+    }
+
+    /// Removing `[search]` drops exactly that table and nothing else — the rest
+    /// of the document, comments included, is byte-identical.
+    #[test]
+    fn remove_search_drops_only_that_table() {
+        let mut doc = Doc::parse(
+            "# top\n[server]\nlisten = \"127.0.0.1:8710\"\n\n\
+             [search]\n# which engine\nprovider = \"exa\"\napi_key_env = \"EXA_API_KEY\"\nmax_loops = 5\n\n\
+             [routes.\"claude-sonnet-5\"]\nprovider = \"zen\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+
+        doc.remove_search().unwrap();
+
+        let out = doc.as_str();
+        assert!(!out.contains("[search]"), "got:\n{out}");
+        assert!(!out.contains("api_key_env"), "got:\n{out}");
+        // Everything outside the block survived, comments included.
+        assert!(out.contains("# top"), "got:\n{out}");
+        assert!(out.contains("[server]"), "got:\n{out}");
+        assert!(out.contains("[routes.\"claude-sonnet-5\"]"), "got:\n{out}");
+        assert!(
+            out.contains("listen = \"127.0.0.1:8710\""),
+            "the [server] table's own key was lost:\n{out}"
+        );
+    }
+
+    /// The missing-table case is an error, not a silent no-op — the same answer
+    /// `remove_route`/`remove_provider` give for an id that is not there.
+    #[test]
+    fn remove_search_refuses_when_absent() {
+        let mut doc = starter();
+        assert!(!doc.as_str().contains("[search]"));
+
+        let err = doc.remove_search().unwrap_err().to_string();
+        assert!(err.contains("[search]"), "got: {err}");
+
+        // `search = 1` is not a table either, and must not be silently removed:
+        // there is no `[search]` block, so the answer is the same refusal.
+        let mut scalar = Doc::parse("search = 1\n").unwrap();
+        assert!(scalar.remove_search().is_err());
     }
 
     #[test]

@@ -11,12 +11,28 @@
   import Doctor from "./config/Doctor.svelte";
   import Providers from "./config/Providers.svelte";
   import Routes from "./config/Routes.svelte";
+  import Search from "./config/Search.svelte";
+
+  /// The five sub-tabs, in the order they render.
+  ///
+  /// A *tab* list, distinct from `PANELS` below, and the difference is
+  /// deliberate. `Overview` is a landing page that owns no edit, and `Doctor` is
+  /// read-only — neither can ever be `touched`, so putting them in the
+  /// attribution set would give the bar's sentence a name it can never honestly
+  /// print. The tabs are what the user navigates; the panels are what the
+  /// session can be dirty in.
+  const TABS = ["Overview", "Providers", "Search", "Routes", "Doctor"] as const;
+  type SubTab = (typeof TABS)[number];
 
   /// The three panels that can hold an edit, in the order they appear on
   /// screen. The heading markers and the bar's sentence both read this list, so
   /// the two cannot disagree about spelling or order.
   const PANELS = ["Providers", "Search", "Routes"] as const;
   type Panel = (typeof PANELS)[number];
+
+  /// Which sub-tab is showing. Shadows nothing — `App.svelte`'s own `tab` lives
+  /// in its component scope.
+  let tab = $state<SubTab>("Overview");
 
   /// The staged session, and everything the window knows about it.
   ///
@@ -89,9 +105,27 @@
   }
 
   /// Which panel a staged slot belongs to. The slot names it: `provider.zen` is
-  /// Providers, the fixed literal `search.exa` is Search.
+  /// Providers, and anything under `search.` is Search — `search.<provider>`, so
+  /// a `startsWith("provider")` test would file Search's keys under Providers,
+  /// the one panel that can never resolve them.
   const panelForSlot = (slot: string): Panel =>
     slot.startsWith("search.") ? "Search" : "Providers";
+
+  /// Findings worth a marker on the Doctor tab: the same `notable` filter the
+  /// Doctor panel itself uses, so the count on the tab button and the rows in
+  /// the panel cannot disagree.
+  const doctorCount = $derived(
+    checks.filter((c) => c.status === "fail" || c.status === "warn").length,
+  );
+
+  /// The dot on a sub-tab whose panel is holding an edit.
+  ///
+  /// The panel's own heading marker only exists while its tab is mounted, so
+  /// without this the session could be dirty with the tab that holds the edit
+  /// showing nothing at all. A `===` against a `Panel` rather than an
+  /// `includes` on a `SubTab`: the two lists differ by `Overview`/`Doctor`, and
+  /// the overlap is exactly the three names that can be dirty.
+  const isDirtyTab = (t: SubTab) => touchedList.some((p) => p === t);
 
   /// One place the whole session payload lands, so `view` and `staged_keys`
   /// cannot be updated out of step with each other.
@@ -256,26 +290,25 @@
   const removeTarget = (id: string, index: number) =>
     apply("remove-target", { id, index }, "Routes");
 
-  /// `[search]` has no provider id, so both of its edits are the same op.
+  /// `[search]`'s document scalars — provider, base_url, max_loops, api_key_env.
   const setSearch = (args: Record<string, unknown>) =>
     apply("set-search", args, "Search");
 
-  const addSearch = (provider: string) =>
-    apply("set-search", { provider }, "Search");
-</script>
+  /// Adding `[search]` needs no provider id: the block carries its own
+  /// `provider` key, and the select starts it at the schema default. So the op
+  /// is `set-search` with no fields — which `parse_args` accepts as `{}`.
+  ///
+  /// A thunk, not the bare op: `Search.svelte`'s button calls it with no
+  /// arguments, and `apply`'s second parameter is the args object — passing the
+  /// click event through would put a `MouseEvent` where the CLI expects JSON.
+  const addSearch = () => apply("set-search", {}, "Search");
 
-<div class="panel">
-  <h2>Gateway</h2>
-  <div class="pad kv">
-    <span>listen <b>{v ? v.listen : "—"}</b></span>
-    <span>routes <b>{v ? v.routes.length : "—"}</b></span>
-    <span>providers <b>{v ? v.providers.length : "—"}</b></span>
-    <span>search <b>{v && v.search ? v.search.provider : v ? "off" : "—"}</b></span>
-  </div>
-  <div class="pad sub" style="border-top: 1px solid var(--line)">
-    config <code>{configPath || "…"}</code>
-  </div>
-</div>
+  /// Removing `[search]` takes **no args**, so it must send `{}` and never
+  /// `""` — `parse_args` refuses an empty string outright. The op reads the
+  /// provider off the document to stage `search.<provider>` for deletion, which
+  /// is why it needs nothing from here.
+  const removeSearch = () => apply("remove-search", {}, "Search");
+</script>
 
 {#if payload === null}
   <div class="panel"><div class="empty">Loading…</div></div>
@@ -316,36 +349,98 @@
     </div>
   </div>
 
-  <Providers
-    providers={v.providers as ProviderView[]}
-    search={v.search}
-    {stagedKeys}
-    {busy}
-    changed={touched.includes("Providers")}
-    searchChanged={touched.includes("Search")}
-    onAdd={addProvider}
-    onRemove={removeProvider}
-    onKeyEnv={setKeyEnv}
-    onStageKey={stageKey}
-    onUnstageKey={unstageKey}
-    onSearch={setSearch}
-    onAddSearch={addSearch}
-    error={null}
-  />
+  <div class="subtabs" role="tablist" aria-label="Configuration sections">
+    {#each TABS as t (t)}
+      <button
+        class="tab"
+        role="tab"
+        aria-selected={tab === t}
+        aria-controls="subtab-body"
+        onclick={() => (tab = t)}
+      >
+        {t}
+        {#if isDirtyTab(t)}
+          <span class="tabdot" title="unsaved changes"></span>
+        {/if}
+        {#if t === "Doctor" && doctorCount > 0}
+          <span class="badge warn">{doctorCount}</span>
+        {/if}
+      </button>
+    {/each}
+  </div>
 
-  <Routes
-    routes={v.routes}
-    providers={v.providers as ProviderView[]}
-    {busy}
-    changed={touched.includes("Routes")}
-    onAdd={(args) => apply("add-route", args, "Routes")}
-    onRemove={(id) => apply("remove-route", { id }, "Routes")}
-    onSetScalar={setRouteScalar}
-    onStrategy={setStrategy}
-    onAddTarget={addTarget}
-    onRemoveTarget={removeTarget}
-    error={null}
-  />
-
-  <Doctor {checks} path={configPath} {dirty} />
+  <div id="subtab-body" role="tabpanel">
+    {#if tab === "Overview"}
+      <div class="panel">
+        <h2>Gateway</h2>
+        <div class="pad kv">
+          <span>listen <b>{v.listen}</b></span>
+          <span>routes <b>{v.routes.length}</b></span>
+          <span>providers <b>{v.providers.length}</b></span>
+          <span>search <b>{v.search ? v.search.provider : "off"}</b></span>
+        </div>
+        <div class="pad sub" style="border-top: 1px solid var(--line)">
+          config <code>{configPath || "…"}</code>
+        </div>
+      </div>
+    {:else if tab === "Providers"}
+      <Providers
+        providers={v.providers as ProviderView[]}
+        {stagedKeys}
+        {busy}
+        changed={touched.includes("Providers")}
+        onAdd={addProvider}
+        onRemove={removeProvider}
+        onKeyEnv={setKeyEnv}
+        onStageKey={stageKey}
+        onUnstageKey={unstageKey}
+        error={null}
+      />
+    {:else if tab === "Search"}
+      <Search
+        search={v.search}
+        {stagedKeys}
+        {busy}
+        changed={touched.includes("Search")}
+        onSearch={setSearch}
+        onAddSearch={addSearch}
+        onRemoveSearch={removeSearch}
+        onStageKey={stageKey}
+        onUnstageKey={unstageKey}
+        error={null}
+      />
+    {:else if tab === "Routes"}
+      <Routes
+        routes={v.routes}
+        providers={v.providers as ProviderView[]}
+        {busy}
+        changed={touched.includes("Routes")}
+        onAdd={(args) => apply("add-route", args, "Routes")}
+        onRemove={(id) => apply("remove-route", { id }, "Routes")}
+        onSetScalar={setRouteScalar}
+        onStrategy={setStrategy}
+        onAddTarget={addTarget}
+        onRemoveTarget={removeTarget}
+        error={null}
+      />
+    {:else if tab === "Doctor"}
+      <Doctor {checks} path={configPath} {dirty} />
+    {/if}
+  </div>
 {/if}
+
+<style>
+  /* The dot is the tab-level twin of a panel's `unsaved` badge: a panel's
+     heading only exists while its own tab is mounted, so without this a
+     session could be dirty with nothing on screen saying where.
+
+     Named for the tab rather than `.dot`, which is a global rule for the
+     status pill (`app.css`) at a different size — two rules of equal
+     specificity over one class is a coin toss on which stylesheet lands last. */
+  .tabdot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--warn);
+  }
+</style>

@@ -114,6 +114,25 @@ input:focus-visible {
   outline-offset: 2px;
 }
 
+/* The Settings sub-tab strip. A `.tabs` variant for a second-level nav: the
+   same tab grammar one size down, with no panel background of its own so it
+   reads as *inside* the body rather than beside the app's own tab bar. */
+.subtabs {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+  padding: 0 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.subtabs .tab {
+  font-size: 13px;
+  padding: 5px 9px 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .body {
   flex: 1 1 auto;
   overflow: auto;

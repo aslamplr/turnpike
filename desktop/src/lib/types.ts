@@ -98,7 +98,9 @@ export interface CheckView {
   fix?: string;
 }
 
-/// The plan key a staged secret lives under: `provider.<id>` or `search.exa`.
+/// The plan key a staged secret lives under: `provider.<id>` or
+/// `search.<provider>` — the search slot is keyed by provider, so exa's key is
+/// never reused for searxng.
 export type KeySlot = string;
 
 export interface LogLine {

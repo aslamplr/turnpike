@@ -1,31 +1,31 @@
 <script lang="ts">
-  import type { ProviderView, SearchView } from "../../lib/types";
+  import type { ProviderView } from "../../lib/types";
   import { keyTone, noAutofill } from "./kit.svelte";
 
-  /// Providers and `[search]`, which share a key story and nothing else.
+  /// Providers: where requests can be sent, and where each one's key lives.
   ///
   /// The three key homes are the wizard's own three choices, in its own order:
   /// point `api_key_env` at a variable name (which *also* strips an inline key),
   /// paste a plaintext value into the store, or leave it unset. The editor never
   /// offers a fourth, and it never shows a value back.
+  ///
+  /// `[search]` used to render here as a second heading. It is its own component
+  /// now (`Search.svelte`) and its own tab — the shared key story was the only
+  /// thing joining them, and it reads better from the search side anyway, where
+  /// the slot follows a provider the user picks.
   let {
     providers,
-    search,
     stagedKeys,
     busy,
     changed,
-    searchChanged,
     onAdd,
     onRemove,
     onKeyEnv,
     onStageKey,
     onUnstageKey,
-    onSearch,
-    onAddSearch,
     error,
   }: {
     providers: ProviderView[];
-    search: SearchView | null;
     stagedKeys: string[];
     busy: boolean;
     /// Whether this panel is holding an unsaved edit. A panel, not a row: one op
@@ -33,16 +33,11 @@
     /// `api_key_env` *and* strips an inline key), so anything finer would be a
     /// claim the window cannot back. `settings.svelte` owns the answer.
     changed: boolean;
-    /// The same, for the `[search]` heading. A sibling panel inside this
-    /// component, so it needs its own flag rather than a second component.
-    searchChanged: boolean;
     onAdd: (id: string, spec: string, baseUrl: string) => Promise<void>;
     onRemove: (id: string) => Promise<void>;
     onKeyEnv: (id: string, envVar: string) => Promise<void>;
     onStageKey: (slot: string, value: string) => Promise<void>;
     onUnstageKey: (slot: string) => Promise<void>;
-    onSearch: (args: Record<string, unknown>) => Promise<void>;
-    onAddSearch: (provider: string) => Promise<void>;
     error: string | null;
   } = $props();
 
@@ -58,10 +53,9 @@
   let newBase = $state("");
 
   const slotFor = (id: string) => `provider.${id}`;
-  /// Takes the *slot*, not a provider id: `[search]`'s slot is the fixed
-  /// literal `search.exa`, so threading it through `slotFor` would look for
-  /// `provider.search.exa` and never match — a staged Exa key could be staged
-  /// and then never unstaged.
+  /// Takes the *slot*, not a provider id — the session keys its staged map by
+  /// slot, so wrapping an id here would look for `provider.zen` in a list that
+  /// holds `provider.zen` only by coincidence of spelling.
   const isStaged = (slot: string) => stagedKeys.includes(slot);
 
   function openKey(id: string) {
@@ -195,100 +189,6 @@
     </div>
   {:else}
     <div class="actions"><button class="ghost" onclick={() => (adding = true)} disabled={busy}>Add provider</button></div>
-  {/if}
-</div>
-
-<div class="panel">
-  <h2>
-    Search
-    {#if searchChanged}<span class="badge warn">unsaved</span>{/if}
-  </h2>
-  {#if !search}
-    <div class="empty">
-      Off — server tools are stripped from bridged requests. Adding it needs an
-      Exa key; searxng is keyless.
-      <div class="actions">
-        <button class="ghost" onclick={() => onAddSearch("exa")} disabled={busy}>Add [search] (exa)</button>
-      </div>
-    </div>
-  {:else}
-    <div class="row">
-      <div class="row-head">
-        <span class="badge">{search.provider}</span>
-        <span class="badge {keyTone(search.key)}">{search.key.tier}</span>
-        {#if isStaged("search.exa")}
-          <span class="badge warn">staged</span>
-        {/if}
-        {#if search.base_url}<span class="mono grow">{search.base_url}</span>{/if}
-      </div>
-      {#if search.key.note}<div class="sub">{search.key.note}</div>{/if}
-      <div class="edit-fields">
-        <label for="s-loops">max loops</label>
-        <input
-          id="s-loops"
-          class="num"
-          type="number"
-          min="0"
-          value={search.max_loops}
-          disabled={busy}
-          onchange={(e) => onSearch({ max_loops: Number((e.currentTarget as HTMLInputElement).value) })}
-          {...noAutofill}
-        />
-      </div>
-      <div class="actions">
-        <button
-          class="ghost"
-          onclick={() => {
-            openKey("__search__");
-          }}
-          disabled={busy}
-        >
-          Change key
-        </button>
-        {#if isStaged("search.exa")}
-          <button class="ghost" onclick={() => onUnstageKey("search.exa")} disabled={busy}>Unstage key</button>
-        {/if}
-      </div>
-
-      {#if editingKey === "__search__"}
-        <div class="edit">
-          <div class="edit-fields">
-            <label for="s-mode">key home</label>
-            <select id="s-mode" bind:value={keyMode} disabled={busy}>
-              <option value="env">environment variable</option>
-              <option value="paste">paste a value (stored encrypted)</option>
-            </select>
-            <label for="s-val">{keyMode === "env" ? "variable name" : "value"}</label>
-            <input
-              id="s-val"
-              type={keyMode === "env" ? "text" : "password"}
-              placeholder={keyMode === "env" ? "EXA_API_KEY" : ""}
-              bind:value={keyDraft}
-              disabled={busy}
-              {...noAutofill}
-            />
-          </div>
-          <div class="actions">
-            <button
-              onclick={async () => {
-                if (!keyDraft.trim()) return;
-                if (keyMode === "env") {
-                  await onSearch({ api_key_env: keyDraft.trim() });
-                } else {
-                  await onStageKey("search.exa", keyDraft);
-                }
-                keyDraft = "";
-                editingKey = null;
-              }}
-              disabled={busy || !keyDraft.trim()}
-            >
-              {keyMode === "env" ? "Point at it" : "Stage it"}
-            </button>
-            <button class="ghost" onclick={() => (editingKey = null)} disabled={busy}>Cancel</button>
-          </div>
-        </div>
-      {/if}
-    </div>
   {/if}
 </div>
 

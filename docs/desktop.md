@@ -57,7 +57,7 @@ desktop/
     main.ts  App.svelte  app.css
     lib/{api.ts,types.ts,stores.ts}
     routes/{Settings.svelte,Logs.svelte}
-    routes/config/{Providers.svelte,Routes.svelte,Doctor.svelte,kit.svelte}
+    routes/config/{Providers.svelte,Search.svelte,Routes.svelte,Doctor.svelte,kit.svelte}
   src-tauri/
     Cargo.toml  build.rs  tauri.conf.json  capabilities/default.json  icons/
     tauri.macos.conf.json       # the CLI payload's name, per platform
@@ -401,12 +401,22 @@ Two tabs. **Settings** is an editor; **Logs** is a reader.
 
 ### Settings
 
-A gateway summary (listen, route count, provider count, search on/off, the resolved
-config path) above three editable groups — providers, routes, and search — and a
-read-only Doctor panel at the foot. `[search]` is the third group for the bar's
-purposes even though it renders as a sibling heading inside `Providers.svelte`: its
-key slot is the fixed literal `search.exa`, so its edits are attributable to it and
-to nothing else.
+Five sub-tabs — **Overview | Providers | Search | Routes | Doctor** — under one
+save bar. The tab list and the panel list are deliberately different things: a
+*tab* is what the user navigates, a *panel* is what the session can be dirty in.
+`Overview` is a landing page that owns no edit and `Doctor` is read-only, so
+neither can ever be `touched`, and putting them in the attribution set would give
+the bar's sentence a name it could never honestly print. `TABS` is the five,
+`Settings.svelte`'s `PANELS` is the three.
+
+**Overview** is the gateway summary — listen, route count, provider count, search
+on/off, the resolved config path — so the landing tab is a read of the whole
+document rather than a form.
+
+**The save bar and the sub-tab strip are lifted above the tab bodies**, not
+rendered per-tab. The bar is the one `save`/`discard` pair, always mounted, so an
+edit made on Routes is one click from being saved instead of a trip back to the
+landing page.
 
 **Nothing is written until Save.** The window holds a *session*, not the file: the
 staged document lives as an opaque TOML string on the Rust side
@@ -440,14 +450,29 @@ diffed here — so a finer marker would be a guess dressed as a fact, and the op
 name is the level at which the sentence is true.
 
 The marker is a badge, not a new signal: `.badge.warn` already means "worth a look,
-not an error" everywhere else in this window. Because `[search]` is a third panel
-rendering inside `Providers.svelte` rather than as its own component, it takes its
-own `searchChanged` flag beside `changed` — one component, two headings, two flags.
+not an error" everywhere else in this window.
+
+**A panel's heading is only mounted while its own tab is**, so the component also
+puts a dot on the *tab button* of every sub-tab whose name is in `touchedList` (and a
+count on Doctor when `checks` has any `fail`/`warn`, off the same `notable` predicate
+the panel's own list uses). Without it a session could be dirty with the tab holding
+the edit showing nothing at all, and a marker that exists only on the tab you are
+already looking at cannot tell you where to look. The dot is `.tabdot`, not a
+`.dot` — the latter is a global rule for the status pill at a different size, and two
+rules of equal specificity over one class is a coin toss on which stylesheet lands last.
 
 - **Providers** — add, remove, and the wizard's exact three key homes: name an env
   var (which also strips any inline key, one edit), paste a key (staged into the
   session and never rendered back), or leave it unset. The badge shows the key's
   **tier**, as in the read-only view.
+- **Search** — its own component (`config/Search.svelte`) and its own tab, not a
+  second heading inside `Providers.svelte`. The engine is a real `<select>` over the
+  two `SearchManager::from_config` accepts, `base_url` and `max_loops` are editable,
+  and the key story is the same three homes. **The key slot follows the provider** —
+  `search.<provider>`, never the literal `search.exa` — so switching exa → searxng
+  re-points the slot the badge and the Unstage button look for, and searxng renders
+  its `not required` key face. `Remove [search]` removes the block and stages the
+  slot's delete, since the key has no home without it.
 - **Routes** — all three strategies. The target chain renders target 0 as the
   route's own flat `provider`/`model` with **no remove button** (removing it is
   "edit the route," and `targets()` synthesizes it); chain index `i` removes
@@ -766,7 +791,7 @@ registered **rejects loudly** rather than returning undefined. `setup.ts` resets
 the fakes before and after each test, because a fake leaking between tests is how
 a suite starts passing for the wrong reason.
 
-Covered today, six suites: `kit.svelte`'s `keyTone`/`windows` and the shape of the
+Covered today, seven suites: `kit.svelte`'s `keyTone`/`windows` and the shape of the
 `noAutofill` opt-out every editor field spreads; `Doctor.svelte`'s `notable` filter
 and its fail/warn tallies; `Routes.svelte`'s strategy gate, the `i - 1` array index
 its remove buttons send, and a `noAutofill` assertion per text field; each panel's
@@ -775,12 +800,17 @@ session lifecycle — the `dirty`-and-`touched`-only-on-success rule (a refusal 
 as a thrown string and must not light up Save), the `config_edit_apply` op/args wire
 shape, the save and discard paths, and which panel each op is attributed to (including
 the ordering rule: the bar reads `Providers, Routes` off the panel list, never off the
-order the edits arrived in); `Providers.svelte`'s three key homes, the slot each
-one files under (`provider.<id>`, and the literal `search.exa`), and the same
-`noAutofill` assertion per text field; and `App.svelte`'s two banners and the status
-bar. Edits are driven by the click a user makes, not by calling a panel's internals,
-so the shims between a panel and `apply` are exercised too. The suite is
-`cd desktop && npm test`.
+order the edits arrived in) — plus the sub-tab shell: five tabs in order, Overview
+landing first, exactly one panel mounted at a time, the Save bar reachable from every
+tab, and the dot on the *tab button* for a panel holding an edit; `Providers.svelte`'s
+three key homes, the slot each one files under (`provider.<id>`), and the same
+`noAutofill` assertion per text field; and `Search.svelte`'s own — the slot derived
+from the view's provider (so a switch re-points it, and exa's staged key never
+satisfies searxng's), the three key homes with `api_key_env` asserted on the
+*command's* args, `clear_inline_key`, `remove-search` sending `{}`, and the `[search]`
+scalars; and `App.svelte`'s two banners and the status bar. Edits are driven by the
+click a user makes, not by calling a panel's internals, so the shims between a panel
+and `apply` are exercised too. The suite is `cd desktop && npm test`.
 
 It has already earned its keep: mounting the real components found two defects
 no Rust test could reach — `Providers.svelte`'s `isStaged` wrapped a

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/svelte";
 import { userEvent } from "@testing-library/user-event";
 import Providers from "./Providers.svelte";
-import type { ProviderView, SearchView } from "../../lib/types";
+import type { ProviderView } from "../../lib/types";
 
 /// This panel is where a key's three homes are chosen, and the wizard's order is
 /// the contract: point `api_key_env` at a variable name (which *also* strips an
@@ -26,22 +26,12 @@ const provider = (over: Partial<ProviderView> = {}): ProviderView => ({
   ...over,
 });
 
-const search = (over: Partial<SearchView> = {}): SearchView => ({
-  provider: "exa",
-  base_url: "https://api.exa.ai",
-  max_loops: 5,
-  key: { tier: "env EXA_API_KEY", missing: false },
-  ...over,
-});
-
 function mount(
   over: {
     providers?: ProviderView[];
-    search?: SearchView | null;
     stagedKeys?: string[];
     busy?: boolean;
     changed?: boolean;
-    searchChanged?: boolean;
     error?: string | null;
   } = {},
   handlers: Partial<Record<string, unknown>> = {},
@@ -49,19 +39,15 @@ function mount(
   return render(Providers, {
     props: {
       providers: [],
-      search: null,
       stagedKeys: [],
       busy: false,
       changed: false,
-      searchChanged: false,
       error: null,
       onAdd: async () => {},
       onRemove: async () => {},
       onKeyEnv: async () => {},
       onStageKey: async () => {},
       onUnstageKey: async () => {},
-      onSearch: async () => {},
-      onAddSearch: async () => {},
       ...over,
       ...handlers,
     },
@@ -188,27 +174,17 @@ describe("Providers — the three key homes", () => {
 
 /// The `unsaved` marker is the one thing in this panel that is driven by the
 /// parent's state rather than the panel's own, so both directions get pinned:
-/// the flag renders a marker on *its own* heading and no other, and its absence
-/// renders nothing. Read off the `h2`, because the `[search]` row already
-/// carries a `staged` badge in the same style — a bare `getByText("unsaved")`
-/// could not tell the panel heading from that row.
+/// the flag renders a marker on the heading, and its absence renders nothing.
+/// Read off the `h2` rather than a bare `getByText("unsaved")`, which would
+/// match any badge in the panel as well as the heading.
 describe("Providers — the unsaved marker", () => {
-  it("marks the Providers heading when the parent says so", () => {
+  it("marks the heading when the parent says so", () => {
     mount({ providers: [provider()], changed: true });
     expect(screen.getByRole("heading", { name: /Providers unsaved/ })).toBeInTheDocument();
-    // `changed` is the *Providers* flag and must not reach the sibling heading:
-    // the two panels share a component, so crossing the wires is one keystroke.
-    expect(screen.queryByRole("heading", { name: /Search unsaved/ })).not.toBeInTheDocument();
   });
 
-  it("marks the Search heading off its own flag, not Providers'", () => {
-    mount({ search: search(), searchChanged: true });
-    expect(screen.getByRole("heading", { name: /Search unsaved/ })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: /Providers unsaved/ })).not.toBeInTheDocument();
-  });
-
-  it("marks neither heading when nothing is unsaved", () => {
-    mount({ providers: [provider()], search: search() });
+  it("marks nothing when nothing is unsaved", () => {
+    mount({ providers: [provider()] });
     expect(screen.queryByRole("heading", { name: /unsaved/ })).not.toBeInTheDocument();
   });
 });
@@ -228,10 +204,7 @@ describe("Providers — the panel's edges", () => {
     // The redaction boundary reaches into this panel: `view.rs` emits header
     // *names* only, and the copy has to say so or a reader assumes the values
     // were omitted from the panel rather than from the wire.
-    mount({
-      providers: [provider({ extra_header_names: ["x-opencode-session", "x-trace"] })],
-      search: null,
-    });
+    mount({ providers: [provider({ extra_header_names: ["x-opencode-session", "x-trace"] })] });
     expect(
       screen.getByText(/headers: x-opencode-session, x-trace \(values hidden\)/),
     ).toBeInTheDocument();
@@ -320,110 +293,5 @@ describe("Providers — no field invites the browser's autofill", () => {
 
     expectNoAutofill(screen.getByLabelText("id"));
     expectNoAutofill(screen.getByLabelText("base_url"));
-  });
-
-  it("opts the search fields out", async () => {
-    mount({ search: search() });
-    expectNoAutofill(screen.getByLabelText("max loops"));
-
-    await userEvent.click(screen.getByRole("button", { name: "Change key" }));
-    expectNoAutofill(screen.getByLabelText("variable name"));
-    await userEvent.selectOptions(screen.getByLabelText("key home"), "paste");
-    expectNoAutofill(screen.getByLabelText("value"));
-  });
-});
-
-describe("Providers — [search], which shares the key story", () => {
-  it("offers to add [search] only when it is off", () => {
-    const { unmount } = mount({ search: null });
-    expect(screen.getByRole("button", { name: "Add [search] (exa)" })).toBeInTheDocument();
-    // The copy names the consequence rather than the setting: with no `[search]`
-    // the server tools are stripped from bridged requests.
-    expect(screen.getByText(/server tools are stripped/)).toBeInTheDocument();
-    unmount();
-
-    mount({ search: search() });
-    expect(screen.queryByRole("button", { name: "Add [search] (exa)" })).not.toBeInTheDocument();
-  });
-
-  it("files the search key under the literal `search.exa` slot", async () => {
-    const seen: Array<[string, string]> = [];
-    mount({ search: search() }, {
-      onStageKey: async (slot: string, value: string) => {
-        seen.push([slot, value]);
-      },
-    });
-
-    await userEvent.click(screen.getByRole("button", { name: "Change key" }));
-    await userEvent.selectOptions(screen.getByLabelText("key home"), "paste");
-    await userEvent.type(screen.getByLabelText("value"), "exa-secret");
-    await userEvent.click(screen.getByRole("button", { name: "Stage it" }));
-
-    // `search.exa`, spelled out — the slot is a fixed literal here, not derived
-    // from the provider id the way `provider.<id>` is.
-    expect(seen).toEqual([["search.exa", "exa-secret"]]);
-  });
-
-  it("sends an env-var name through onSearch rather than onKeyEnv", async () => {
-    const searchArgs: Array<Record<string, unknown>> = [];
-    const envArgs: unknown[] = [];
-    mount({ search: search() }, {
-      onSearch: async (args: Record<string, unknown>) => {
-        searchArgs.push(args);
-      },
-      onKeyEnv: async (...args: unknown[]) => {
-        envArgs.push(args);
-      },
-    });
-
-    await userEvent.click(screen.getByRole("button", { name: "Change key" }));
-    await userEvent.type(screen.getByLabelText("variable name"), "EXA_API_KEY");
-    await userEvent.click(screen.getByRole("button", { name: "Point at it" }));
-
-    // `[search]` has no provider id, so its env home is `api_key_env` on the
-    // search block — routed through `onSearch`, never through `onKeyEnv`.
-    expect(searchArgs).toEqual([{ api_key_env: "EXA_API_KEY" }]);
-    expect(envArgs).toEqual([]);
-  });
-
-  it("sends the search slot back when unstaging", async () => {
-    const seen: string[] = [];
-    mount({ search: search(), stagedKeys: ["search.exa"] }, {
-      onUnstageKey: async (slot: string) => {
-        seen.push(slot);
-      },
-    });
-
-    // The regression this pins: `isStaged` is called with the literal slot here
-    // and with `slotFor(id)` in the provider row. Before, it took a provider id
-    // and wrapped it in `slotFor` itself, so this call looked for
-    // `provider.search.exa` — the Exa badge and this button could never render,
-    // and an Exa key that was staged could not be unstaged.
-    try {
-      await userEvent.click(screen.getByRole("button", { name: "Unstage key" }));
-    } finally {
-      expect(seen).toEqual(["search.exa"]);
-    }
-  });
-
-  it("sends max_loops as a number, not the input's string", async () => {
-    const seen: Array<Record<string, unknown>> = [];
-    mount({ search: search() }, {
-      onSearch: async (args: Record<string, unknown>) => {
-        seen.push(args);
-      },
-    });
-
-    // The handler is `onchange`, not `oninput`, so a number typed and left in
-    // the field sends nothing until it loses focus — typing alone would make
-    // this test pass against a handler that fires per keystroke.
-    const loops = screen.getByLabelText("max loops");
-    await userEvent.clear(loops);
-    await userEvent.type(loops, "3");
-    await userEvent.tab();
-
-    // `Number(...)` is load-bearing: a string would serialize into the document
-    // as `max_loops = "3"` and the writer would refuse it.
-    expect(seen).toEqual([{ max_loops: 3 }]);
   });
 });

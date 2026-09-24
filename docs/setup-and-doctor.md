@@ -248,10 +248,27 @@ input and testable without a tty.
 | `set-strategy` | `id`, `strategy` | `set_strategy` |
 | `add-target` | `id`, `provider`, `model`, … | `add_route_target` |
 | `remove-target` | `id`, `index` | `remove_route_target` |
-| `set-search` | `provider`, … | `set_search` |
+| `set-search` | `provider`, `base_url`, `max_loops`, `api_key_env`, `clear_inline_key` | `set_search` |
+| `remove-search` | — | `remove_search` |
 | `stage-key` | `slot`, `value` | `Plan::secret_writes` |
+| `stage-delete` | `slot` | `Plan::secret_deletes` |
 | `unstage-key` | `slot` | `Plan::secret_deletes` |
 | `save` | — | `commit_doc` |
+
+**`set-search`'s `api_key_env` is the field to keep an eye on.** Its absence was a
+live bug: `SetSearch` did not declare it, so the desktop shell's env-var write was
+discarded with `rc=0, error: null` — the window marked Search dirty, a later Save
+reported success, and the setting was not in the file. The struct now carries
+`#[serde(deny_unknown_fields)]` so the *next* stray field is refused loudly instead
+of dropped. The sweep stops there deliberately: the other arg structs still ignore
+what they do not know, and widening it is a behavior change (a caller sending a
+stray field would move from silently-ignored to refused) that wants its own pass.
+
+**`remove-search` takes no arguments.** It reads the provider off the *document*
+to stage `search.<provider>` for deletion — the key has no home without the block —
+so it needs nothing from the caller. It must be sent `{}` and never `""`:
+`parse_args` strips whitespace and refuses an empty string with "this op needs
+arguments".
 
 Every op that changes anything returns the **whole new session**, so a caller never
 reconstructs state and the two sides cannot drift.
@@ -264,8 +281,10 @@ Three conventions the callers must respect, all of them the wizard's:
   `[[routes.<id>.target]]` block.** `add-target` appends to the array (so chain
   index `i` is array index `i - 1`), `remove-target` takes the **array** index, and
   changing target 0 is `set-route`, not `remove-target`.
-- **A key's slot is `provider.<id>` or `search.exa`** — the plan key it is staged
-  under, and the only thing a caller ever learns about a staged secret.
+- **A key's slot is `provider.<id>` or `search.<provider>`** — the plan key it is
+  staged under, and the only thing a caller ever learns about a staged secret. The
+  search slot is keyed by the *provider*, not fixed at `search.exa`, so exa's key is
+  never reused for searxng.
 
 ### Refusals
 

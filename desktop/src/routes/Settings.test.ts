@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { render, screen, waitFor } from "@testing-library/svelte";
+import { render, screen, waitFor, within } from "@testing-library/svelte";
 import { userEvent } from "@testing-library/user-event";
 import { callCount, fake, lastCall } from "../test/tauri";
 import Settings from "./Settings.svelte";
@@ -12,7 +12,8 @@ import type {
   SessionPayload,
 } from "../lib/types";
 
-/// The session lifecycle, which is the whole reason this component exists.
+/// The session lifecycle, which is the whole reason this component exists, plus
+/// the sub-tab shell it grew when the one long scroll became five tabs.
 ///
 /// The one rule that matters most is the `dirty` flag: it is set *only* on the
 /// path that actually changed something. A refusal arrives as a thrown string
@@ -22,7 +23,14 @@ import type {
 ///
 /// Nothing here is asserted through the panels' internals; each edit is driven
 /// by the same click a user makes, so the shims between panel and `apply` are
-/// exercised too.
+/// exercised too. Since a panel is only mounted on its own tab, every edit below
+/// is preceded by a real click on that tab — see `openTab`.
+///
+/// The one thing the split must not cost is attribution. `dirty` alone can only
+/// say "somewhere"; a panel's `unsaved` badge sits on its own `<h2>`, which is
+/// gone the moment its tab is, so the component also puts a dot on the *tab
+/// button*. The tests below pin both, because a marker that only exists on the
+/// tab you are already looking at cannot tell you where to look.
 
 const configView = (over: Partial<ConfigView> = {}): ConfigView => ({
   config_path: "/tmp/config.toml",
@@ -87,6 +95,14 @@ async function mount(payload = session(), checks: CheckView[] = []) {
   return result;
 }
 
+/// Switch sub-tabs the way a user does. The panels are mounted per tab, so this
+/// is the only way to reach a control on a tab other than the landing one — and
+/// reaching it any other way would not exercise the shell that gates it. Matched
+/// on a prefix, because a tab button may carry a dot or a Doctor count beside its
+/// name and the accessible name picks up the count.
+const tab = (name: string) => screen.getByRole("tab", { name: new RegExp(`^${name}`) });
+const openTab = (name: string) => userEvent.click(tab(name));
+
 const saveButton = () => screen.getByRole("button", { name: "Save" });
 const discardButton = () => screen.getByRole("button", { name: "Discard changes" });
 
@@ -106,10 +122,87 @@ const dirtyLine = (panels: string) =>
   );
 
 /// The heading marker, as rendered. Read off the `h2` rather than a bare
-/// `getByText("unsaved")`, because `[search]`'s row already carries a `staged`
-/// badge in the same style — a panel-scoped query is what keeps the two apart.
+/// `getByText("unsaved")`, because a panel's row can carry a `staged` badge in
+/// the same style — a heading-scoped query is what keeps the two apart. Only
+/// visible while the panel's own tab is showing.
 const marked = (panel: string) =>
   screen.getByRole("heading", { name: new RegExp(`${panel} unsaved`) });
+
+/// The dot on a sub-tab button, which is the marker that survives a tab switch.
+const tabDot = (name: string) => within(tab(name)).getByTitle("unsaved changes");
+
+describe("Settings — the sub-tab shell", () => {
+  it("renders the five tabs with Overview showing first", async () => {
+    await mount();
+
+    const names = screen.getAllByRole("tab").map((t) => t.textContent?.trim());
+    expect(names).toEqual(["Overview", "Providers", "Search", "Routes", "Doctor"]);
+    // Overview is the landing page: the Gateway summary is on screen at first
+    // paint, which is what makes the load barrier in `mount` work at all.
+    expect(tab("Overview")).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("heading", { name: /unsaved/ })).not.toBeInTheDocument();
+  });
+
+  it("summarizes the view on the Overview landing", async () => {
+    await mount();
+    expect(screen.getByText("127.0.0.1:8710")).toBeInTheDocument();
+    // The path, not the word `config` that labels it: the label sits in the same
+    // `<div>` as its `<code>`, so `/config/` matches the parent and the child and
+    // trips the multiple-elements error. The path's own text is unique.
+    expect(screen.getByText("/tmp/config.toml")).toBeInTheDocument();
+  });
+
+  it("mounts exactly one panel at a time", async () => {
+    await mount(session({ view: { kind: "view", view: configView({ providers: [provider()], routes: [route()] }) } }));
+
+    // The route id is a Routes-panel fact and must not be on Overview.
+    expect(screen.queryByText("claude-sonnet-5")).not.toBeInTheDocument();
+    await openTab("Routes");
+    expect(screen.getByText("claude-sonnet-5")).toBeInTheDocument();
+    await openTab("Providers");
+    // A regex, not the bare string: `Providers.svelte` renders the whole base URL
+    // in one `<span>`, and a string argument to `getByText` is an exact match on
+    // the element's *entire* text — so `"opencode.ai/zen"` misses
+    // `"https://opencode.ai/zen"`.
+    expect(screen.getByText(/opencode\.ai\/zen/)).toBeInTheDocument();
+    expect(screen.queryByText("claude-sonnet-5")).not.toBeInTheDocument();
+  });
+
+  it("switches selection to the tab that was clicked", async () => {
+    await mount();
+    await openTab("Search");
+    expect(tab("Search")).toHaveAttribute("aria-selected", "true");
+    expect(tab("Overview")).toHaveAttribute("aria-selected", "false");
+  });
+
+  it("keeps the Save bar reachable from every tab", async () => {
+    await mount();
+    // Nothing is dirty, so the bar's two buttons are closed — but present, which
+    // is the point: the bar is lifted above the tab bodies rather than living on
+    // the landing page, so an edit made on Routes is one click from being saved.
+    for (const name of ["Overview", "Providers", "Search", "Routes", "Doctor"]) {
+      await openTab(name);
+      expect(saveButton()).toBeInTheDocument();
+      expect(saveButton()).toBeDisabled();
+      expect(discardButton()).toBeInTheDocument();
+    }
+  });
+
+  it("counts Doctor's findings on the Doctor tab", async () => {
+    const checks: CheckView[] = [
+      { id: "key-resolvable", status: "warn", summary: "…" },
+      { id: "config-parse", status: "fail", summary: "…" },
+      { id: "listen", status: "ok", summary: "…" },
+      { id: "live", status: "skip", summary: "…" },
+    ];
+    await mount(session(), checks);
+
+    // The same `notable` predicate Doctor's own list uses — `fail` and `warn`,
+    // not `ok` and not `skip` — so the count on the button and the rows in the
+    // panel cannot disagree.
+    expect(within(tab("Doctor")).getByText("2")).toBeInTheDocument();
+  });
+});
 
 describe("Settings — the first load", () => {
   it("seeds a session and leaves everything clean", async () => {
@@ -122,13 +215,7 @@ describe("Settings — the first load", () => {
     expect(clean()).toBeInTheDocument();
     expect(saveButton()).toBeDisabled();
     expect(discardButton()).toBeDisabled();
-  });
-
-  it("renders the redacted view it was handed", async () => {
-    await mount();
-    // The gateway summary comes from the view, not from a separate probe.
-    expect(screen.getByText("127.0.0.1:8710")).toBeInTheDocument();
-    expect(screen.getByText("claude-sonnet-5")).toBeInTheDocument();
+    expect(screen.queryAllByTitle("unsaved changes")).toHaveLength(0);
   });
 
   it("shows a read failure as an error panel, not a broken window", async () => {
@@ -156,6 +243,7 @@ describe("Settings — an edit that succeeds", () => {
     await mount();
     fake("config_edit_apply", () => session({ id: "s1" }));
 
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
 
     // The op went out against the live session id with the CLI's own arg names.
@@ -179,11 +267,33 @@ describe("Settings — which panel is holding the edit", () => {
     await mount();
     fake("config_edit_apply", () => session());
 
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
 
     await waitFor(() => expect(marked("Routes")).toBeInTheDocument());
-    expect(screen.queryByRole("heading", { name: /Providers unsaved/ })).not.toBeInTheDocument();
     expect(dirtyLine(" in Routes")).toBeInTheDocument();
+    expect(tabDot("Routes")).toBeInTheDocument();
+    expect(within(tab("Providers")).queryByTitle("unsaved changes")).not.toBeInTheDocument();
+  });
+
+  it("keeps the edit's dot visible from a tab that is not holding it", async () => {
+    await mount();
+    fake("config_edit_apply", () => session());
+
+    await openTab("Routes");
+    await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
+    await waitFor(() => expect(marked("Routes")).toBeInTheDocument());
+
+    await openTab("Overview");
+    // The panel's own heading went with its tab, so the dot is the only thing on
+    // screen saying where the edit is — which is the reason it exists.
+    expect(screen.queryByRole("heading", { name: /unsaved/ })).not.toBeInTheDocument();
+    expect(dirtyLine(" in Routes")).toBeInTheDocument();
+    expect(tabDot("Routes")).toBeInTheDocument();
+
+    // And it is a way back: the tab it names is the one holding the panel.
+    await openTab("Routes");
+    expect(marked("Routes")).toBeInTheDocument();
   });
 
   it("names the panels in screen order, not the order they were edited", async () => {
@@ -204,16 +314,18 @@ describe("Settings — which panel is holding the edit", () => {
     // `Remove` is unambiguous against this fixture: the one route has a single
     // target, and target 0 renders no remove button at all, so the only button
     // by that name is the provider's.
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
-    await waitFor(() => expect(marked("Routes")).toBeInTheDocument());
+    await waitFor(() => expect(dirtyLine(" in Routes")).toBeInTheDocument());
+    await openTab("Providers");
     await userEvent.click(screen.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(marked("Providers")).toBeInTheDocument());
 
     // `PANELS.filter(...)`, not an append log: a join over arrival order would
     // read `Routes, Providers` here, which is not the order on screen.
     expect(dirtyLine(" in Providers, Routes")).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /Providers unsaved/ })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /Routes unsaved/ })).toBeInTheDocument();
+    // Both dots, though only the Providers panel is mounted.
+    expect(screen.getAllByTitle("unsaved changes")).toHaveLength(2);
   });
 
   it("marks Providers for a staged key, which is a plan edit not a document one", async () => {
@@ -223,6 +335,7 @@ describe("Settings — which panel is holding the edit", () => {
     // a stray `apply` would reject loudly instead of quietly passing.
     fake("config_edit_stage_key", () => session({ staged_keys: ["provider.zen"] }));
 
+    await openTab("Providers");
     await userEvent.click(screen.getByRole("button", { name: "Change key" }));
     await userEvent.selectOptions(screen.getByLabelText("key home"), "paste");
     await userEvent.type(screen.getByLabelText("value"), "sk-secret");
@@ -231,9 +344,10 @@ describe("Settings — which panel is holding the edit", () => {
     // `stage-key` touches no document key at all, so it never reaches `apply`'s
     // op table — the slot's own name is what says which panel it belongs to.
     await waitFor(() => expect(marked("Providers")).toBeInTheDocument());
+    expect(dirtyLine(" in Providers")).toBeInTheDocument();
   });
 
-  it("marks Search for the fixed `search.exa` slot", async () => {
+  it("marks Search for the derived `search.<provider>` slot", async () => {
     await mount(
       session({
         view: { kind: "view", view: configView({ search: searchView() }) },
@@ -241,17 +355,18 @@ describe("Settings — which panel is holding the edit", () => {
     );
     fake("config_edit_stage_key", () => session({ staged_keys: ["search.exa"] }));
 
+    await openTab("Search");
     await userEvent.click(screen.getByRole("button", { name: "Change key" }));
     await userEvent.selectOptions(screen.getByLabelText("key home"), "paste");
     await userEvent.type(screen.getByLabelText("value"), "exa-secret");
     await userEvent.click(screen.getByRole("button", { name: "Stage it" }));
 
-    // The regression this pins: `provider.<id>` and `search.exa` are both slots,
-    // and a `slot.startsWith("provider")` test would file Search's key under
-    // Providers — the one panel that can never resolve it.
+    // The regression this pins: `provider.<id>` and `search.<provider>` are both
+    // slots, and a `slot.startsWith("provider")` test would file Search's key
+    // under Providers — the one panel that can never resolve it.
     await waitFor(() => expect(marked("Search")).toBeInTheDocument());
-    expect(screen.queryByRole("heading", { name: /Providers unsaved/ })).not.toBeInTheDocument();
     expect(dirtyLine(" in Search")).toBeInTheDocument();
+    expect(within(tab("Providers")).queryByTitle("unsaved changes")).not.toBeInTheDocument();
   });
 
   it("marks nothing for an edit the CLI refused", async () => {
@@ -260,18 +375,20 @@ describe("Settings — which panel is holding the edit", () => {
       throw "a failover strategy needs at least two targets";
     });
 
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
 
     await screen.findByText("a failover strategy needs at least two targets");
     // `mark` is on the success path only, the same as `dirty`: a marker on a
     // panel nothing changed in would be the exact lie this feature exists to fix.
     expect(clean()).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: /unsaved/ })).not.toBeInTheDocument();
+    expect(screen.queryAllByTitle("unsaved changes")).toHaveLength(0);
   });
 
   it("clears every marker on save", async () => {
     await mount();
     fake("config_edit_apply", () => session());
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
     await waitFor(() => expect(marked("Routes")).toBeInTheDocument());
 
@@ -279,12 +396,16 @@ describe("Settings — which panel is holding the edit", () => {
     await userEvent.click(saveButton());
 
     await waitFor(() => expect(clean()).toBeInTheDocument());
+    // The tab dot goes with the heading marker: both read `touchedList`, so a
+    // survivor would mean the two had drifted apart.
+    expect(screen.queryAllByTitle("unsaved changes")).toHaveLength(0);
     expect(screen.queryByRole("heading", { name: /unsaved/ })).not.toBeInTheDocument();
   });
 
   it("clears every marker on discard", async () => {
     await mount();
     fake("config_edit_apply", () => session());
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
     await waitFor(() => expect(marked("Routes")).toBeInTheDocument());
 
@@ -296,7 +417,7 @@ describe("Settings — which panel is holding the edit", () => {
     // was just thrown away.
     await waitFor(() => expect(callCount("config_edit_load")).toBe(2));
     await waitFor(() => expect(clean()).toBeInTheDocument());
-    expect(screen.queryByRole("heading", { name: /unsaved/ })).not.toBeInTheDocument();
+    expect(screen.queryAllByTitle("unsaved changes")).toHaveLength(0);
   });
 
   it("keeps a session error from being read as a marker", async () => {
@@ -307,11 +428,27 @@ describe("Settings — which panel is holding the edit", () => {
     // marker are both right; what must not happen is the error text retracting
     // the marker or the bar naming a panel that did not hold the edit.
     fake("config_edit_apply", () => session({ error: "the seed is already editable" }));
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
 
     await screen.findByText("the seed is already editable");
     await waitFor(() => expect(dirtyLine(" in Routes")).toBeInTheDocument());
     expect(marked("Routes")).toBeInTheDocument();
+  });
+
+  it("does not advance the round-robin or re-seed the view on a tab switch", async () => {
+    await mount();
+    const before = callCount("config_edit_load");
+
+    for (const name of ["Providers", "Search", "Routes", "Doctor", "Overview"]) {
+      await openTab(name);
+    }
+
+    // Navigation is a local `$state` write and nothing else: switching tabs must
+    // not re-read the file, or a user browsing the tabs would silently discard
+    // the session's staged keys.
+    expect(callCount("config_edit_load")).toBe(before);
+    expect(callCount("config_edit_apply")).toBe(0);
   });
 });
 
@@ -323,6 +460,7 @@ describe("Settings — an edit the CLI refuses", () => {
       throw "a failover strategy needs at least two targets";
     });
 
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
 
     await screen.findByText("a failover strategy needs at least two targets");
@@ -337,6 +475,7 @@ describe("Settings — an edit the CLI refuses", () => {
     fake("config_edit_apply", () => {
       throw "one target";
     });
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
     await screen.findByText("one target");
 
@@ -352,6 +491,7 @@ describe("Settings — save", () => {
   it("adopts the returned session and clears dirty", async () => {
     await mount();
     fake("config_edit_apply", () => session());
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
     await waitFor(() => expect(saveButton()).toBeEnabled());
 
@@ -373,6 +513,7 @@ describe("Settings — save", () => {
   it("treats a refusal as nothing written", async () => {
     await mount();
     fake("config_edit_apply", () => session());
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
     await waitFor(() => expect(saveButton()).toBeEnabled());
 
@@ -392,6 +533,7 @@ describe("Settings — discard", () => {
   it("forgets the staged session and reloads from the file", async () => {
     await mount();
     fake("config_edit_apply", () => session());
+    await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
     await waitFor(() => expect(discardButton()).toBeEnabled());
 
