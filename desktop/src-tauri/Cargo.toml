@@ -1,6 +1,6 @@
 [package]
 name = "turnpike-desktop"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "Desktop shell for the turnpike local LLM gateway: menu-bar item, process supervisor, start-at-login, read-only settings."
 license = "MIT"
