@@ -4,3 +4,10 @@ config.toml
 .DS_Store
 .turnpike-todo.md
 .turnpike-plan.md
+
+# Editor scratch files. A `git add -A` would otherwise commit a swap file
+# holding a half-written buffer, which is not anyone's intent.
+*.swp
+*.swo
+*.swn
+*~
