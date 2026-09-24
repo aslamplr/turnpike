@@ -16,7 +16,7 @@ disagree, the doc is wrong.
 | [secrets.md](secrets.md) | The encrypted key store: layout, crypto, the precedence chain, what it does and does not protect |
 | [setup-and-doctor.md](setup-and-doctor.md) | `turnpike setup` (the wizard, comment preservation, the migration invariant), `turnpike config` (the redacted view), and `turnpike doctor` (the 26 checks, `--json`), plus the stdout/stderr prompt discipline |
 | [launchers.md](launchers.md) | `turnpike launch`: Claude Code env vars, Claude Desktop gateway profile, model resolution |
-| [desktop.md](desktop.md) | The desktop shell: the supervisor state machine over `turnpike serve`, the tray, autostart, the read-only settings window, the CLI it bundles and installs to `PATH`, the auto-updater, and the release pipeline |
+| [desktop.md](desktop.md) | The desktop shell: the supervisor state machine over `turnpike serve`, the tray, autostart, the settings window that edits the config, the CLI it bundles and installs to `PATH`, the auto-updater, and the release pipeline |
 
 Each doc follows the same shape: what the component does, how it works (with
 the key code paths), and the design decisions behind it — including the

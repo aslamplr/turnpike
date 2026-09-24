@@ -34,6 +34,14 @@ Each script downloads the newest release, verifies it against the release's
 | `turnpike-aarch64-apple-darwin.tar.gz` | macOS arm64 | `~/.local/bin/turnpike` |
 | `turnpike-x86_64-pc-windows-msvc.zip` | Windows x86_64 | `%LOCALAPPDATA%\turnpike\bin\turnpike.exe` |
 
+It then **offers the Desktop app** — the menu-bar item, the supervisor, and the
+config window from [desktop/](desktop/). Answer `n` (or run with
+`TURNPIKE_DESKTOP=0`) to install the CLI alone; with no terminal to ask on, the
+script skips it rather than hanging. The app is downloaded from the same release
+(`turnpike_desktop-…`) and verified against `SHA256SUMS-desktop` when that
+manifest is published — a missing one warns and continues, because the CLI half
+has already succeeded.
+
 Pin a version with `TURNPIKE_VERSION=v0.1.2`; skip the checksum with
 `TURNPIKE_SKIP_SHA256=1`. Other platforms build from source:
 `cargo build --release` → `target/release/turnpike`.
@@ -109,7 +117,8 @@ turnpike launch claude-desktop --restore
 ```
 
 There is also a **desktop shell** (menu-bar item, a supervisor that runs the
-gateway for you, and a read-only settings window) in [desktop/](desktop/) — Tauri
+gateway for you, and a settings window that edits the config) in
+[desktop/](desktop/) — Tauri
 v2 + Svelte, published on each release as an **ad-hoc signed** macOS `.dmg` and an
 unsigned Windows installer (`cd desktop && npm run tauri dev` to hack on it). It
 supervises the same `turnpike` binary and **carries a copy of it**, offering to

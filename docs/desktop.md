@@ -26,7 +26,7 @@ release** on launch and installs it on request — see
 | Start / stop / restart the gateway | the tray menu and the window's top bar |
 | Say whether it is up | the tray's status item and tooltip |
 | Start at login | optional, off until you turn it on |
-| Show the config | read-only: providers, routes, targets, search, key **tiers** |
+| Show the config | providers, routes, targets, search, key **tiers** — and edit all of it (see the last row) |
 | Show the gateway's output | a log panel; stderr marked as diagnostics |
 | Check for a newer release | on launch, and from the tray |
 | **Edit the config** | **yes** — the Settings window is a second front-end onto the same mutation core (`turnpike config-edit`); `turnpike setup` remains the terminal one |
@@ -630,8 +630,10 @@ download.
 
 A second and unrelated keypair signs the **update payload**, not the app:
 `tauri signer generate` produces a minisign pair. The public half is
-`plugins.updater.pubkey` in `tauri.conf.json` — the whole two-line file's content,
-not just the base64 line. The private half is `TAURI_SIGNING_PRIVATE_KEY` in this
+`plugins.updater.pubkey` in `tauri.conf.json` — the **base64 line alone**, not the
+whole file: the key is a base64 *string* in JSON, and the two
+`untrusted comment:` lines the `.pub` file carries are minisign's own header, not
+part of the value. The private half is `TAURI_SIGNING_PRIVATE_KEY` in this
 repo's Actions secrets, plus `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if it was
 generated with one. Note that a `.env` file does **not** work here: the Tauri CLI
 reads the process environment.
