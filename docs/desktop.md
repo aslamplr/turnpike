@@ -69,7 +69,6 @@ desktop/
     src/resolve.rs              # where the binary and config.toml are
     src/settings.rs             # consumes `turnpike config --json`
     src/config_edit.rs          # the editable session: shells out to `turnpike config-edit`
-    src/config_edit.rs          # the editable session: shells out to `turnpike config-edit`
     src/cli_install.rs          # puts the bundled CLI on the user's PATH
     src/update.rs               # checks for a newer release, installs on request
     src/tray.rs                 # the menu-bar item
@@ -697,10 +696,6 @@ mutation and no fixtures on disk:
   that what this side sends parses as the CLI's session shape (the contract that
   would otherwise only fail in the window), and that the staged slots come back
   sorted so a badge does not flap between repaints.
-- `config_edit.rs` — that a CLI session round-trips through this side unchanged,
-  that what this side sends parses as the CLI's session shape (the contract that
-  would otherwise only fail in the window), and that the staged slots come back
-  sorted so a badge does not flap between repaints.
 - `cli_install.rs` — `classify` over all four states (including an unparsed version
   staying `ready`), `parse_version` against the shapes `turnpike --version` actually
   prints, the pure PATH arithmetic (`path_has_entry` / `path_with_entry`, including
@@ -715,6 +710,84 @@ mutation and no fixtures on disk:
 **Manual only**, because they need a GUI and a real process: tray rendering, plist
 creation, the real spawn/kill, readiness timing, log streaming, and
 quit-kills-child.
+
+### The frontend, in three tiers
+
+The window is ~1200 lines of Svelte and TypeScript that had no automated coverage
+at all, and the Rust tests above cannot reach any of it — `config_edit.rs`'s ten
+tests parse canned JSON `const`s, so they pin the *contract* between the two sides
+and not the panel logic that consumes it. Three tiers, in the order they are worth
+building:
+
+**Tier 1 — mounted components against a fake `invoke`.** Implemented. The real
+components render under jsdom with a scripted `invoke`, so a test exercises the
+actual template, the actual `$derived`s and the actual click handlers — no
+browser, no WebDriver, no Rust. `desktop/vitest.config.ts` aliases
+`@tauri-apps/api/core` and `@tauri-apps/api/event` to `src/test/tauri.ts`, a
+scripted double in the same spirit as the Rust side's `MemoryStore` and
+`ScriptedPrompt`: injection by construction, not by global.
+
+That one alias is a complete seam because `api.ts` and `stores.ts` are the **only**
+two files that import `@tauri-apps` — every component takes its commands through
+them, so nothing else in the tree can reach a real IPC and a command with no fake
+registered **rejects loudly** rather than returning undefined. `setup.ts` resets
+the fakes before and after each test, because a fake leaking between tests is how
+a suite starts passing for the wrong reason.
+
+Covered today, six suites: `kit.svelte`'s `keyTone`/`windows` and the shape of the
+`noAutofill` opt-out every editor field spreads; `Doctor.svelte`'s `notable` filter
+and its fail/warn tallies; `Routes.svelte`'s strategy gate, the `i - 1` array index
+its remove buttons send, and a `noAutofill` assertion per text field; `Settings.svelte`'s
+session lifecycle — the `dirty`-only-on-success rule (a refusal arrives as a thrown
+string and must not light up Save), the `config_edit_apply` op/args wire shape,
+and the save and discard paths; `Providers.svelte`'s three key homes, the slot each
+one files under (`provider.<id>`, and the literal `search.exa`), and the same
+`noAutofill` assertion per text field; and `App.svelte`'s two banners and the status
+bar. Edits are driven by the click a user makes, not by calling a panel's internals,
+so the shims between a panel and `apply` are exercised too. The suite is
+`cd desktop && npm test`.
+
+It has already earned its keep: mounting the real components found two defects
+no Rust test could reach — `Providers.svelte`'s `isStaged` wrapped a
+slot it had been handed as a provider id, so the search row asked for
+`provider.search.exa` and never matched, leaving a staged Exa key with no
+Unstage control; and `App.svelte`'s autostart checkbox kept the state its own
+click had set after the platform refused the toggle, because Svelte re-applies a
+`checked={}` binding only when the expression *changes* and a refused toggle
+leaves the store where it was — so the box claimed login-start was on directly
+above an error saying it was not.
+
+What Tier 1 does **not** reach, by construction: everything that is not this
+process. Tier 2 covers the boundary it stops at.
+
+**Tier 2 — the writer against the real CLI.** Not yet implemented. Tier 1 asserts
+what the window sends; nothing yet asserts that the CLI accepts it. The precedent
+already exists in the repo: `wizard_and_cli_produce_the_same_bytes`
+(`src/setup/cli.rs`) drives the wizard and a spawned `turnpike` and compares the
+resulting bytes, so "the UI's edit means what the CLI thinks it means" is testable
+the same way. The target is `config_edit.rs`'s op shim: feed each op the window can
+emit through a real `turnpike config-edit` and assert the session that comes back.
+A rename on the Rust side of the contract would then fail here rather than in the
+window, which is the same property `settings.rs` gets from deserializing a real
+payload.
+
+**Tier 3 — the command surface.** Not yet implemented. `api.ts` names exactly 20
+commands in its `invoke<T>("…")` calls, and `lib.rs`'s `generate_handler!` registers
+exactly 20 — the same 20, in the same set, today. Nothing checks that they agree, so
+a renamed Rust command fails at click time in the window; a typo'd name in a test
+double would fail just as quietly if the fake were keyed on the name rather than
+missing. A small test that collects every `invoke` string and asserts each resolves
+to a registered handler turns that from a runtime surprise into a build failure.
+
+The two sides are not one list read twice: the frontend names a command, and
+`generate_handler!` names a **Rust path** — `config_edit::doctor_view` — from which
+Tauri derives the wire name `doctor_view`. So the comparison has to know that a
+module path is a prefix and not part of the name, which is the reason it is worth
+pinning in a test rather than by eye.
+
+Tier 3 is the cheapest of the three and does not need jsdom — but it does need the
+two lists to be readable from one place, which is why it is written down before it
+is built.
 
 ## See also
 

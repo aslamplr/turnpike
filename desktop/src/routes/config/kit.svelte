@@ -17,4 +17,20 @@
 
   export const windows = (n: number | null) =>
     n === null ? "—" : n.toLocaleString("en-US");
+
+  /// Opting every text-entry control out of the browser's own help.
+  ///
+  /// Spread onto each text-entry `<input>` in the editor (`{...noAutofill}`).
+  /// Left on, the browser offers a dropdown of the user's saved form history
+  /// over a provider id or a base URL, and `autocorrect` would silently rewrite
+  /// a value the user pasted. Both are wrong here: these fields hold identifiers
+  /// and keys, not prose.
+  ///
+  /// One definition rather than three attributes repeated on ten inputs, so a
+  /// field added later cannot quietly opt back in.
+  export const noAutofill = {
+    autocomplete: "off",
+    autocorrect: "off",
+    spellcheck: false,
+  } as const;
 </script>

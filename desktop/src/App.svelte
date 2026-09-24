@@ -7,6 +7,7 @@
   import Logs from "./routes/Logs.svelte";
 
   let tab: "settings" | "logs" = "settings";
+  let autostartBox: HTMLInputElement | null = null;
 
   // Session-only: a dismissal is not a decision never to install, so the next
   // launch offers again.
@@ -29,10 +30,16 @@
 
   async function toggleAutostart() {
     lastError.set(null);
-    // The command applies the change and broadcasts what actually took effect,
-    // which may differ from the ask — the checkbox follows that event, not the
-    // click.
-    await api.autostartSet(!$autostart);
+    // The command applies the change and reports what actually took effect,
+    // which may differ from the ask.
+    const actual = await api.autostartSet(!$autostart);
+    // The click flips the DOM box before the platform answers, and Svelte only
+    // re-applies a `checked={}` binding when the expression *changes*. A toggle
+    // the platform refused leaves the store at `false` — unchanged — so Svelte
+    // never re-renders the input and the box would go on claiming login-start is
+    // on, right below an error saying it is not. Re-assert it from the state the
+    // command reported, which is what the plist actually says.
+    if (autostartBox) autostartBox.checked = actual;
   }
 
   /// What to offer, if anything. `null` means there is nothing to do: a CLI is
@@ -187,7 +194,12 @@
   <button on:click={api.stop} disabled={!stoppable}>Stop</button>
   <button on:click={api.restart} disabled={!running}>Restart</button>
   <label class="check">
-    <input type="checkbox" checked={$autostart} on:change={toggleAutostart} />
+    <input
+      type="checkbox"
+      checked={$autostart}
+      bind:this={autostartBox}
+      on:change={toggleAutostart}
+    />
     Start at login
   </label>
 </div>

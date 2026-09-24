@@ -496,7 +496,12 @@ fn save(session: &Session) -> Result<()> {
         }
     }
 
-    commit_doc(&doc, &plan, &path, &mut store, false)
+    // The report is dropped rather than printed, because this stdout is the JSON
+    // reply and nothing else: `apply` sends it straight to the desktop shell,
+    // which parses it as one object. The shell re-renders the view itself, so
+    // there is nothing here for a human to read. A prose line ahead of the JSON
+    // is a save the desktop reports as failed having in fact written the file.
+    commit_doc(&doc, &plan, &path, &mut store, false).map(|_| ())
 }
 
 /// The wizard's `set_strategy`, minus the prompts.

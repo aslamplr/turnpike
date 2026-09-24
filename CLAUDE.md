@@ -207,7 +207,10 @@ So when behavior changes, update the relevant `docs/*.md` too.
 ## Testing conventions
 
 - Inline `#[cfg(test)] mod tests` per file — unit tests exercise translation, stream grammar,
-  config resolution, and launcher env/profile shape.
+  config resolution, and launcher env/profile shape. The one exception is `tests/config_edit_stdout.rs`:
+  a process-boundary property (spawned binary, its stdout is one JSON line) that an inline test
+  cannot assert, because every test in the binary shares one stdout and a capture there races
+  the suite.
 - **No env mutation in tests.** `TURNPIKE_HOME` points at `temp_root(tag)` instead of mutating
   `HOME`; `resolve_chain` is pure for the same reason.
 - Mock injection **by construction**, not by global: `MemoryStore` for the secret store,
@@ -216,7 +219,9 @@ So when behavior changes, update the relevant `docs/*.md` too.
 - Router-level tests use axum `tower::ServiceExt::oneshot` against a stub upstream bound to
   `127.0.0.1:0` under tokio. A mock `SearchProvider` is injected via `SearchManager::new` for
   the search middleware loop test.
-- Everything is an async-trait + reqwest-anywhere; no test fixtures on disk.
+- Everything is an async-trait + reqwest-anywhere; no test fixtures on disk — with the same
+  exception: `tests/config_edit_stdout.rs` writes a scratch config and store under a temp dir
+  (never `~/.turnpike`, so no env mutation).
 
 ## Not implemented by design
 

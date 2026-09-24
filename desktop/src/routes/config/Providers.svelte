@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { ProviderView, SearchView } from "../../lib/types";
-  import { keyTone } from "./kit.svelte";
+  import { keyTone, noAutofill } from "./kit.svelte";
 
   /// Providers and `[search]`, which share a key story and nothing else.
   ///
@@ -48,7 +48,11 @@
   let newBase = $state("");
 
   const slotFor = (id: string) => `provider.${id}`;
-  const isStaged = (id: string) => stagedKeys.includes(slotFor(id));
+  /// Takes the *slot*, not a provider id: `[search]`'s slot is the fixed
+  /// literal `search.exa`, so threading it through `slotFor` would look for
+  /// `provider.search.exa` and never match — a staged Exa key could be staged
+  /// and then never unstaged.
+  const isStaged = (slot: string) => stagedKeys.includes(slot);
 
   function openKey(id: string) {
     editingKey = id;
@@ -105,7 +109,7 @@
           <button class="ghost" onclick={() => (editingKey === p.id ? (editingKey = null) : openKey(p.id))} disabled={busy}>
             Change key
           </button>
-          {#if isStaged(p.id)}
+          {#if isStaged(slotFor(p.id))}
             <button class="ghost" onclick={() => onUnstageKey(slotFor(p.id))} disabled={busy}>
               Unstage key
             </button>
@@ -132,6 +136,7 @@
                 placeholder={keyMode === "env" ? "OPENCODE_API_KEY" : ""}
                 bind:value={keyDraft}
                 disabled={busy}
+                {...noAutofill}
               />
             </div>
             <div class="sub">
@@ -155,14 +160,20 @@
     <div class="edit">
       <div class="edit-fields">
         <label for="np-id">id</label>
-        <input id="np-id" bind:value={newId} placeholder="zen" disabled={busy} />
+        <input id="np-id" bind:value={newId} placeholder="zen" disabled={busy} {...noAutofill} />
         <label for="np-spec">spec</label>
         <select id="np-spec" bind:value={newSpec} disabled={busy}>
           <option value="anthropic">anthropic</option>
           <option value="openai">openai</option>
         </select>
         <label for="np-base">base_url</label>
-        <input id="np-base" bind:value={newBase} placeholder="https://opencode.ai/zen" disabled={busy} />
+        <input
+          id="np-base"
+          bind:value={newBase}
+          placeholder="https://opencode.ai/zen"
+          disabled={busy}
+          {...noAutofill}
+        />
       </div>
       <div class="actions">
         <button onclick={addProvider} disabled={busy || !newId.trim() || !newBase.trim()}>Add provider</button>
@@ -205,6 +216,7 @@
           value={search.max_loops}
           disabled={busy}
           onchange={(e) => onSearch({ max_loops: Number((e.currentTarget as HTMLInputElement).value) })}
+          {...noAutofill}
         />
       </div>
       <div class="actions">
@@ -237,6 +249,7 @@
               placeholder={keyMode === "env" ? "EXA_API_KEY" : ""}
               bind:value={keyDraft}
               disabled={busy}
+              {...noAutofill}
             />
           </div>
           <div class="actions">

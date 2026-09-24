@@ -191,8 +191,8 @@ pub(crate) fn run_with(
                  providers).\n"
             ),
             5 => {
-                state.commit(&path, &mut store, opts.no_validate)?;
-                print_handoff(&path);
+                let report = state.commit(&path, &mut store, opts.no_validate)?;
+                print_handoff(&path, &report);
                 return Ok(());
             }
             _ => break,
@@ -816,9 +816,26 @@ impl WizardState {
         path: &Path,
         store: &mut secrets::StoreCtx,
         no_validate: bool,
-    ) -> Result<()> {
+    ) -> Result<CommitReport> {
         commit_doc(&self.doc, &self.plan, path, store, no_validate)
     }
+}
+
+/// What a successful [`commit_doc`] did, for the caller to report.
+///
+/// Returned rather than printed because the two callers own different
+/// descriptors: the wizard's stdout is a terminal a human reads, while
+/// `config-edit`'s stdout is JSON the desktop shell parses. A print here is a
+/// print on both — and a line of prose ahead of that JSON is a save the shell
+/// reports as failed, having in fact written the file. See `cli::save`.
+#[derive(Debug, Default)]
+pub(crate) struct CommitReport {
+    /// Where the pre-existing config was backed up, if it was.
+    pub backup: Option<PathBuf>,
+    /// A backup that could not be made. Not fatal: the config is still written.
+    pub backup_error: Option<String>,
+    /// How many plaintext secrets were moved into the store.
+    pub secrets_stored: usize,
 }
 
 /// Write `doc` and `plan` to `path`, in the order that keeps a crash recoverable.
@@ -837,6 +854,9 @@ impl WizardState {
 ///    hard bail that aborts before the config is touched.
 /// 4. Only then the config itself, atomically.
 ///
+/// It **prints nothing** — the outcome comes back as a [`CommitReport`] and the
+/// caller says it in its own idiom.
+///
 /// `no_validate` is not a CLI flag: `SetupOptions` carries it so the wizard's
 /// own tests can drive the write path past the gate, and `run()` always passes
 /// false. So the message must not offer it as a way out — naming a flag that
@@ -847,7 +867,7 @@ pub(crate) fn commit_doc(
     path: &Path,
     store: &mut secrets::StoreCtx,
     no_validate: bool,
-) -> Result<()> {
+) -> Result<CommitReport> {
     if !no_validate {
         doc.validated().context(
             "the config being saved is not valid — nothing was written; \
@@ -856,15 +876,17 @@ pub(crate) fn commit_doc(
         )?;
     }
 
+    let mut report = CommitReport::default();
+
     // 1. Back up the current config, outside the directory being written.
     //    Write-once per namespace, so the backup is the pre-turnpike state
     //    and a second `setup` does not overwrite it with a wizard-written
     //    file.
     if path.exists() && store.is_open() && !store.root.as_os_str().is_empty() {
         match crate::secrets::file::backup_config_once(&store.root, &store.ns, path) {
-            Ok(Some(dest)) => println!("  backed up the current config to {}", dest.display()),
+            Ok(Some(dest)) => report.backup = Some(dest),
             Ok(None) => {}
-            Err(e) => println!("  (could not back up the config: {e})"),
+            Err(e) => report.backup_error = Some(e.to_string()),
         }
     }
 
@@ -885,13 +907,7 @@ pub(crate) fn commit_doc(
         store_impl
             .save()
             .map_err(|e| anyhow::anyhow!("writing the secret store: {e}"))?;
-        let n = plan.secret_writes.len();
-        if n > 0 {
-            println!(
-                "  stored {n} secret{} encrypted",
-                if n == 1 { "" } else { "s" }
-            );
-        }
+        report.secrets_stored = plan.secret_writes.len();
     }
 
     // 4. The config itself, atomically: temp file in the same directory,
@@ -904,9 +920,8 @@ pub(crate) fn commit_doc(
         }
     }
     write_atomic(path, &doc.as_str()).with_context(|| format!("writing {}", path.display()))?;
-    println!("  wrote {}", path.display());
 
-    Ok(())
+    Ok(report)
 }
 
 /// Report a `Doc` mutation's outcome without swallowing it.
@@ -963,7 +978,27 @@ fn print_menu(
     println!();
 }
 
-fn print_handoff(path: &Path) {
+/// Say what [`commit_doc`] did, on the one stdout a human reads.
+///
+/// The three detail lines used to be printed *inside* `commit_doc`, which put
+/// them ahead of `config-edit`'s JSON reply as well and made every desktop save
+/// report itself as unparseable. They belong here: this is the wizard, whose
+/// stdout is a terminal.
+fn print_handoff(path: &Path, report: &CommitReport) {
+    if let Some(dest) = &report.backup {
+        println!("  backed up the current config to {}", dest.display());
+    }
+    if let Some(e) = &report.backup_error {
+        println!("  (could not back up the config: {e})");
+    }
+    if report.secrets_stored > 0 {
+        let n = report.secrets_stored;
+        println!(
+            "  stored {n} secret{} encrypted",
+            if n == 1 { "" } else { "s" }
+        );
+    }
+    println!("  wrote {}", path.display());
     println!();
     println!("Saved {}.", path.display());
     println!("Next: `turnpike serve`, then `turnpike launch claude-code`.");

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ProviderView, RouteView } from "../../lib/types";
+  import { noAutofill } from "./kit.svelte";
 
   /// Routes, including the target chain.
   ///
@@ -183,7 +184,13 @@
           <div class="edit">
             <div class="edit-fields">
               <label for="dn-{r.id}">display_name</label>
-              <input id="dn-{r.id}" bind:value={draft.display_name} placeholder="(none)" disabled={busy} />
+              <input
+                id="dn-{r.id}"
+                bind:value={draft.display_name}
+                placeholder="(none)"
+                disabled={busy}
+                {...noAutofill}
+              />
               <label for="ct-{r.id}">context_tokens</label>
               <input
                 id="ct-{r.id}"
@@ -192,6 +199,7 @@
                 bind:value={draft.context_tokens}
                 placeholder="(none)"
                 disabled={busy}
+                {...noAutofill}
               />
             </div>
             <div class="sub">Leaving a field empty removes the key rather than writing an empty one.</div>
@@ -210,7 +218,13 @@
                 {#each providers as p (p.id)}<option value={p.id}>{p.id}</option>{/each}
               </select>
               <label for="tm-{r.id}">model</label>
-              <input id="tm-{r.id}" bind:value={tModel} placeholder="claude-opus-4-5" disabled={busy} />
+              <input
+                id="tm-{r.id}"
+                bind:value={tModel}
+                placeholder="claude-opus-4-5"
+                disabled={busy}
+                {...noAutofill}
+              />
             </div>
             <div class="sub">
               Appended to the chain as target {chainLen(r)}. Which one serves a
@@ -232,13 +246,25 @@
     <div class="edit">
       <div class="edit-fields">
         <label for="nr-id">id (the client-facing model)</label>
-        <input id="nr-id" bind:value={newId} placeholder="claude-sonnet-5" disabled={busy} />
+        <input
+          id="nr-id"
+          bind:value={newId}
+          placeholder="claude-sonnet-5"
+          disabled={busy}
+          {...noAutofill}
+        />
         <label for="nr-p">provider</label>
         <select id="nr-p" bind:value={newProvider} disabled={busy}>
           {#each providers as p (p.id)}<option value={p.id}>{p.id}</option>{/each}
         </select>
         <label for="nr-m">model (upstream)</label>
-        <input id="nr-m" bind:value={newModel} placeholder="claude-sonnet-4-5" disabled={busy} />
+        <input
+          id="nr-m"
+          bind:value={newModel}
+          placeholder="claude-sonnet-4-5"
+          disabled={busy}
+          {...noAutofill}
+        />
       </div>
       <div class="actions">
         <button onclick={submitAdd} disabled={busy || !newId.trim() || !newProvider || !newModel.trim()}>
