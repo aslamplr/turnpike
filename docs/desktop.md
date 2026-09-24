@@ -464,7 +464,15 @@ rules of equal specificity over one class is a coin toss on which stylesheet lan
 - **Providers** — add, remove, and the wizard's exact three key homes: name an env
   var (which also strips any inline key, one edit), paste a key (staged into the
   session and never rendered back), or leave it unset. The badge shows the key's
-  **tier**, as in the read-only view.
+  **tier**, as in the read-only view. Each row also has an **`Edit address`** form
+  for its `base_url`, the one provider scalar the window writes besides the key: the
+  prop is named `onSetBaseUrl` rather than a generic `onSetScalar` (the shape
+  `Routes` uses) because `set-provider` is a generic scalar setter on the CLI side
+  and writes `spec` *without* validating it — only `add-provider` calls
+  `spec_from` — so a generic prop would put an unvalidated write in the window's
+  reach. The address is required and the op's value is a plain `String`, so an
+  empty draft is refused **locally** rather than written as `""`, which
+  `config::validate` would accept and leave a provider no request can reach.
 - **Search** — its own component (`config/Search.svelte`) and its own tab, not a
   second heading inside `Providers.svelte`. The engine is a real `<select>` over the
   two `SearchManager::from_config` accepts, `base_url` and `max_loops` are editable,

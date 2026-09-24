@@ -276,6 +276,16 @@
   const setKeyEnv = (id: string, envVar: string) =>
     apply("set-provider-key-env", { id, env_var: envVar }, "Providers");
 
+  /// One provider's `base_url`, through the same generic scalar op the wizard's
+  /// own `edit_provider` uses. `SetProvider` is a generic setter, so the *shape*
+  /// of this shim is what keeps the window to one field: it hardcodes the key
+  /// rather than forwarding one, which is also why `Providers.svelte`'s prop is
+  /// named `onSetBaseUrl` instead of a generic `onSetScalar` (`spec` travels
+  /// through the same op with no validation — only `add-provider` calls
+  /// `spec_from` — so a generic prop would put an unvalidated write in reach).
+  const setProviderBaseUrl = (id: string, value: string) =>
+    apply("set-provider", { id, key: "base_url", value }, "Providers");
+
   const setRouteScalar = (id: string, key: string, value: string | null) =>
     apply("set-route", { id, key, value }, "Routes");
 
@@ -391,6 +401,7 @@
         changed={touched.includes("Providers")}
         onAdd={addProvider}
         onRemove={removeProvider}
+        onSetBaseUrl={setProviderBaseUrl}
         onKeyEnv={setKeyEnv}
         onStageKey={stageKey}
         onUnstageKey={unstageKey}

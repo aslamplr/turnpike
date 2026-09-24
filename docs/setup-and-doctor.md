@@ -241,6 +241,7 @@ input and testable without a tty.
 | --- | --- | --- |
 | `add-provider` | `id`, `spec`, `base_url` | `add_provider` |
 | `remove-provider` | `id` | `remove_provider` |
+| `set-provider` | `id`, `key`, `value` | `set_provider_scalar` |
 | `set-provider-key-env` | `id`, `env_var` | `set_provider_key_env` |
 | `add-route` | `id`, `provider`, `model`, … | `add_route` |
 | `remove-route` | `id` | `remove_route` |
@@ -248,6 +249,7 @@ input and testable without a tty.
 | `set-strategy` | `id`, `strategy` | `set_strategy` |
 | `add-target` | `id`, `provider`, `model`, … | `add_route_target` |
 | `remove-target` | `id`, `index` | `remove_route_target` |
+| `set-target` | `id`, `index`, `key`, `value` | `set_route_target_scalar` |
 | `set-search` | `provider`, `base_url`, `max_loops`, `api_key_env`, `clear_inline_key` | `set_search` |
 | `remove-search` | — | `remove_search` |
 | `stage-key` | `slot`, `value` | `Plan::secret_writes` |

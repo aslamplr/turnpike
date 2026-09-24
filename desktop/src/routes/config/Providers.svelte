@@ -9,6 +9,13 @@
   /// paste a plaintext value into the store, or leave it unset. The editor never
   /// offers a fourth, and it never shows a value back.
   ///
+  /// The address is editable too, one row at a time, through the same
+  /// `set-provider` scalar op the wizard's own `edit_provider` uses. That is the
+  /// *only* other provider scalar this panel can write, and deliberately so: the
+  /// prop is named for the field rather than a generic `onSetScalar`, because
+  /// `spec` travels through the same op with no validation — see the prop's own
+  /// note.
+  ///
   /// `[search]` used to render here as a second heading. It is its own component
   /// now (`Search.svelte`) and its own tab — the shared key story was the only
   /// thing joining them, and it reads better from the search side anyway, where
@@ -20,6 +27,7 @@
     changed,
     onAdd,
     onRemove,
+    onSetBaseUrl,
     onKeyEnv,
     onStageKey,
     onUnstageKey,
@@ -35,6 +43,16 @@
     changed: boolean;
     onAdd: (id: string, spec: string, baseUrl: string) => Promise<void>;
     onRemove: (id: string) => Promise<void>;
+    /// One provider's `base_url`, and only that field.
+    ///
+    /// `Routes` takes a generic `onSetScalar(id, key, value)` because it edits
+    /// several of a route's scalars. This panel must not: `set-provider` is a
+    /// generic scalar setter on the CLI side, so a generic prop here would put
+    /// every provider key in the window's reach — including `spec`, which
+    /// `set-provider` writes *without* passing through `spec_from` (only
+    /// `add-provider` validates it). Naming the one field keeps that door shut at
+    /// the type level rather than by convention.
+    onSetBaseUrl: (id: string, value: string) => Promise<void>;
     onKeyEnv: (id: string, envVar: string) => Promise<void>;
     onStageKey: (slot: string, value: string) => Promise<void>;
     onUnstageKey: (slot: string) => Promise<void>;
@@ -46,6 +64,14 @@
   let editingKey = $state<string | null>(null);
   let keyMode = $state<"env" | "paste">("env");
   let keyDraft = $state("");
+
+  /// Which provider's address is open for editing, and the draft.
+  ///
+  /// A second piece of state rather than a mode on `editingKey`, because the two
+  /// editors hold different kinds of value: one is a secret that is never read
+  /// back, the other is a URL the badge above already prints in full.
+  let editingBase = $state<string | null>(null);
+  let baseDraft = $state("");
 
   let adding = $state(false);
   let newId = $state("");
@@ -73,6 +99,26 @@
     }
     keyDraft = "";
     editingKey = null;
+  }
+
+  /// Seed the address draft from the row's *view*, not from a document read —
+  /// `base_url` is one of the fields the redaction boundary passes through
+  /// unchanged, since a URL is not a credential.
+  function openBase(id: string) {
+    editingBase = id;
+    baseDraft = providers.find((p) => p.id === id)?.base_url ?? "";
+  }
+
+  async function submitBase(id: string) {
+    // Refuse locally on an empty draft. `base_url` is a required, non-`Option`
+    // field in `ProviderCfg`, and `SetProvider.value` is a plain `String`, so there
+    // is no shape of this op that removes the key — sending `""` would write an
+    // empty string and leave a provider no request can reach, which
+    // `config::validate` does not catch (it checks provider *existence*, not the
+    // URL; that is `doctor`'s `base-url-shape` lint).
+    if (!baseDraft.trim()) return;
+    await onSetBaseUrl(id, baseDraft.trim());
+    editingBase = null;
   }
 
   async function addProvider() {
@@ -113,6 +159,13 @@
         {/if}
 
         <div class="actions">
+          <button
+            class="ghost"
+            onclick={() => (editingBase === p.id ? (editingBase = null) : openBase(p.id))}
+            disabled={busy}
+          >
+            Edit address
+          </button>
           <button class="ghost" onclick={() => (editingKey === p.id ? (editingKey = null) : openKey(p.id))} disabled={busy}>
             Change key
           </button>
@@ -125,6 +178,31 @@
             Remove
           </button>
         </div>
+
+        {#if editingBase === p.id}
+          <div class="edit">
+            <div class="edit-fields">
+              <label for="addr-{p.id}">base_url</label>
+              <input
+                id="addr-{p.id}"
+                value={baseDraft}
+                placeholder="https://opencode.ai/zen"
+                disabled={busy}
+                oninput={(e) => (baseDraft = (e.currentTarget as HTMLInputElement).value)}
+                {...noAutofill}
+              />
+            </div>
+            <div class="sub">
+              Where this provider's requests are sent. Written straight through —
+              the field is required, so an empty one is refused here rather than
+              saved as a provider nothing can reach.
+            </div>
+            <div class="actions">
+              <button onclick={() => submitBase(p.id)} disabled={busy || !baseDraft.trim()}>Save</button>
+              <button class="ghost" onclick={() => (editingBase = null)} disabled={busy}>Cancel</button>
+            </div>
+          </div>
+        {/if}
 
         {#if editingKey === p.id}
           <div class="edit">
@@ -173,14 +251,21 @@
           <option value="anthropic">anthropic</option>
           <option value="openai">openai</option>
         </select>
-        <label for="np-base">base_url</label>
+        <!-- Labelled "where requests go", not "base_url": the row editor above
+             already carries that accessible name, and two labels sharing one
+             text make `getByLabelText` ambiguous for the tests and for a screen
+             reader scanning a form with two fields it cannot tell apart. The
+             help text keeps the document's own spelling. -->
+        <label for="np-base">where requests go</label>
         <input
           id="np-base"
+          aria-describedby="np-base-hint"
           bind:value={newBase}
           placeholder="https://opencode.ai/zen"
           disabled={busy}
           {...noAutofill}
         />
+        <span id="np-base-hint" class="sub">base_url</span>
       </div>
       <div class="actions">
         <button onclick={addProvider} disabled={busy || !newId.trim() || !newBase.trim()}>Add provider</button>
