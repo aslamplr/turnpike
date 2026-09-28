@@ -58,7 +58,8 @@ esac
 
 echo
 echo "turnpike $version installed to $INSTALL_DIR/turnpike"
-echo "Start the gateway with: turnpike serve --init"
+echo "Next: turnpike setup   (creates your config, and asks for your provider + key)"
+echo "Then: turnpike serve   (starts the gateway)"
 
 # --- Desktop app (optional) -------------------------------------------------
 

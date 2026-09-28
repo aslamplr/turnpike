@@ -64,12 +64,56 @@
   /// copy. Known before a session exists, which is exactly when it is needed.
   let configPath = $state("");
 
+  /// Whether this session's file does not exist yet — the first-run case.
+  ///
+  /// It comes from the *session* payload, never from `settingsConfigPath` or a
+  /// filesystem check here: only the Rust side knows whether `config-edit`
+  /// seeded from a file or from the in-memory skeleton, and a window that
+  /// guessed would either offer to create a file that already exists or hide
+  /// the walkthrough from someone who needs it.
+  let freshSetup = $state(false);
+
   onMount(load);
 
   const view = (p: SettingsPayload | null): ConfigView | null =>
     p && p.kind === "view" ? p.view : null;
 
   const v = $derived(view(payload));
+
+  /// The walkthrough's own picture of the document, read off the seeded
+  /// session even though it is not on disk. Empty means "nothing to serve yet".
+  const freshProviders = $derived(v?.providers.length ?? 0);
+  const freshRoutes = $derived(v?.routes.length ?? 0);
+
+  /// Which step the walkthrough is pointing at. Three, in the order the config
+  /// layer demands them: a provider (nothing resolves without one), a route
+  /// pointing at it, then Save — which is also the only moment a key is
+  /// committed.
+  type Step = { n: number; title: string; done: boolean; body: string };
+  const steps = $derived.by((): Step[] => {
+    const haveProvider = freshProviders > 0;
+    const haveRoute = freshRoutes > 0;
+    return [
+      {
+        n: 1,
+        title: "Add a provider",
+        done: haveProvider,
+        body: "An upstream to send requests to. You need its base URL and the wire format it speaks (anthropic or openai).",
+      },
+      {
+        n: 2,
+        title: "Point a route at it",
+        done: haveRoute,
+        body: "A route is the model name your client asks for. It maps onto one of the providers above, and remaps it to the upstream model id.",
+      },
+      {
+        n: 3,
+        title: "Give it a key, then save",
+        done: false,
+        body: "Name the environment variable holding the key, or paste the value to store it encrypted. Nothing is written until you save.",
+      },
+    ];
+  });
 
   /// The panels holding an edit, in `PANELS` order and deduped.
   ///
@@ -132,6 +176,7 @@
   function take(next: SessionPayload) {
     session = next.id;
     payload = next.view;
+    freshSetup = next.fresh ?? false;
     stagedKeys = next.staged_keys ?? [];
     if (next.error) problem = next.error;
   }
@@ -331,8 +376,8 @@
       <div class="actions"><button onclick={load}>Try again</button></div>
     </div>
   </div>
-{:else if v}
-  {#if payload.kind === "missingConfig"}
+{:else if payload.kind === "view"}
+  {#if freshSetup}
     <div class="panel">
       <h2>No configuration yet</h2>
       <div class="empty">
@@ -340,11 +385,36 @@
         starter config and is written for the first time when you save.
       </div>
     </div>
+
+    {#if v && v.providers.length === 0}
+      <div class="panel">
+        <h2>Getting to a working config</h2>
+        <ol class="steps">
+          {#each steps as s (s.n)}
+            <li>
+              <span class="stepn" class:done={s.done}>{s.done ? "✓" : s.n}</span>
+              <div>
+                <b>{s.title}</b>
+                <p class="sub">{s.body}</p>
+              </div>
+            </li>
+          {/each}
+        </ol>
+        <div class="pad sub" style="border-top: 1px solid var(--line)">
+          Everything here is written for the first time when you save.
+        </div>
+      </div>
+    {/if}
   {/if}
 
   {#if problem}
     <div class="panel"><div class="note">{problem}</div></div>
   {/if}
+
+  <!-- The gate above is on `payload.kind` rather than on `v` because the
+       fresh-setup heading renders with no view at all; this is where the
+       narrowing that gate gave up is put back, once, for the panel props. -->
+  {#if v}
 
   <div class="panel">
     <div class="pad bar">
@@ -438,6 +508,7 @@
       <Doctor {checks} path={configPath} {dirty} />
     {/if}
   </div>
+  {/if}
 {/if}
 
 <style>
@@ -453,5 +524,48 @@
     height: 6px;
     border-radius: 50%;
     background: var(--warn);
+  }
+
+  /* The fresh-setup walkthrough. Numbered because it *is* a sequence: nothing
+     resolves without a provider, a route needs one to point at, and a key is
+     only committed by the Save that follows. The markers read as a checklist,
+     which is what makes the step already satisfied show as done rather than as
+     a count that restarted. */
+  .steps {
+    list-style: none;
+    margin: 0;
+    padding: 6px 14px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .steps li {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .steps li p {
+    margin: 2px 0 0;
+  }
+
+  .stepn {
+    flex: none;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 600;
+    background: var(--chip);
+    color: var(--ink-dim);
+  }
+
+  .stepn.done {
+    background: var(--ok);
+    color: var(--panel);
   }
 </style>

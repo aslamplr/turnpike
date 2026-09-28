@@ -437,14 +437,20 @@ impl Supervisor {
         self.stderr_tail.clear();
         self.publish(Status::Starting);
 
-        // The pre-check, and it must come before anything is spawned:
-        // `resolve_config` writes a starter config *before* its mode match, so
-        // `turnpike serve` on a missing file writes one and exits 0. The approved
-        // behavior is to say so and write nothing.
+        // The pre-check, and it comes before anything is spawned so the window
+        // can name the path without paying for a process that would only fail.
+        // `resolve_config` refuses a missing file (it once wrote a starter
+        // first, which is what this check originally worked around), so this is
+        // now about the message, not about avoiding a stray write.
         if !self.config.exists() {
             self.terminal = true;
+            // Names the app's own Settings window, not a CLI command: the
+            // window is where a first-run user already is, and a status line
+            // that answers "run `turnpike setup`" sends them somewhere they
+            // have no reason to know about. `turnpike setup` is still the
+            // terminal answer, and the Settings walkthrough says so.
             let reason = format!(
-                "no config at {} — run `turnpike setup` to create one",
+                "no config at {} — open Settings to create one",
                 self.config.display()
             );
             self.emit_log("stderr", &format!("— {reason}"));

@@ -16,9 +16,65 @@
 use std::fmt;
 
 use anyhow::{Context, Result};
-use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Key, Table, Value};
 
 use crate::config::{ProviderCfg, SearchCfg, Spec};
+
+/// A route id as a `Key` that renders **basic-quoted**, always.
+///
+/// Matching the repo's spelling is the smaller half of why. The load-bearing
+/// half is the id containing a dot: `[routes.deepseek-v3.2]` is *valid TOML*
+/// that parses as the nested tables `routes.deepseek-v3 { "2" = … }`, so the
+/// route would not exist under the name that was asked for. Quoting removes
+/// that entire class of collision.
+///
+/// Constructing it is awkward because `Key::new` leaves `repr: None`, and
+/// rendering then falls back to `toml_writer`'s `as_default`, which quotes only
+/// when it *must* — bare-safe ids therefore come out bare. There is no public
+/// repr setter to fix that afterwards (`Repr::new_unchecked` and
+/// `Key::with_repr_unchecked` are both `pub(crate)`).
+///
+/// So go the long way round, through the parser: `FromStr for Key` parses a
+/// quoted key, decodes it back to the id, and — because `try_parse_simple`
+/// calls `despan` — resolves the repr's span against the input, leaving an
+/// *explicit* repr that holds the quoted spelling verbatim. The decoded id and
+/// the quoted repr therefore ride together, and `Key`'s `PartialEq`/`Hash`/`Ord`
+/// are all on the decoded text, so this is still the same key as far as the
+/// document is concerned.
+///
+/// The payoff needs `Table::insert_formatted` at the write site, not indexing:
+/// `Table::insert` calls `entry.key_mut().fmt()` on an occupied entry, which
+/// clears the repr and puts us back to bare.
+fn quoted_key(id: &str) -> Key {
+    // Escape the id the way TOML escapes a basic-string key. Hand-rolled only
+    // because the alternative — `toml_writer`'s `TomlKeyBuilder::as_basic` — is
+    // not a dependency of this crate.
+    let mut quoted = String::with_capacity(id.len() + 2);
+    quoted.push('"');
+    for c in id.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            c if (c as u32) < 0x20 => quoted.push_str(&format!("\\u{:04X}", c as u32)),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+
+    let key: Key = quoted
+        .parse()
+        .expect("a basic-quoted string always parses as a key");
+    debug_assert_eq!(key.get(), id, "the parsed key decodes back to the id");
+    debug_assert_eq!(
+        key.display_repr().as_ref(),
+        quoted.as_str(),
+        "the repr holds the quoted spelling, so it renders as written"
+    );
+    key
+}
 
 /// A parsed document, plus the config it currently renders to.
 ///
@@ -55,6 +111,73 @@ impl Doc {
         Self::parse(&crate::config::default_config_text())
     }
 
+    /// A document for tests that need something to *operate on*: providers,
+    /// routes, targets, comments.
+    ///
+    /// Distinct from [`Doc::starter`] on purpose. The starter is the production
+    /// skeleton — deliberately empty, so that a first run cannot mistake an
+    /// example for a recommendation. Every test in `setup` that edits a document
+    /// is about what an edit does to a *populated* one (target indexing,
+    /// strategy resets, comment preservation, route-removal refusals), and none
+    /// of that logic is exercised by an empty document. Seeding those tests from
+    /// the starter meant the logic under test and the fixture drifted together
+    /// with the starter's contents, which is what broke them when the starter
+    /// was emptied.
+    ///
+    /// Shared across `setup::{edit, cli, mod, prompt}`'s test modules — hence
+    /// the home here beside `starter` rather than in this module's own tests.
+    #[cfg(test)]
+    pub fn fixture() -> Result<Self> {
+        Self::parse(
+            r#"# turnpike gateway configuration
+#
+# ---- providers -------------------------------------------------------------
+# A provider is an upstream API.
+
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key_env = "OPENCODE_API_KEY"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+
+[providers.openrouter]
+spec = "openai"
+base_url = "https://openrouter.ai/api"
+api_key = "or-key"
+
+# ---- routes ----------------------------------------------------------------
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "claude-sonnet-4-5"
+family = "sonnet"
+
+# A commented-out example, kept commented.
+# [routes."claude-haiku-4-5"]
+# provider = "zen"
+# model = "claude-haiku-4-5"
+# family = "haiku"
+
+[routes."claude-opus-5"]
+provider = "zen"
+model = "claude-opus-4-1"
+family = "opus"
+context_tokens = 200000
+
+[routes.fast]
+provider = "zen-go"
+model = "grok-code-fast-1"
+
+[search]
+provider = "searxng"
+base_url = "http://localhost:8888"
+"#,
+        )
+    }
+
     /// Render, and reparse through `config::load` so validation runs against
     /// exactly the bytes that would be written.
     ///
@@ -88,21 +211,32 @@ impl Doc {
 
     /// Add a provider as a new table appended to the end of the document.
     ///
-    /// `set_position` is what actually appends it. Assigning into
-    /// `doc["providers"][id]` only anchors the new sub-table inside `providers`
-    /// — and `toml_edit` renders tables sorted by `(is_nested, position)`,
-    /// where a table with no position of its own *inherits its parent's*. The
-    /// starter opens with `[providers.zen]`, so `providers` sits at position 0
-    /// and a new entry under it inherits that 0, rendering immediately after
-    /// `zen`, mid-file, above the routes. (Probed: header at byte 514 of 1657,
-    /// with `[routes."claude-haiku-4-5"]` down at 1057.) Pinning the position
-    /// past every parsed row lifts it to the end — byte 1116, after the routes
-    /// and their trailing comments — which is what makes the diff a pure
-    /// addition.
+    /// Two things make this an *append* rather than a mid-file splice, and both
+    /// are needed:
+    ///
+    /// 1. `ensure_table("providers")` first. Assigning straight into
+    ///    `doc["providers"][id]` on a document with no `[providers.*]` yet
+    ///    creates `providers` as an **implicit** table — and `toml_edit` renders
+    ///    an implicit table *inline, at the very top*, above the header comments
+    ///    (probed on the starter: `providers = { openrouter.spec = … }` as line
+    ///    1, before `# turnpike gateway configuration`). That is the first-run
+    ///    path for both `turnpike setup` and the Settings window, which both
+    ///    start from the empty skeleton. `ensure_table` sets `implicit(true)` on
+    ///    the parent it creates, so the children get real headers and the parent
+    ///    itself renders nothing — exactly as a hand-written `[providers.zen]`
+    ///    does, with no bare `[providers]` line above it.
+    /// 2. `set_position` on the new sub-table. `toml_edit` renders tables sorted
+    ///    by `(is_nested, position)`, and a table with no position of its own
+    ///    *inherits its parent's*. Where `[providers.zen]` already exists,
+    ///    `providers` sits at position 0, so a new entry under it inherits that
+    ///    0 and renders immediately after `zen` — mid-file, above the routes.
+    ///    Pinning the position past every parsed row lifts it to the end, which
+    ///    is what makes the diff a pure addition.
     pub fn add_provider(&mut self, id: &str, spec: Spec, base_url: &str) -> Result<()> {
         if self.provider_ids().iter().any(|p| p == id) {
             anyhow::bail!("a provider named {id:?} already exists");
         }
+        self.ensure_table("providers")?;
 
         let mut t = Table::new();
         t["spec"] = toml_edit::value(spec.as_str());
@@ -283,11 +417,23 @@ impl Doc {
         if let Some(v) = route.context_tokens {
             t["context_tokens"] = toml_edit::value(v as i64);
         }
-        // Same reasoning as `add_provider`: without an explicit position the
-        // new table inherits `routes`' position and renders beside the existing
-        // routes rather than after them.
+        // Same reasoning as `add_provider` on both counts: the parent must exist
+        // as a real table (or the new route renders as an inline `routes = { … }`
+        // at the top of a document that had no routes yet), and the new table
+        // needs its own position or it inherits `routes`' and renders beside the
+        // existing ones rather than after them.
+        //
+        // The write goes through `insert_formatted` with a quoted key rather than
+        // indexing, because indexing would build the key with `Key::new` — repr
+        // and all — and render `[routes.claude-sonnet-5]`. See `quoted_key`.
+        self.ensure_table("routes")?;
         t.set_position(Some(isize::MAX));
-        self.doc["routes"][id] = toml_edit::Item::Table(t);
+        let routes = self
+            .doc
+            .get_mut("routes")
+            .and_then(|r| r.as_table_mut())
+            .context("no [routes] section to add to")?;
+        routes.insert_formatted(&quoted_key(id), toml_edit::Item::Table(t));
         Ok(())
     }
 
@@ -540,10 +686,23 @@ impl Doc {
             .unwrap_or_default()
     }
 
-    /// Create `<name>` as a table if it is absent.
+    /// Create `<name>` as a table if it is absent, marked **implicit**.
+    ///
+    /// Implicit is the whole point. An explicit empty table renders a bare
+    /// `[providers]` header line — and neither the starter, `config.example.toml`
+    /// nor any config `setup` has written has one. The parent exists to hold
+    /// `[providers.<id>]` children, which is exactly what an implicit table
+    /// means to `toml_edit`, and it renders exactly as if the children alone
+    /// had been written.
+    ///
+    /// This is only ever called when the table is *absent*: a config that
+    /// already has `[providers.zen]` has a `providers` table already, and this
+    /// returns without touching it.
     fn ensure_table(&mut self, name: &str) -> Result<()> {
         if self.doc.get(name).is_none() {
-            self.doc[name] = toml_edit::Item::Table(Table::new());
+            let mut t = Table::new();
+            t.set_implicit(true);
+            self.doc[name] = toml_edit::Item::Table(t);
         }
         Ok(())
     }
@@ -757,30 +916,88 @@ fn _type_anchors(_: &Array, _: &Item) {}
 mod tests {
     use super::*;
 
+    /// A document for tests that need something to *operate on*: providers,
+    /// routes, targets, comments.
+    ///
+    /// Distinct from [`Doc::starter`] on purpose. The starter is the production
+    /// skeleton — deliberately empty, so that a first run cannot mistake an
+    /// example for a recommendation. Every test below is about what an edit does
+    /// to a *populated* document (target indexing, strategy resets, comment
+    /// preservation, route-removal refusals), and none of that logic is
+    /// exercised by an empty one. Seeding these tests from the starter meant the
+    /// logic under test and the fixture drifted together with the starter's
+    /// contents, which is what broke them when the starter was emptied.
+    fn fixture() -> Doc {
+        Doc::parse(
+            r#"# turnpike gateway configuration
+#
+# ---- providers -------------------------------------------------------------
+# A provider is an upstream API.
+
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key_env = "OPENCODE_API_KEY"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+
+[providers.openrouter]
+spec = "openai"
+base_url = "https://openrouter.ai/api"
+api_key = "or-key"
+
+# ---- routes ----------------------------------------------------------------
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "claude-sonnet-4-5"
+family = "sonnet"
+
+# A commented-out example, kept commented.
+# [routes."claude-haiku-4-5"]
+# provider = "zen"
+# model = "claude-haiku-4-5"
+# family = "haiku"
+
+[routes."claude-opus-5"]
+provider = "zen"
+model = "claude-opus-4-1"
+family = "opus"
+context_tokens = 200000
+
+[routes.fast]
+provider = "zen-go"
+model = "grok-code-fast-1"
+
+[search]
+provider = "searxng"
+base_url = "http://localhost:8888"
+"#,
+        )
+        .unwrap()
+    }
+
+    /// The document for tests whose subject is a *document under edit* rather
+    /// than a first-run skeleton. See `Doc::fixture`.
     fn starter() -> Doc {
-        Doc::starter().unwrap()
+        Doc::fixture().unwrap()
     }
 
     /// The load-bearing test: adding a provider must not cost a single comment.
     ///
-    /// `default_config_text()` is ~40% comment by volume and every one of those
-    /// lines is doing work. This asserts on the *whole* set, not a spot check,
-    /// because the failure mode being guarded against is silent and total.
+    /// The fixture is comment-bearing and every one of those lines is doing
+    /// work. This asserts on the *whole* set, not a spot check, because the
+    /// failure mode being guarded against is silent and total.
     #[test]
     fn append_provider_preserves_existing_comments() {
-        let before = crate::config::default_config_text();
-        let expected: Vec<String> = before
-            .lines()
-            .filter(|l| l.trim_start().starts_with('#'))
-            .map(|l| l.trim().to_string())
-            .collect();
-        assert!(expected.len() > 10, "starter should be comment-heavy");
+        let before = fixture();
+        let expected = before.comments();
+        assert!(expected.len() > 5, "fixture should be comment-bearing");
 
-        let mut doc = starter();
-        // `openrouter` is deliberately the id the starter already shows as a
-        // commented-out example — the hardest case for both preservation and
-        // detection, which is why this test uses it.
-        doc.add_provider("openrouter", Spec::Openai, "https://openrouter.ai/api")
+        let mut doc = fixture();
+        doc.add_provider("groq", Spec::Openai, "https://api.groq.com/openai")
             .unwrap();
 
         let after = doc.comments();
@@ -795,34 +1012,44 @@ mod tests {
         // …and the addition is a pure append: everything that came before is
         // byte-identical, and the new table is at the end.
         let tail = doc.as_str();
-        // Search for the *table header* — the starter has a commented-out
-        // `# [providers.openrouter]` example, and a bare `find` matches that
-        // comment instead of the table we just added.
-        let idx = tail
-            .find("\n[providers.openrouter]")
-            .expect("new table present");
+        let idx = tail.find("\n[providers.groq]").expect("new table present");
         assert!(
-            idx > tail.find("[routes.\"claude-haiku-4-5\"]").unwrap(),
+            idx > tail.find("[search]").unwrap(),
             "new table should be appended after existing content"
         );
-        // The commented-out example is still there, still commented.
-        assert!(tail.contains("# [providers.openrouter]"), "example lost");
+    }
+
+    /// The added provider must actually parse and validate.
+    #[test]
+    fn append_provider_refuses_an_id_that_already_exists() {
+        let mut doc = fixture();
+        let before = doc.as_str();
+        let err = doc
+            .add_provider("openrouter", Spec::Openai, "https://openrouter.ai/api")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "got: {err}");
+        assert_eq!(doc.as_str(), before, "document changed on a rejected add");
     }
 
     /// The added provider must actually parse and validate.
     #[test]
     fn appended_provider_is_valid_config() {
-        let mut doc = starter();
-        doc.add_provider("openrouter", Spec::Openai, "https://openrouter.ai/api")
+        let mut doc = fixture();
+        doc.add_provider("groq", Spec::Openai, "https://api.groq.com/openai")
             .unwrap();
         let cfg = doc.validated().unwrap();
+        assert_eq!(
+            cfg.providers["groq"].base_url,
+            "https://api.groq.com/openai"
+        );
+        assert_eq!(cfg.providers["groq"].spec, Spec::Openai);
+        // The pre-existing providers survived untouched.
+        assert_eq!(cfg.providers["zen"].base_url, "https://opencode.ai/zen");
         assert_eq!(
             cfg.providers["openrouter"].base_url,
             "https://openrouter.ai/api"
         );
-        assert_eq!(cfg.providers["openrouter"].spec, Spec::Openai);
-        // The pre-existing provider survived untouched.
-        assert_eq!(cfg.providers["zen"].base_url, "https://opencode.ai/zen");
     }
 
     /// A scalar edit keeps the trailing comment on that line.
@@ -900,7 +1127,7 @@ mod tests {
     /// names the routes — the same rule `validate` enforces at load time.
     #[test]
     fn remove_provider_refuses_while_routes_reference_it() {
-        let mut doc = starter();
+        let mut doc = fixture();
         let err = doc.remove_provider("zen").unwrap_err().to_string();
         assert!(err.contains("claude-sonnet-5"), "got: {err}");
         assert!(err.contains("claude-opus-5"), "got: {err}");
@@ -929,9 +1156,9 @@ mod tests {
     /// optional fields are omitted rather than written empty.
     #[test]
     fn add_route_omits_absent_optionals() {
-        let mut doc = starter();
+        let mut doc = fixture();
         doc.add_route(
-            "fast",
+            "fast-new",
             &RouteDraft {
                 provider: "zen".into(),
                 model: "claude-haiku-4-5".into(),
@@ -942,26 +1169,24 @@ mod tests {
         .unwrap();
 
         let out = doc.as_str();
-        // Scope the "is it absent?" checks to the new table: the starter's own
-        // routes already contain `display_name`, so a document-wide `contains`
-        // would pass vacuously even if the field *had* been written.
+        // Scope the "is it absent?" checks to the new table. The fixture's own
+        // `claude-opus-5` route sets `context_tokens`, so a document-wide
+        // `contains` would pass vacuously even if the field *had* been written.
         //
-        // The block ends at the first line that starts a new table *uncommented*
-        // — matching a bare `\n[` would run on into the starter's commented-out
-        // `# [routes."deepseek"]` tail, whose `# context_tokens = 200000` line
-        // otherwise trips the negative assertion below with a comment.
+        // The block ends at the first line that starts a new table — commented
+        // out or not — because the fixture carries a commented-out route example
+        // whose `# context_tokens` line would otherwise trip the negative
+        // assertion below.
+        //
+        // The key is quoted, so the split matches the quoted spelling the writer
+        // emits rather than the bare one `toml_edit` would default to.
         let block = out
-            .split("\n[routes.fast]")
+            .split("\n[routes.\"fast-new\"]")
             .nth(1)
             .expect("new route table present");
         let block: String = block
             .lines()
             .take_while(|l| {
-                // Stop at the next table header — commented out or not. The
-                // starter's tail is a run of `# [providers.zen-go]` style
-                // examples, so an uncommented-only rule runs straight into
-                // `# context_tokens = 200000` and the assertion below then
-                // matches a *comment* rather than a key.
                 let t = l.trim_start();
                 !t.trim_start_matches('#').trim_start().starts_with('[')
             })
@@ -972,7 +1197,7 @@ mod tests {
         assert!(block.contains("family = \"haiku\""), "got:\n{block}");
 
         let cfg = doc.validated().unwrap();
-        let r = &cfg.routes["fast"];
+        let r = &cfg.routes["fast-new"];
         assert_eq!(r.provider, "zen");
         assert_eq!(r.family.as_deref(), Some("haiku"));
         assert_eq!(r.max_tokens, None);
@@ -984,6 +1209,9 @@ mod tests {
     fn staged_then_committed() {
         let dir = crate::secrets::tests::temp_root("edit-staged");
         let path = dir.join("config.toml");
+        // Seeded from the *empty skeleton*, which is what a first run actually
+        // starts from: the point of the test is that a staged write lands only
+        // at commit, and that it lands as a valid config.
         std::fs::write(&path, crate::config::default_config_text()).unwrap();
         let untouched = std::fs::read_to_string(&path).unwrap();
 
@@ -992,6 +1220,16 @@ mod tests {
             .unwrap();
         doc.set_provider_scalar("openrouter", "api_key_env", "OPENROUTER_API_KEY")
             .unwrap();
+        doc.add_route(
+            "claude-sonnet-5",
+            &RouteDraft {
+                provider: "openrouter".into(),
+                model: "claude-sonnet-4-5".into(),
+                family: Some("sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         // Staged: the file on disk is still byte-identical.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), untouched);
@@ -1001,18 +1239,71 @@ mod tests {
         let rendered = doc.as_str();
         assert!(rendered.contains("[providers.openrouter]"));
         assert!(rendered.contains("api_key_env = \"OPENROUTER_API_KEY\""));
+        assert!(rendered.contains("[routes.\"claude-sonnet-5\"]"));
         crate::config::load_from_str(&rendered).unwrap();
     }
 
+    /// The first-run document: an empty skeleton plus one provider and one
+    /// route, which is what both `turnpike setup` and the Settings window build.
+    ///
+    /// Two things this pins, both of which toml_edit gets wrong by default:
+    ///
+    /// - No bare `[providers]` / `[routes]` header. A parent table created by
+    ///   assignment is *explicit*, and renders an empty header line the starter
+    ///   and `config.example.toml` never have.
+    /// - The route key is **quoted**. The repo's own files write
+    ///   `[routes."claude-sonnet-5"]`; an id inserted with no `repr` is quoted
+    ///   only if toml_writer's default happens to think it needs to be, which is
+    ///   a different question from what this project's configs look like.
+    #[test]
+    fn first_run_write_has_no_bare_parent_headers() {
+        let mut doc = Doc::starter().unwrap();
+        doc.add_provider("openrouter", Spec::Openai, "https://openrouter.ai/api")
+            .unwrap();
+        doc.add_route(
+            "claude-sonnet-5",
+            &RouteDraft {
+                provider: "openrouter".into(),
+                model: "claude-sonnet-4-5".into(),
+                family: Some("sonnet".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let out = doc.as_str();
+        assert!(!out.contains("\n[providers]\n"), "bare header:\n{out}");
+        assert!(!out.contains("\n[routes]\n"), "bare header:\n{out}");
+        assert!(
+            out.contains("\n[providers.openrouter]\n"),
+            "provider lost its header:\n{out}"
+        );
+        assert!(
+            out.contains("[routes.\"claude-sonnet-5\"]"),
+            "route key not quoted:\n{out}"
+        );
+        // And it is a valid config, which is the point of writing it at all.
+        doc.validated().unwrap();
+    }
+
+    /// `[search]` is created from nothing on a document that has no such table.
+    ///
+    /// Seeded from the empty skeleton rather than the fixture: the fixture
+    /// already carries a `[search]` block, and "is it created when absent?" is
+    /// only a question an absent one can answer.
     #[test]
     fn search_block_is_created_when_absent() {
-        let mut doc = starter();
-        // The starter has no [search] table at all.
+        let mut doc = Doc::starter().unwrap();
+        // The skeleton has no [search] table at all.
         assert!(!doc.as_str().contains("[search]"));
         doc.set_search_key_env("EXA_API_KEY").unwrap();
         assert!(doc.as_str().contains("[search]"), "got:\n{}", doc.as_str());
         assert!(doc.as_str().contains("api_key_env = \"EXA_API_KEY\""));
-        doc.validated().unwrap();
+        // The `[search]` write alone leaves the document unvalidated — there is
+        // still no provider for a route to point at — so this asserts the
+        // search block parses, not that the document as a whole validates.
+        let cfg = doc.validated().unwrap_err().to_string();
+        assert!(cfg.contains("no [providers.*]"), "got: {cfg}");
     }
 
     /// Removing `[search]` drops exactly that table and nothing else — the rest
@@ -1045,7 +1336,7 @@ mod tests {
     /// `remove_route`/`remove_provider` give for an id that is not there.
     #[test]
     fn remove_search_refuses_when_absent() {
-        let mut doc = starter();
+        let mut doc = Doc::starter().unwrap();
         assert!(!doc.as_str().contains("[search]"));
 
         let err = doc.remove_search().unwrap_err().to_string();
@@ -1059,7 +1350,7 @@ mod tests {
 
     #[test]
     fn duplicate_provider_and_route_ids_are_rejected() {
-        let mut doc = starter();
+        let mut doc = fixture();
         let err = doc
             .add_provider("zen", Spec::Anthropic, "https://x")
             .unwrap_err()
@@ -1112,10 +1403,10 @@ mod tests {
     /// rather than requiring an existing key.
     #[test]
     fn add_target_creates_the_aot_when_absent() {
-        let mut doc = starter();
+        let mut doc = fixture();
         assert!(
             !doc.as_str().contains(".target]]"),
-            "starter should have no target blocks"
+            "fixture should have no target blocks"
         );
 
         doc.add_route_target("claude-sonnet-5", &draft("zen", "claude-sonnet-4-5"))
@@ -1145,7 +1436,7 @@ mod tests {
     /// A second target appends to the existing array instead of clobbering it.
     #[test]
     fn add_target_appends_to_an_existing_aot() {
-        let mut doc = starter();
+        let mut doc = fixture();
         doc.add_route_target("claude-sonnet-5", &draft("zen", "first"))
             .unwrap();
         doc.add_route_target("claude-sonnet-5", &draft("zen", "second"))
@@ -1170,7 +1461,7 @@ mod tests {
     /// mutation — a wizard error must leave the document byte-identical.
     #[test]
     fn add_target_rejects_unknown_provider() {
-        let mut doc = starter();
+        let mut doc = fixture();
         let before = doc.as_str();
         let err = doc
             .add_route_target("claude-sonnet-5", &draft("nope", "m"))
@@ -1202,7 +1493,7 @@ mod tests {
     /// stale one into place.
     #[test]
     fn remove_target_reindexes() {
-        let mut doc = starter();
+        let mut doc = fixture();
         doc.add_route_target("claude-sonnet-5", &draft("zen", "first"))
             .unwrap();
         doc.add_route_target("claude-sonnet-5", &draft("zen", "second"))
@@ -1221,7 +1512,7 @@ mod tests {
     /// show as a diff against a freshly written config.
     #[test]
     fn remove_last_target_drops_the_key() {
-        let mut doc = starter();
+        let mut doc = fixture();
         doc.add_route_target("claude-sonnet-5", &draft("zen", "only"))
             .unwrap();
         doc.remove_route_target("claude-sonnet-5", 0).unwrap();
@@ -1239,7 +1530,7 @@ mod tests {
     /// Removing an index that is not there is an error, not a silent no-op.
     #[test]
     fn remove_target_out_of_range_is_an_error() {
-        let mut doc = starter();
+        let mut doc = fixture();
         let err = doc.remove_route_target("claude-sonnet-5", 0).unwrap_err();
         assert!(
             format!("{err:#}").contains("no target"),
@@ -1251,7 +1542,7 @@ mod tests {
     /// key rather than writing an empty value.
     #[test]
     fn target_scalar_round_trips_and_clears() {
-        let mut doc = starter();
+        let mut doc = fixture();
         let mut t = draft("zen", "claude-sonnet-4-5");
         t.display_name = Some("Zen primary".into());
         t.context_tokens = Some(200_000);
@@ -1289,7 +1580,7 @@ mod tests {
     /// what target 0 reports.
     #[test]
     fn add_target_leaves_route_fields_alone() {
-        let mut doc = starter();
+        let mut doc = fixture();
         let before = crate::config::load_from_str(&doc.as_str()).unwrap();
         let before_route = before.routes["claude-sonnet-5"].clone();
 
@@ -1312,7 +1603,7 @@ mod tests {
     /// the new target's upstream id as well as its own.
     #[test]
     fn added_target_block_is_valid_config() {
-        let mut doc = starter();
+        let mut doc = fixture();
         doc.add_route_target("claude-sonnet-5", &draft("zen", "claude-sonnet-4-5"))
             .unwrap();
         let cfg = doc.validated().unwrap();
@@ -1349,7 +1640,7 @@ mod tests {
     /// synthesized entry that exists in no `[[…target]]` block.
     #[test]
     fn route_targets_lists_target_zero_first() {
-        let mut doc = starter();
+        let mut doc = fixture();
         assert_eq!(doc.route_targets("claude-sonnet-5").len(), 1);
 
         doc.add_route_target("claude-sonnet-5", &draft("zen", "extra"))
@@ -1372,7 +1663,7 @@ mod tests {
     /// the key. Both have to survive the config layer.
     #[test]
     fn strategy_scalar_round_trips_and_clears() {
-        let mut doc = starter();
+        let mut doc = fixture();
         doc.set_route_scalar("claude-sonnet-5", "strategy", "failover")
             .unwrap();
         let cfg = doc.validated().unwrap();
@@ -1391,15 +1682,15 @@ mod tests {
         );
     }
 
-    /// A target add/remove cycle preserves every comment in the starter.
+    /// A target add/remove cycle preserves every comment in the document.
     ///
     /// Removal loses the *target block's own* introducing comment — that is
-    /// documented behavior, and there is no such comment in the starter, so the
-    /// property this pins is that nothing else is disturbed.
+    /// documented behavior, and the fixture's routes carry no such comment, so
+    /// the property this pins is that nothing else is disturbed.
     #[test]
     fn target_cycle_preserves_route_comments() {
-        let before = starter().comments();
-        let mut doc = starter();
+        let before = fixture().comments();
+        let mut doc = fixture();
 
         doc.add_route_target("claude-sonnet-5", &draft("zen", "extra"))
             .unwrap();

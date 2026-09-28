@@ -472,8 +472,8 @@ pub(crate) async fn diagnose(config_path: Option<PathBuf>, live: bool) -> Vec<Ch
                 Check::fail(
                     "config-found",
                     format!("no config at {}", path.display()),
-                    "run `turnpike setup` to create one, or `turnpike serve --init` \
-                     to write a starter non-interactively",
+                    "run `turnpike setup` to create one — the desktop app's Settings \
+                     window walks through the same steps",
                 )
                 .with_detail(e.to_string()),
                 Check::skip("config-parse", "skipped — there is no config to parse"),
@@ -1607,8 +1607,8 @@ model = "claude-sonnet-4-5"
             let mut checks = vec![Check::fail(
                 "config-found",
                 format!("no config at {}", path.display()),
-                "run `turnpike setup` to create one, or `turnpike serve --init` \
-                 to write a starter non-interactively",
+                "run `turnpike setup` to create one — the desktop app's Settings \
+                 window walks through the same steps",
             )];
             checks.push(Check::skip(
                 "config-parse",

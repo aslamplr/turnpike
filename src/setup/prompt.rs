@@ -393,9 +393,12 @@ pub(crate) mod tests {
 
     #[test]
     fn describe_doc_counts_what_is_in_the_document() {
-        let doc = Doc::starter().unwrap();
+        // The fixture, not the skeleton: the skeleton is deliberately empty, so
+        // counting it would assert "0 providers · 0 routes" and prove nothing.
+        // The counts are spelled out rather than read back off the doc, so this
+        // pins the *format* as well as the arithmetic.
+        let doc = Doc::fixture().unwrap();
         let s = describe_doc(&doc);
-        assert!(s.contains("routes"), "got: {s}");
-        assert!(s.contains('1'), "starter has at least one provider: {s}");
+        assert_eq!(s, "3 providers · 3 routes", "got: {s}");
     }
 }

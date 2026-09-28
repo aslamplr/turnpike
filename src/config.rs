@@ -349,6 +349,12 @@ fn default_search_loops() -> usize {
 pub struct Config {
     #[serde(default)]
     pub server: ServerCfg,
+    /// Defaulted so a config with no providers at all is a *validation* failure
+    /// (`validate` says "config defines no [providers.*]") rather than a parse
+    /// error. That is the whole difference between the starter skeleton being
+    /// diagnosable and being a raw serde "missing field" message — and the
+    /// editor has to be able to load the skeleton to show it.
+    #[serde(default)]
     pub providers: BTreeMap<String, ProviderCfg>,
     #[serde(default)]
     pub routes: BTreeMap<String, RouteCfg>,
@@ -608,77 +614,64 @@ pub(crate) fn validate(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Built-in starter config written on first run: OpenCode Zen as the
-/// Anthropic-compatible upstream, with the fixed Claude slot IDs Ollama
-/// advertises mapped onto Zen models.
+/// The document the editor starts from when there is no config on disk yet.
+///
+/// A skeleton, deliberately not a usable config: `[server]` plus instructions,
+/// with **no providers and no routes**. It is never written to disk unasked —
+/// see `main::resolve_config`. Two callers hand it out:
+///
+/// - `setup::run` and `config_edit::load`, which put it in front of a user who
+///   then fills in real details, so the first bytes that land on disk are a
+///   config for *that* user;
+/// - `doctor`, which parses it to prove it is at least well-formed TOML.
+///
+/// It used to carry a worked OpenCode Zen example with three routes. That read
+/// as a recommendation — users ran it unchanged and then could not tell why
+/// nothing worked, or assumed the example provider was the intended one. A
+/// skeleton promises nothing and can only be finished by supplying a real
+/// provider.
 pub fn default_config_text() -> String {
     r#"# turnpike gateway configuration
-# Client-facing model ids on the left ([routes.<id>]), upstream provider and
-# model on the right. The gateway rewrites the "model" field of every request.
+#
+# This file is incomplete on purpose: it has a server block and nothing to
+# serve. Add a provider and at least one route, then start the gateway.
+#
+# The fastest way to fill it in, either of which will walk you through it:
+#
+#     turnpike setup          # in a terminal
+#     turnpike doctor         # what is missing, and how to fix it
+#
+# The desktop app's Settings window edits this same file.
+#
+# ---- providers -------------------------------------------------------------
+# A provider is an upstream API. @name is how routes refer to it.
+#
+#     [providers.NAME]
+#     spec = "anthropic"                 # "anthropic" or "openai"
+#     base_url = "https://…"             # no /v1 suffix for "anthropic"
+#     api_key_env = "NAME_API_KEY"       # read the key from this env var
+#     # api_key = "…"                    # or inline it here (plaintext)
+#
+# Headers a provider requires go in their own table:
+#
+#     [providers.NAME.extra_headers]
+#     "x-opencode-session" = "…"
+#
+# ---- routes ----------------------------------------------------------------
+# A route is a model id your client asks for, pointed at a provider's model.
+#
+#     [routes."claude-sonnet-4-5"]
+#     provider = "NAME"
+#     model = "the-upstream-model-id"
+#     family = "sonnet"                  # sonnet | opus | haiku
+#
+# `turnpike routes` prints what is configured; `turnpike doctor` says what is
+# wrong. Client to start once the gateway is up: `turnpike launch claude-code`.
 
 [server]
 listen = "127.0.0.1:8710"
-
-# OpenCode Zen — Anthropic-compatible upstream.
-# The Anthropic SDK appends /v1/messages, so base_url has no path.
-# Get a key at https://opencode.ai (export OPENCODE_API_KEY=...).
-[providers.zen]
-spec = "anthropic"
-base_url = "https://opencode.ai/zen"
-api_key_env = "OPENCODE_API_KEY"
-
-# Example OpenAI-compatible provider (uncomment to use):
-# [providers.openrouter]
-# spec = "openai"
-# base_url = "https://openrouter.ai/api"
-# api_key_env = "OPENROUTER_API_KEY"
-
-[routes."claude-sonnet-5"]
-provider = "zen"
-model = "claude-sonnet-4-5"
-display_name = "Sonnet 5 (via Zen)"
-family = "sonnet"
-max_tokens = 64000
-
-[routes."claude-opus-5"]
-provider = "zen"
-model = "claude-opus-4-5"
-display_name = "Opus 5 (via Zen)"
-family = "opus"
-max_tokens = 64000
-
-[routes."claude-haiku-4-5"]
-provider = "zen"
-model = "qwen3-coder"
-display_name = "Haiku 5 (via Zen)"
-family = "haiku"
-max_tokens = 64000
-
-# OpenCode Go subscription models speak the OpenAI spec at /go/v1/... and are
-# bridged automatically. Uncomment and point routes at `zen-go` to use them:
-# [providers.zen-go]
-# spec = "openai"
-# base_url = "https://opencode.ai/zen/go"
-# api_key_env = "OPENCODE_API_KEY"
-#
-# [providers.zen-go.extra_headers]
-# "x-opencode-session" = "turnpike-stable-session"
-#
-# [routes."deepseek"]
-# provider = "zen-go"
-# model = "deepseek-v4-flash"
-# context_tokens = 200000
 "#
     .to_string()
-}
-
-pub fn write_default_config(path: &PathBuf) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(path, default_config_text())
-        .with_context(|| format!("writing default config to {}", path.display()))
 }
 
 #[cfg(test)]
@@ -756,12 +749,18 @@ model = "openai/gpt-5"
         assert_eq!(family_for_path("/v1/whatever"), None);
     }
 
+    /// The skeleton has to survive a round trip through `Config`, because that
+    /// is what `doctor` does with it and what the editor's first render parses.
+    /// It is *not* a valid turnpike config — `validate` refuses it for defining
+    /// no providers, which is the point: a file nobody has finished is not one
+    /// the gateway should serve.
     #[test]
     fn default_config_parses() {
         let cfg: Config = toml::from_str(&default_config_text()).unwrap();
         assert_eq!(cfg.server.listen, "127.0.0.1:8710");
-        assert!(cfg.providers.contains_key("zen"));
-        assert!(cfg.routes.contains_key("claude-sonnet-5"));
+        assert!(cfg.providers.is_empty());
+        assert!(cfg.routes.is_empty());
+        assert!(validate(&cfg).is_err(), "the skeleton is not servable");
     }
 
     #[test]

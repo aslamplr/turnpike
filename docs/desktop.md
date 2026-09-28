@@ -527,15 +527,15 @@ The app starts the gateway on launch, including at login. If there is no config
 file, that start **fails with a message naming the path and pointing at
 `turnpike setup`**, and nothing is written.
 
-That is not incidental. `resolve_config` in the turnpike crate writes a starter
-config *before* its mode match, so `turnpike serve` (and `turnpike config`) on a
-missing file writes one and then exits. A GUI must not trigger that, so both
-`Supervisor::start` and `settings::load` check `config.exists()` **first** and
-never invoke turnpike until it does.
+That is not incidental. `resolve_config` is the load path for every command and
+it refuses a missing file rather than inventing one — no starter is written, so
+`turnpike serve` (and `turnpike config`) simply report what is missing. The
+supervisor still checks `config.exists()` **first** so the window can show its own
+empty state instead of a CLI error string.
 
 The Settings window is the other half of that dead end, and it now closes it. With
 no file it shows the "No configuration yet" empty state and offers the **fresh
-setup** path: the session seeds from the same starter text the wizard starts from
+setup** path: the session seeds from the same skeleton text the wizard starts from
 in memory, not from disk, and the file is written for the first time on Save. The
 gateway's own start still refuses until that happens — the window creates the file,
 the supervisor does not.

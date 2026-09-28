@@ -73,6 +73,7 @@ const searchView = (over: Partial<SearchView> = {}): SearchView => ({
 const session = (over: Partial<SessionPayload> = {}): SessionPayload => ({
   id: "s1",
   view: { kind: "view", view: configView({ routes: [route()] }) },
+  fresh: false,
   staged_keys: [],
   ...over,
 });

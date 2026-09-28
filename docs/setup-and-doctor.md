@@ -34,8 +34,8 @@ is where a first run goes to die.
 If stdin is not a terminal, `setup` **refuses** rather than plodding through:
 
 ```text
-turnpike setup needs an interactive terminal — use `turnpike serve --init` to
-write a starter config non-interactively, then edit it
+turnpike setup needs an interactive terminal — the desktop app's Settings window
+walks through the same steps, and `turnpike config-edit` drives them from a script
 ```
 
 A prompt read from a pipe returns `""` immediately, so an unattended run would
@@ -43,6 +43,11 @@ answer "no" to every question and then save an unchanged file — a wizard that
 looks like it did something and did nothing. Refusing up front is the only
 honest behavior, and it is what `setup < /dev/null` exercises in CI-adjacent
 manual checks. Exit code 1.
+
+The refusal names `config-edit` rather than a flag that writes a starter: there
+is no non-interactive way to make a *usable* config other than driving the same
+ops the window drives, and pointing at a removed flag sent users to a rejected
+argument.
 
 ### Staged, then committed
 
@@ -405,17 +410,14 @@ Three things the view deliberately does *not* compute for itself:
   view cannot claim a search provider that the gateway would refuse to build
   (an `exa` entry with no resolvable key, say) and silently drop server tools.
 
+### It writes nothing when the config is missing
+
 `resolve_config(path, ConfigMode::Required)` is what loads it, so the view is
 **hydrated** — the key tiers it reports are the live precedence result, not the
-raw TOML.
-
-### It does not write a starter config
-
-`ConfigMode::Required` is the mode `serve` also uses, and `resolve_config` writes
-a starter config **before** its mode match — so `turnpike config` on a missing
-file writes one and then bails. That is fine for a human at a shell and wrong for
-a GUI that starts on login, which is why the desktop shell pre-checks
-`config.exists()` and never invokes turnpike until the file is there. See
+raw TOML. On a missing file that load fails, and `turnpike config` reports the
+same message `serve` would: no config, here is how to make one. Nothing is
+written — there is no mode that writes a starter, which is what makes this
+command safe for a GUI that starts on login. See
 [desktop.md](desktop.md#missing-config).
 
 ## `turnpike doctor`

@@ -124,9 +124,9 @@ pub(crate) fn run_with(
     // like it did something and did nothing.
     if !is_tty {
         anyhow::bail!(
-            "turnpike setup needs an interactive terminal — use \
-             `turnpike serve --init` to write a starter config non-interactively, \
-             then edit it"
+            "turnpike setup needs an interactive terminal — the desktop app's \
+             Settings window walks through the same steps, and \
+             `turnpike config-edit` drives them from a script"
         );
     }
 
@@ -871,8 +871,8 @@ pub(crate) fn commit_doc(
     if !no_validate {
         doc.validated().context(
             "the config being saved is not valid — nothing was written; \
-             fix it above, or `turnpike serve --init` writes a known-good \
-             starter to compare against",
+             fix it above — `turnpike doctor` reports what the gateway \
+             needs and what is missing",
         )?;
     }
 
@@ -1216,17 +1216,19 @@ mod tests {
         // End-to-end without a tty: the wizard's own commit path, driven with a
         // document built the way `add_provider`/`add_route` build one.
         let path = temp_path("commit-ok");
-        let mut state = WizardState::new(Doc::starter().unwrap(), Plan::default());
+        let mut state = WizardState::new(Doc::fixture().unwrap(), Plan::default());
+        // A provider id the fixture does not already carry, so this exercises
+        // `add_provider`'s write path rather than colliding with its seed.
         state
             .doc
-            .add_provider("openrouter", Spec::Openai, "https://openrouter.ai/api")
+            .add_provider("fireworks", Spec::Openai, "https://api.fireworks.ai")
             .unwrap();
         state
             .doc
             .add_route(
                 "qwen-coder",
                 &RouteDraft {
-                    provider: "openrouter".into(),
+                    provider: "fireworks".into(),
                     model: "anthropic/claude-haiku-4.5".into(),
                     display_name: None,
                     family: Some("haiku".into()),
@@ -1242,13 +1244,13 @@ mod tests {
         // What landed on disk parses and validates...
         let written = std::fs::read_to_string(&path).unwrap();
         let cfg = crate::config::load_from_str(&written).unwrap();
-        assert!(cfg.providers.contains_key("openrouter"));
+        assert!(cfg.providers.contains_key("fireworks"));
         assert!(cfg.routes.contains_key("qwen-coder"));
 
-        // ...and every comment from the starter survived the round trip. This is
+        // ...and every comment from the fixture survived the round trip. This is
         // the property the whole `toml_edit` dependency exists for.
-        let starter = Doc::starter().unwrap();
-        for comment in starter.comments() {
+        let fixture = Doc::fixture().unwrap();
+        for comment in fixture.comments() {
             assert!(
                 written.contains(&comment),
                 "commit dropped the comment {comment:?}"
@@ -1259,7 +1261,7 @@ mod tests {
     #[test]
     fn commit_stores_secrets_before_writing_the_config() {
         let path = temp_path("commit-secrets");
-        let mut state = WizardState::new(Doc::starter().unwrap(), Plan::default());
+        let mut state = WizardState::new(Doc::fixture().unwrap(), Plan::default());
         state.plan.stage_secret("provider.zen", "sk-secret");
 
         let mut store = memory_store();
@@ -1278,22 +1280,17 @@ mod tests {
     #[test]
     fn commit_refuses_an_invalid_document_and_writes_nothing() {
         let path = temp_path("commit-invalid");
-        let mut state = WizardState::new(Doc::starter().unwrap(), Plan::default());
-        // A route pointing at a provider that does not exist: `toml_edit` will
-        // build it happily, `validate` will not accept it.
-        state
-            .doc
-            .add_provider("ghost", Spec::Openai, "https://ghost.example")
-            .unwrap();
-        state.doc.remove_provider("ghost").unwrap();
-        // Hand-build an invalid state by removing every provider's routes'
-        // referent: drop `zen` while its routes still point at it.
-        state.doc.remove_route("claude-sonnet-5").unwrap();
-        state.doc.remove_route("claude-opus-5").unwrap();
-        state.doc.remove_route("claude-haiku-4-5").unwrap();
-        // Now remove the provider; with no routes left, this succeeds and leaves
-        // a config with no providers, which `validate` rejects.
-        state.doc.remove_provider("zen").unwrap();
+        let mut state = WizardState::new(Doc::fixture().unwrap(), Plan::default());
+        // Strip it to a document `validate` rejects: every route first — a
+        // provider still referenced cannot be removed — then every provider.
+        // `toml_edit` builds an empty-providers document happily; `validate`
+        // does not accept it.
+        for id in state.doc.route_ids() {
+            state.doc.remove_route(&id).unwrap();
+        }
+        for id in state.doc.provider_ids() {
+            state.doc.remove_provider(&id).unwrap();
+        }
 
         let mut store = memory_store();
         let err = state.commit(&path, &mut store, false).unwrap_err();
@@ -1307,11 +1304,13 @@ mod tests {
     #[test]
     fn commit_with_no_validate_saves_the_invalid_document() {
         let path = temp_path("commit-novalidate");
-        let mut state = WizardState::new(Doc::starter().unwrap(), Plan::default());
+        let mut state = WizardState::new(Doc::fixture().unwrap(), Plan::default());
         for id in state.doc.route_ids() {
             state.doc.remove_route(&id).unwrap();
         }
-        state.doc.remove_provider("zen").unwrap();
+        for id in state.doc.provider_ids() {
+            state.doc.remove_provider(&id).unwrap();
+        }
 
         let mut store = memory_store();
         state.commit(&path, &mut store, true).unwrap();
@@ -1324,7 +1323,7 @@ mod tests {
     #[test]
     fn commit_is_atomic_and_leaves_no_temp_file() {
         let path = temp_path("commit-atomic");
-        let mut state = WizardState::new(Doc::starter().unwrap(), Plan::default());
+        let mut state = WizardState::new(Doc::fixture().unwrap(), Plan::default());
         let mut store = memory_store();
         state.commit(&path, &mut store, false).unwrap();
 
@@ -1347,14 +1346,16 @@ mod tests {
         let path = temp_path("quit");
         std::fs::write(&path, "original").unwrap();
 
-        let mut state = WizardState::new(Doc::starter().unwrap(), Plan::default());
+        let mut state = WizardState::new(Doc::fixture().unwrap(), Plan::default());
         state
             .doc
-            .add_provider("openrouter", Spec::Openai, "https://openrouter.ai/api")
+            .add_provider("fireworks", Spec::Openai, "https://api.fireworks.ai")
             .unwrap();
-        state.plan.stage_secret("provider.openrouter", "sk-x");
+        state.plan.stage_secret("provider.fireworks", "sk-x");
         drop(state);
 
+        // Nothing was written: the file is exactly what it was before the
+        // wizard touched the document.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
     }
 
@@ -1494,7 +1495,10 @@ base_url = "https://opencode.ai/zen"
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("interactive terminal"), "got: {err:#}");
-        assert!(msg.contains("serve --init"), "got: {err:#}");
+        // The refusal has to name a way forward that actually exists: `--init`
+        // was removed, and a message pointing at it sent users to a flag clap
+        // now rejects.
+        assert!(msg.contains("config-edit"), "got: {err:#}");
     }
 
     #[test]
@@ -1523,16 +1527,13 @@ base_url = "https://opencode.ai/zen"
 
     // --- targets & strategy ------------------------------------------------
 
-    /// A state on the starter document, with an extra provider to point a
-    /// second target at — the starter's routes all sit on `zen`, and a failover
-    /// chain on one provider is the shape `doctor` lints.
+    /// A state on the fixture document.
+    ///
+    /// The fixture carries two providers (`zen` and `zen-go`) with routes on
+    /// each, so the second target these tests fan out to is already in the
+    /// document — no provider to graft on first.
     fn target_state() -> WizardState {
-        let mut state = WizardState::new(Doc::starter().unwrap(), Plan::default());
-        state
-            .doc
-            .add_provider("zen-go", Spec::Openai, "https://opencode.ai/zen/go")
-            .unwrap();
-        state
+        WizardState::new(Doc::fixture().unwrap(), Plan::default())
     }
 
     /// The `provider/model` chain of the starter's `claude-sonnet-5` route.
@@ -1695,8 +1696,8 @@ base_url = "https://opencode.ai/zen"
         assert_eq!(r.targets().len(), 2);
         assert_eq!(r.strategy, crate::config::Strategy::Failover);
 
-        let starter = Doc::starter().unwrap();
-        for comment in starter.comments() {
+        let fixture = Doc::fixture().unwrap();
+        for comment in fixture.comments() {
             assert!(
                 written.contains(&comment),
                 "the target path dropped the comment {comment:?}"

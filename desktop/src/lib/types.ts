@@ -69,10 +69,17 @@ export type SettingsPayload =
 /// side for the life of the session and has no command that returns it.
 export interface SessionPayload {
   id: string;
-  /// `SettingsPayload`, not `ConfigView`: the session's own path may not exist
-  /// yet (a fresh setup), and that is a `missingConfig` the window must offer to
-  /// create rather than an error.
+  /// `SettingsPayload`, not `ConfigView`: the view is rendered from the
+  /// session's own *document*, which on a fresh setup has never been written —
+  /// so a first run is an ordinary `view` of the starter skeleton, not a
+  /// `missingConfig`. `missingConfig` is reached only when there is no session
+  /// at all (a bare `settings_view`).
   view: SettingsPayload;
+  /// Whether the session's file is absent — the first-run state. It is the Rust
+  /// side's answer, read off the filesystem, because the window cannot tell
+  /// "nothing configured yet" from "nothing on disk yet" through a redacted
+  /// view. False once a save has created the file.
+  fresh: boolean;
   /** Plan slots a key is staged for (`provider.zen`). Never values. */
   staged_keys: KeySlot[];
   error?: string;

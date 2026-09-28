@@ -10,11 +10,11 @@ The launcher reads the same config as the gateway (`--config`, else
 `$TURNPIKE_CONFIG`, else `~/.config/turnpike/config.toml`) and shares its
 resolution logic; a model id that works for the gateway works for the launcher.
 
-**If no config exists**, `launch` writes the starter and then **fails** rather
-than exiting 0 without launching anything. That was the old behavior, and it is
-the worst possible failure shape for a script: a fresh machine looked
-configured. Set up first (`turnpike setup`, or `turnpike serve --init` plus an
-edit), then launch.
+**If no config exists**, `launch` says so and **fails** rather than exiting 0
+without launching anything. That was the old behavior — it wrote a starter config
+— and it is the worst possible failure shape for a script: a fresh machine looked
+configured. Set up first, then launch: `turnpike setup` walks through providers,
+routes and keys; the desktop app's Settings window edits the same file.
 
 ## CLI surface
 

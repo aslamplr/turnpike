@@ -99,6 +99,10 @@ pub struct Reply {
     pub session: Option<Session>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The redacted view of the session's *document*, for `--view`. Absent on
+    /// every other op, so the bytes the other callers already see do not change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::view::ConfigView>,
 }
 
 impl Reply {
@@ -106,6 +110,7 @@ impl Reply {
         Self {
             session: Some(session),
             error: None,
+            view: None,
         }
     }
 
@@ -115,7 +120,19 @@ impl Reply {
         Self {
             session: Some(session),
             error: Some(error.into()),
+            view: None,
         }
+    }
+
+    /// Attach the rendered view to an otherwise-unchanged reply.
+    ///
+    /// A builder rather than an `ok_with_view(session, view)` constructor: the
+    /// view is a *second* rendering of the same session, so the session field
+    /// stays exactly what `ok` would have produced and a caller that ignores the
+    /// view sees the reply it always saw.
+    pub fn with_view(mut self, view: crate::view::ConfigView) -> Self {
+        self.view = Some(view);
+        self
     }
 }
 
@@ -287,10 +304,12 @@ struct StageDelete {
 /// Seed a session: the file if there is one, else the starter text **in
 /// memory**.
 ///
-/// The starter is never written here. That is the same rule `setup` follows, and
-/// it is why this must not go through `main::resolve_config`, which writes a
-/// starter to disk *before* deciding what the mode means — for an editor, "I
-/// opened it to look" must not leave a file behind.
+/// The starter is never written here. That is the same rule `setup` follows: the
+/// skeleton is the *editor's* starting text, not a config, so the first bytes on
+/// disk are the ones a user actually filled in. `main::resolve_config` is the
+/// same way now — it refuses a missing config instead of inventing one — but an
+/// editor must not even reach that path: "I opened it to look" has to leave
+/// nothing behind.
 pub fn load(config: Option<PathBuf>) -> Result<Session> {
     let path = config
         .or_else(crate::config::default_config_path)
@@ -704,6 +723,34 @@ pub fn validation(session: &Session) -> Option<String> {
     doc.validated().err().map(|e| format!("{e:#}"))
 }
 
+/// The redacted view of the session's **document**, not of the file on disk.
+///
+/// This is what lets the window render a config that has never been saved.
+/// `turnpike config` reads the file, and on a first run there is no file — so a
+/// window that opened the editor merely to look would have nothing to show, and
+/// the whole editor would be unreachable behind that emptiness.
+///
+/// Deliberately **not** `config::load_from_str`: that runs `validate`, and the
+/// one document this must render above all others is the starter skeleton, which
+/// has no providers yet and so is a validation *failure* by design. Parsing
+/// alone renders it — an empty provider list is exactly what the window needs to
+/// see in order to offer the walkthrough that fills it in. A malformed document
+/// still fails here, which is the error the caller wants.
+///
+/// The store is opened against the *session's* path so a key that only the
+/// encrypted store can supply reports its real tier rather than "missing". On a
+/// first run that path does not exist, and `secrets::open` treats a missing
+/// `master.key` and `secrets.toml` as the ordinary empty store rather than an
+/// error — which is exactly the right answer for a config nobody has saved yet.
+pub fn view(session: &Session) -> Result<crate::view::ConfigView> {
+    let path = std::path::Path::new(&session.path);
+    let mut cfg: crate::config::Config =
+        toml::from_str(&session.doc).context("parsing the session's document")?;
+    let store = secrets::open(path);
+    secrets::hydrate(&mut cfg, &store);
+    Ok(crate::view::build(path, &cfg))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,9 +768,30 @@ mod tests {
         StoreCtx::with_store("deadbeefdeadbeef", root, Box::new(MemoryStore::new("fake")))
     }
 
+    /// A session on the populated fixture, not the production skeleton.
+    ///
+    /// Every op these tests drive (a route scalar, a target, a provider key
+    /// slot, a `[search]` var) names something that only exists once a document
+    /// has been filled in, and they all assert the *edited* document still
+    /// validates — which the skeleton cannot, since it defines no providers.
+    /// See `edit::Doc::fixture`.
     fn starter_session(tag: &str) -> Session {
         Session {
-            doc: crate::config::default_config_text(),
+            doc: Doc::fixture().unwrap().as_str(),
+            plan: PlanRepr::default(),
+            path: temp_path(tag).display().to_string(),
+        }
+    }
+
+    /// A session on the *empty skeleton* — the document `load()` seeds when no
+    /// config exists yet.
+    ///
+    /// Only for subjects where "absent"/"first run" is the question: the
+    /// skeleton defines no providers, so nothing that edits and then validates
+    /// can use it. Every other test wants `starter_session`.
+    fn skeleton_session(tag: &str) -> Session {
+        Session {
+            doc: Doc::starter().unwrap().as_str(),
             plan: PlanRepr::default(),
             path: temp_path(tag).display().to_string(),
         }
@@ -852,8 +920,11 @@ mod tests {
         .unwrap();
         let wizard_bytes = std::fs::read_to_string(&wizard_path).unwrap();
 
-        // The CLI's path: the same edits, one op at a time.
-        let session = starter_session("equiv-cli");
+        // The CLI's path: the same edits, one op at a time — seeded from the
+        // *skeleton*, which is what the wizard's `load()` starts from on a path
+        // that does not exist yet. A fixture here would compare two documents
+        // that were never the same to begin with.
+        let session = skeleton_session("equiv-cli");
         let session = chain(
             &session,
             &[
@@ -1155,7 +1226,7 @@ mod tests {
     /// leave the session untouched — the same shape as an unknown route id.
     #[test]
     fn remove_search_is_refused_when_there_is_no_table() {
-        let session = starter_session("remove-search-absent");
+        let session = skeleton_session("remove-search-absent");
         assert!(!session.doc.contains("[search]"));
 
         let reply = apply("remove-search", &session, "{}").unwrap();
@@ -1193,11 +1264,149 @@ mod tests {
     /// the slot is right, but it must only be *used* on the success branch.
     #[test]
     fn refused_remove_search_stages_no_delete() {
-        let session = starter_session("search-refused");
+        let session = skeleton_session("search-refused");
         assert!(!session.doc.contains("[search]"));
         let reply = apply("remove-search", &session, "{}").unwrap();
         assert!(reply.error.is_some());
         assert!(reply.session.unwrap().plan.deletes.is_empty());
+    }
+
+    /// The whole point of `--view`: a document that has never been on disk still
+    /// renders. The starter skeleton is a validation *failure* (`config::validate`
+    /// rejects a provider-less config), so a `view()` that went through
+    /// `load_from_str` would fail here — and the first-run window would be blank,
+    /// which is the bug this mode exists to fix.
+    #[test]
+    fn view_renders_the_skeleton_that_validation_rejects() {
+        let session = skeleton_session("view-fresh");
+        assert!(
+            validation(&session).is_some(),
+            "the skeleton is supposed to be invalid; the test rests on that"
+        );
+
+        let view = view(&session).expect("the skeleton must still render");
+        assert!(view.providers.is_empty());
+        assert!(view.routes.is_empty());
+        assert!(view.search.is_none());
+        assert_eq!(view.config_path, session.path);
+    }
+
+    /// The read path is the redaction boundary: a view carries key *tiers* and
+    /// header *names*, so a document full of secrets must render without one
+    /// appearing in the JSON the window receives.
+    ///
+    /// The document is built here rather than taken from `Doc::fixture` because
+    /// the fixture declares no `extra_headers` — and the header name is half of
+    /// what this asserts, so a fixture without one would leave the redaction
+    /// claim untested while looking like it passed.
+    #[test]
+    fn view_carries_no_key_value() {
+        let path = temp_path("view-redaction");
+        let session = Session {
+            doc: "[server]\nlisten = \"127.0.0.1:8710\"\n\n\
+                  [providers.zen-go]\nspec = \"openai\"\n\
+                  base_url = \"https://opencode.ai/zen/go\"\napi_key = \"or-key\"\n\n\
+                  [providers.zen-go.extra_headers]\n\
+                  \"x-opencode-session\" = \"session-token\"\n"
+                .to_string(),
+            plan: PlanRepr::default(),
+            path: path.display().to_string(),
+        };
+
+        let rendered = view(&session).unwrap();
+        let json = serde_json::to_string(&rendered).unwrap();
+
+        assert!(!json.contains("or-key"), "an inline key leaked: {json}");
+        assert!(
+            !json.contains("session-token"),
+            "a header value leaked: {json}"
+        );
+        // ...and the name *is* reported, by construction: `view::provider_view`
+        // reads `extra_headers.keys()`, so a name that survived means the value
+        // did too. Without this line a `view()` that dropped the table entirely
+        // would pass both redaction assertions.
+        assert!(
+            json.contains("x-opencode-session"),
+            "the header *name* should be reported: {json}"
+        );
+        assert_eq!(
+            rendered.providers[0].extra_header_names,
+            vec!["x-opencode-session".to_string()]
+        );
+    }
+
+    /// The in-process half of the store tier: with the store root pointed at a
+    /// directory that has never been written, a provider whose only key source is
+    /// the store reports `missing` with the run-`setup` note — which is what a
+    /// first run looks like, and the state the window must not present as an
+    /// error.
+    ///
+    /// The *other* half — a key the store does hold reporting the store tier — is
+    /// not testable from here. `view()` opens the store itself: `secrets::open`
+    /// derives its root from `$TURNPIKE_HOME` and its namespace from the config
+    /// path, so a store this test built in memory would never be the store the
+    /// lookup reads. That half needs a child process with its own `TURNPIKE_HOME`,
+    /// and lives in `tests/config_edit_stdout.rs`:
+    /// `view_reports_a_key_the_store_holds`.
+    #[test]
+    fn view_reports_a_missing_key_as_missing() {
+        let path = temp_path("view-missing-key");
+        let session = Session {
+            doc: "[server]\nlisten = \"127.0.0.1:8710\"\n\n[providers.zen]\n\
+                  spec = \"anthropic\"\nbase_url = \"https://opencode.ai/zen\"\n"
+                .to_string(),
+            plan: PlanRepr::default(),
+            path: path.display().to_string(),
+        };
+
+        let rendered = view(&session).unwrap();
+        assert_eq!(rendered.providers.len(), 1);
+        assert!(
+            rendered.providers[0].key.missing,
+            "a key with no source reported as present: {:?}",
+            rendered.providers[0].key
+        );
+        assert_eq!(rendered.providers[0].key.tier, "missing");
+    }
+
+    /// `Reply` grew a third field for `--view`, and the other modes must not have
+    /// grown it alongside: the desktop shell parses these and a stray `view` on
+    /// every op would be bytes nothing asked for.
+    #[test]
+    fn the_view_field_appears_only_when_asked_for() {
+        let session = starter_session("reply-view-field");
+
+        let plain = serde_json::to_value(Reply::ok(clone_session(&session))).unwrap();
+        assert!(plain.get("view").is_none(), "{plain}");
+        assert!(
+            serde_json::to_value(Reply::refused(clone_session(&session), "no"))
+                .unwrap()
+                .get("view")
+                .is_none()
+        );
+
+        let with = serde_json::to_value(
+            Reply::ok(clone_session(&session)).with_view(view(&session).unwrap()),
+        )
+        .unwrap();
+        // By id, not by index: `providers` is a `BTreeMap`, so the fixture
+        // renders `openrouter` first and an index-based assertion would be
+        // pinning alphabetical order rather than the mapping.
+        let ids: Vec<&str> = with["view"]["providers"]
+            .as_array()
+            .expect("providers is an array")
+            .iter()
+            .map(|p| p["id"].as_str().expect("every provider has an id"))
+            .collect();
+        assert!(ids.contains(&"zen"), "zen is missing from {ids:?}");
+        assert_eq!(
+            ids.len(),
+            3,
+            "the whole provider list should render: {ids:?}"
+        );
+        // The session is still whole beside it — `with_view` attaches, it does
+        // not replace.
+        assert_eq!(with["session"]["path"], session.path);
     }
 
     #[test]

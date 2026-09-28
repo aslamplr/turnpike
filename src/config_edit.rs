@@ -10,10 +10,16 @@
 //! is why `default_log_filter` gives this command `warn`: an `INFO` from the
 //! search manager landing mid-JSON is a session the desktop shell cannot parse.
 //!
-//! ## The three ways in
+//! ## The four ways in
 //!
 //! * `--load` seeds a session (the file if there is one, else the starter text
 //!   in memory) and prints it. No stdin.
+//! * `--view` reads a session on stdin and prints the **redacted view** of the
+//!   document it holds, with the session beside it. This is what lets the
+//!   window render a config that does not exist on disk yet: `turnpike config`
+//!   reads the file, and on a first run there is no file.
+//! * `--validate` reads a session on stdin and prints it unchanged, or refuses
+//!   with the reason.
 //! * `--op <name>` reads a session on stdin, applies the operation, prints the
 //!   result. The operation's arguments come from `--args`.
 //! * Nothing is required to be ordered: `apply` matches `save` first, so a
@@ -43,6 +49,10 @@ pub struct ConfigEditArgs {
     /// Report the validity of the session on stdin instead of applying an op.
     #[arg(long)]
     validate: bool,
+    /// Render the redacted view of the session's *document* rather than the
+    /// file on disk. Reads the session on stdin.
+    #[arg(long)]
+    view: bool,
 }
 
 pub fn run(args: ConfigEditArgs) -> Result<()> {
@@ -52,6 +62,14 @@ pub fn run(args: ConfigEditArgs) -> Result<()> {
     }
 
     let session: Session = read_session()?;
+
+    // `--view` before `--validate` before `--op`, matching the doc comment's
+    // order. All three take the same session on stdin, so the only thing
+    // deciding between them is which one the caller asked for.
+    if args.view {
+        let view = cli::view(&session)?;
+        return print(&Reply::ok(session).with_view(view));
+    }
 
     if args.validate {
         return print(&match cli::validation(&session) {

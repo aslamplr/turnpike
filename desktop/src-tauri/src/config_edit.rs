@@ -56,6 +56,11 @@ struct Reply {
     session: Option<CliSession>,
     #[serde(default)]
     error: Option<String>,
+    /// The redacted view a `--view` reply carries. Absent on every other mode,
+    /// so an op reply parses with this `None` — the session is what an op
+    /// returns, and `view_of_session` is what turns it into a view.
+    #[serde(default)]
+    view: Option<ConfigView>,
 }
 
 /// `src/setup/cli.rs`'s `Session`. `staged` is deliberately absent — the CLI's
@@ -100,6 +105,13 @@ impl Session {
         &self.session.path
     }
 
+    /// Whether this session's file is absent — the first-run state, and the one
+    /// thing the window cannot answer for itself. A save creates the file, so
+    /// this goes false the moment one succeeds, with nothing here to remember it.
+    fn is_fresh(&self) -> bool {
+        !Path::new(self.path()).exists()
+    }
+
     /// The session as the CLI reads it: the document plus the plan, and nothing
     /// else. `staged` is this side's own bookkeeping, so it is not sent.
     fn session_json(&self) -> Result<String, String> {
@@ -114,8 +126,14 @@ impl Session {
 pub struct SessionPayload {
     /// Opaque. The window echoes it back on the next call and never parses it.
     pub id: String,
-    /// A freshly rendered `turnpike config --json` view — key tiers only.
+    /// A freshly rendered view of the session's *document* — key tiers only.
+    /// Rendered by `config-edit --view`, so it exists before the first save.
     pub view: SettingsPayload,
+    /// Whether the session's file is absent — the first-run state. Read here,
+    /// where the filesystem can answer it: the window sees only the redacted
+    /// view, and an empty provider list means "nothing configured yet", which is
+    /// a different question from "nothing on disk yet".
+    pub fresh: bool,
     /// Slots with a key staged for the next Save. Names, never values.
     pub staged_keys: Vec<String>,
     /// A refusal from the op just applied. The session is unchanged; the window
@@ -132,6 +150,7 @@ impl SessionPayload {
             view: SettingsPayload::Error {
                 message: message.into(),
             },
+            fresh: false,
             staged_keys: Vec::new(),
             error: None,
         }
@@ -251,42 +270,51 @@ fn run_cli(bin: &Path, args: &[&str], stdin: Option<&str>) -> Result<String, Str
     String::from_utf8(out.stdout).map_err(|e| format!("the CLI's output was not UTF-8: {e}"))
 }
 
-/// The view of a config path, or why there isn't one.
+/// The view of a **session** — the document it holds, not the file on disk.
 ///
-/// This mirrors `settings::load`'s pre-check, which is load-bearing there:
-/// `resolve_config` writes a starter config *before* its mode match, so
-/// `turnpike config` on a missing file writes one and then bails. A window that
-/// opened the editor merely to look must not leave a file behind, so the check
-/// comes first and `MissingConfig` is reported rather than provoked.
-async fn view_of(path: &str) -> SettingsPayload {
-    if !Path::new(path).exists() {
-        return SettingsPayload::MissingConfig {
-            path: path.to_string(),
-        };
-    }
+/// This is the first-run path, and the reason `--view` exists: `turnpike config`
+/// reads a file, and on a first run there is none. `config-edit --view` renders
+/// the session's staged document through the same redaction boundary, so the
+/// window can show a config that has never been saved — the starter skeleton
+/// included — instead of collapsing to `MissingConfig` and dead-ending a user who
+/// has not run the CLI.
+///
+/// A session is always present here; its `path` may point at a file that does not
+/// exist. That is the normal first-run state, not a failure.
+async fn view_of_session(session: &Session) -> SettingsPayload {
     let Ok(bin) = binary() else {
         return SettingsPayload::Error {
             message: "could not find the `turnpike` binary — set TURNPIKE_BIN to its path"
                 .to_string(),
         };
     };
-    let path_owned = path.to_string();
-    let out =
-        spawn_blocking(move || run_cli(&bin, &["config", "--config", &path_owned, "--json"], None))
-            .await;
+    let stdin = match session.session_json() {
+        Ok(json) => json,
+        Err(e) => return SettingsPayload::Error { message: e },
+    };
+
+    let out = spawn_blocking(move || {
+        run_cli(&bin, &["config-edit", "--view"], Some(&stdin))
+    })
+    .await;
 
     match out {
-        Ok(Ok(text)) => match serde_json::from_str::<ConfigView>(&text) {
-            Ok(view) => SettingsPayload::View {
+        Ok(Ok(text)) => match serde_json::from_str::<Reply>(&text) {
+            // `--view` prints the session beside the view; only the view is read.
+            Ok(Reply { view: Some(view), .. }) => SettingsPayload::View {
                 view: Box::new(view),
             },
+            Ok(_) => SettingsPayload::Error {
+                message: "`config-edit --view` returned no view".to_string(),
+            },
             Err(e) => SettingsPayload::Error {
-                message: format!("could not parse `turnpike config --json`: {e}"),
+                message: format!("could not parse `config-edit --view`: {e}"),
             },
         },
+        // A refusal carries the reason in the CLI's own words, same as an op.
         Ok(Err(e)) => SettingsPayload::Error { message: e },
         Err(e) => SettingsPayload::Error {
-            message: format!("rendering the config did not finish: {e}"),
+            message: format!("rendering the session did not finish: {e}"),
         },
     }
 }
@@ -336,12 +364,17 @@ pub async fn config_edit_load(
     };
     let stored = Session::new(session);
     let staged_keys = stored.staged.clone();
-    let config_path = stored.path().to_string();
+    // The view is rendered *from the session*, not from the file: on a first run
+    // there is no file, and the whole point of this path is to show the starter
+    // document rather than dead-ending on a missing path.
+    let view = view_of_session(&stored).await;
+    let fresh = stored.is_fresh();
     state.put(&id, stored);
 
     Ok(SessionPayload {
         id,
-        view: view_of(&config_path).await,
+        view,
+        fresh,
         staged_keys,
         error: reply.error,
     })
@@ -542,16 +575,17 @@ struct Report {
 }
 
 /// The payload for a session already in the map: its staged slots plus the view
-/// of the file as it now stands. Used after a save, where there is no CLI reply
+/// of the document it now holds. Used after a save, where there is no CLI reply
 /// to carry either.
 async fn payload_of(state: &tauri::State<'_, EditState>, id: &str) -> SessionPayload {
     let Some(stored) = state.get(id) else {
         return SessionPayload::failed(id, "this session is no longer open");
     };
-    let path = stored.path().to_string();
+    let view = view_of_session(&stored).await;
     SessionPayload {
         id: id.to_string(),
-        view: view_of(&path).await,
+        view,
+        fresh: stored.is_fresh(),
         staged_keys: stored.staged,
         error: None,
     }
@@ -568,12 +602,17 @@ async fn store_and_view(
     };
     let stored = Session::new(next);
     let staged_keys = stored.staged.clone();
-    let path = stored.path().to_string();
+    // Both read off `stored` before `put` takes it: the view is a rendering of
+    // the document it holds, and `fresh` a look at the path it names. `put`
+    // takes ownership, so neither can come after it.
+    let view = view_of_session(&stored).await;
+    let fresh = stored.is_fresh();
     state.put(&id, stored);
 
     SessionPayload {
         id,
-        view: view_of(&path).await,
+        view,
+        fresh,
         staged_keys,
         error: reply.error,
     }
@@ -683,6 +722,7 @@ mod tests {
             session: Box::new(SessionPayload {
                 id: "s1".into(),
                 view: SettingsPayload::MissingConfig { path: "/c".into() },
+                fresh: false,
                 staged_keys: vec!["provider.zen".into()],
                 error: None,
             }),
@@ -697,6 +737,7 @@ mod tests {
         let payload = SessionPayload {
             id: "s1".into(),
             view: SettingsPayload::MissingConfig { path: "/c".into() },
+            fresh: false,
             staged_keys: vec!["provider.zen".into()],
             error: None,
         };
@@ -718,6 +759,7 @@ mod tests {
         let payload = SessionPayload {
             id: "s1".into(),
             view: SettingsPayload::MissingConfig { path: "/c".into() },
+            fresh: false,
             staged_keys: stored.staged.clone(),
             error: None,
         };

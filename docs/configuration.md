@@ -3,10 +3,10 @@
 turnpike is configured with a single TOML file. `turnpike setup` walks through
 creating or editing it — providers, routes, and keys — and can store keys
 encrypted instead of leaving them in your shell environment (see
-[secrets.md](secrets.md)). If no config exists at the configured path,
-`serve`/`launch` writes the starter config and tells you what to do next; see
-[where the config lives](#where-the-config-lives) for the exact behavior, which
-differs by command.
+[secrets.md](secrets.md)). turnpike never invents a config: on a path with no
+file, every command says so and exits non-zero rather than writing a starter
+nobody filled in; see [where the config lives](#where-the-config-lives) for the
+exact wording, which differs by command.
 
 ## Where the config lives
 
@@ -18,18 +18,22 @@ The config path is, in order:
 
 `serve`, `launch` and `routes` all honor it, as do `setup` and `doctor`.
 
-What happens when **no config exists at that path** depends on the command —
-this is a deliberate difference, not an inconsistency:
+What happens when **no config exists at that path** is the same everywhere:
+nothing is written, the message names the path, and the exit is non-zero. Only
+the wording differs — `serve` phrases it as the next step, everything else as an
+error about its input:
 
 | Command | Behavior with no config |
 | --- | --- |
-| `turnpike serve --init` | Writes `default_config_text()` and exits 0. The scripted/CI contract. |
-| `turnpike serve` | Writes the starter and exits 0, pointing you at `turnpike setup`. |
-| `turnpike launch`, `turnpike routes` | Writes the starter and **exits non-zero** — a starter nobody filled in is not a useful thing to succeed on. |
-| `turnpike setup`, `turnpike doctor` | Never write a starter to disk. They start from the starter text *in memory*. |
+| `turnpike serve` | Exits non-zero, saying a config is needed to start and pointing at `turnpike setup`. |
+| `turnpike launch`, `turnpike routes`, `turnpike config` | Exits non-zero — a config someone else was supposed to have made is missing. |
+| `turnpike setup` | Starts from the in-memory skeleton and walks you through filling it in; the first bytes on disk are the ones you supplied. Quit without saving and nothing is left behind. |
+| `turnpike doctor` | Reports the missing file as its own finding. Never writes one. |
 
-`launch` and `routes` used to exit 0 here, which made a fresh machine look
-configured when it was not; that is the bug the non-zero exit fixes.
+`serve`, `launch` and `routes` used to write a starter config and exit 0, which
+made a fresh machine look configured when it was not — a file nobody asked for,
+holding an example provider that read as a recommendation. Removing the write is
+what closed that; see [`default_config_text()`](#the-config-skeleton).
 
 
 ## The four top-level tables
@@ -219,16 +223,20 @@ existing configs use it and because it is genuinely the simplest thing for a
 throwaway setup. `doctor`'s `providers-key-inline` check lists every literal key
 it finds and points at `turnpike setup`, which offers to migrate them.
 
-## The default config
+## The config skeleton
 
-`default_config_text()` — what gets written on first run — wires OpenCode Zen
-as the Anthropic-compatible upstream and maps the three Claude slot ids Ollama
-advertises onto Zen models:
+`default_config_text()` is the text a first run starts from — a `[server]` block
+and comments, **no providers and no routes**. It is never written to disk
+unasked. Two callers hand it out, and both put it in front of a user:
 
-- `claude-sonnet-5` → `claude-sonnet-4-5` (family `sonnet`)
-- `claude-opus-5` → `claude-opus-4-5` (family `opus`)
-- `claude-haiku-4-5` → `qwen3-coder` (family `haiku`)
+- `turnpike setup` and the desktop Settings window, which parse it, let you fill
+  in real details, and write the result — so the first bytes on disk are a config
+  that works for *that* user;
+- `turnpike doctor`, which parses it to prove it is at least well-formed TOML.
 
-OpenCode Go subscription models (OpenAI spec at `/go/v1/...`, DeepSeek/GLM on
-that catalog) are included as a commented `[providers.zen-go]` block that the
-comment explains how to enable.
+It used to carry a worked OpenCode Zen example wired to the three Claude slot
+ids. That read as a recommendation: users ran it unchanged, then could not tell
+why nothing worked, or assumed the example provider was the intended one. A
+skeleton promises nothing and can only be finished by supplying a real provider.
+OpenCode Zen and Zen Go are still documented, as options rather than defaults —
+see [the OpenCode notes](#opencode-zen-and-zen-go).

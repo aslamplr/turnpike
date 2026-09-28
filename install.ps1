@@ -62,7 +62,8 @@ if (($userPath -split ';') -notcontains $InstallDir) {
 
 Write-Host ''
 Write-Host "turnpike $Version installed to $InstallDir\turnpike.exe"
-Write-Host 'Start the gateway with: turnpike serve --init'
+Write-Host 'Next: turnpike setup   (creates your config, and asks for your provider + key)'
+Write-Host 'Then: turnpike serve   (starts the gateway)'
 
 # --- Desktop app (optional) -------------------------------------------------
 

@@ -90,6 +90,35 @@ fn one_json_object(stdout: &str, what: &str, stderr: &str) -> serde_json::Value 
     })
 }
 
+/// Apply one op to `session` and return the session the reply carries back.
+///
+/// Every step is asserted to be a one-line JSON object too: an op whose reply is
+/// unparseable is the same failure the save itself used to have, one step
+/// earlier, and it should be named as such rather than surfacing as a confusing
+/// "the session I fed the save was wrong".
+fn edit(
+    config: &std::path::Path,
+    home: &std::path::Path,
+    session: &serde_json::Value,
+    op: &str,
+    args: &str,
+    stderr: &str,
+) -> serde_json::Value {
+    let (out, err, ok) = run(
+        config,
+        home,
+        &["--op", op, "--args", args],
+        &serde_json::to_string(session).expect("re-serializing the session"),
+    );
+    assert!(ok, "op {op} failed: {err}\n(earlier stderr: {stderr})");
+    let reply = one_json_object(&out, op, &err);
+    assert!(reply.get("error").is_none(), "op {op} was refused: {out}");
+    reply
+        .get("session")
+        .unwrap_or_else(|| panic!("op {op}'s reply carries the session back: {out}"))
+        .clone()
+}
+
 #[test]
 fn save_writes_a_reply_the_shell_can_parse() {
     let (config, home) = scratch("save");
@@ -105,6 +134,30 @@ fn save_writes_a_reply_the_shell_can_parse() {
         .clone();
 
     // Now save that session. This is the path the desktop's Save button takes.
+    //
+    // The skeleton `--load` handed back is deliberately empty, and `save`
+    // validates before writing — so it has to be filled in the way the window
+    // fills it in, one op at a time, or the refusal is what we would be pinning
+    // rather than the single-line reply. `edit` is the child's stdin/stdout
+    // round trip, so the session that arrives at the save is the one the ops
+    // actually produced.
+    let session = edit(
+        &config,
+        &home,
+        &session,
+        "add-provider",
+        r#"{"id":"openrouter","spec":"openai","base_url":"https://openrouter.ai/api"}"#,
+        &stderr,
+    );
+    let session = edit(
+        &config,
+        &home,
+        &session,
+        "add-route",
+        r#"{"id":"qwen-coder","provider":"openrouter","model":"anthropic/claude-haiku-4.5"}"#,
+        &stderr,
+    );
+
     let (saved, stderr, ok) = run(
         &config,
         &home,
@@ -133,6 +186,108 @@ fn save_writes_a_reply_the_shell_can_parse() {
     assert!(
         written.contains("[providers."),
         "the saved config does not look like one:\n{written}"
+    );
+
+    std::fs::remove_dir_all(config.parent().expect("config parent")).ok();
+}
+
+/// The store tier of the view, end to end.
+///
+/// It cannot be asserted from `setup::cli`'s inline tests: `cli::view` opens the
+/// store itself — `secrets::open` derives its root from `$TURNPIKE_HOME` and its
+/// namespace from the config path — so a `MemoryStore` a unit test built would
+/// never be the store the lookup reads. Here the child owns both, which is also
+/// the only arrangement in which a *written* store is visible to a later `--view`.
+///
+/// The half tested over there is the other one: a provider with no key source at
+/// all reports `missing` (see `view_reports_a_missing_key_as_missing`).
+#[test]
+fn view_reports_a_key_the_store_holds() {
+    let (config, home) = scratch("view-store-key");
+
+    let (loaded, stderr, ok) = run(&config, &home, &["--load"], "");
+    assert!(ok, "--load failed: {stderr}");
+    let session = one_json_object(&loaded, "--load", &stderr)
+        .get("session")
+        .expect("--load's reply carries a session")
+        .clone();
+
+    // A provider whose *only* key source is the store: no `api_key_env` and no
+    // inline `api_key`, so the precedence chain has nowhere else to look and a
+    // `store` tier can only mean this stage/save pair put it there.
+    let session = edit(
+        &config,
+        &home,
+        &session,
+        "add-provider",
+        r#"{"id":"zen","spec":"anthropic","base_url":"https://opencode.ai/zen"}"#,
+        &stderr,
+    );
+
+    // Stage the secret, then save — the store write happens in `commit_doc`, so
+    // a `stage-key` without a save leaves nothing to read back.
+    let session = edit(
+        &config,
+        &home,
+        &session,
+        "stage-key",
+        r#"{"slot":"provider.zen","value":"sk-store-held"}"#,
+        &stderr,
+    );
+    let (saved, stderr, ok) = run(
+        &config,
+        &home,
+        &["--op", "save"],
+        &serde_json::to_string(&session).expect("re-serializing the session"),
+    );
+    assert!(ok, "save failed: {stderr}");
+    assert!(
+        one_json_object(&saved, "save", &stderr)
+            .get("error")
+            .is_none(),
+        "save refused: {saved}"
+    );
+    let session = one_json_object(&saved, "save", &stderr)
+        .get("session")
+        .expect("save's reply carries a session back")
+        .clone();
+
+    // Now view the session — the read is against the same `$TURNPIKE_HOME`, so
+    // the store the save wrote is the store the lookup opens.
+    let (viewed, stderr, ok) = run(
+        &config,
+        &home,
+        &["--view"],
+        &serde_json::to_string(&session).expect("re-serializing the session"),
+    );
+    assert!(ok, "--view failed: {stderr}");
+    let view = one_json_object(&viewed, "--view", &stderr);
+    let providers = view["view"]["providers"]
+        .as_array()
+        .expect("the view carries a provider list");
+    let zen = providers
+        .iter()
+        .find(|p| p["id"] == "zen")
+        .unwrap_or_else(|| panic!("zen is missing from the view: {viewed}"));
+
+    assert_eq!(
+        zen["key"]["tier"], "store",
+        "a store-held key should report the store tier: {viewed}"
+    );
+    assert_eq!(
+        zen["key"]["missing"], false,
+        "a store-held key reported as missing: {viewed}"
+    );
+    // The store *tier* is reported; the value is not. Scoped to the `view`
+    // subtree and not the whole reply: `--view` prints the session beside the
+    // view, and the session is the *staging area* — a staged key rides in
+    // `session.plan.writes` by design, because the window has to hold it to hand
+    // it back for the save. The redaction boundary is the view, so that is what
+    // this pins.
+    let rendered_view = serde_json::to_string(&view["view"]).expect("re-serializing the view");
+    assert!(
+        !rendered_view.contains("sk-store-held"),
+        "the stored key value leaked into the view: {rendered_view}"
     );
 
     std::fs::remove_dir_all(config.parent().expect("config parent")).ok();

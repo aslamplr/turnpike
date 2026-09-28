@@ -47,9 +47,6 @@ enum Commands {
         /// Override the listen address from config.
         #[arg(long)]
         listen: Option<String>,
-        /// Write the default config to the config path if it does not exist.
-        #[arg(long)]
-        init: bool,
     },
     /// Launch a supported client configured against this gateway.
     Launch {
@@ -140,11 +137,7 @@ async fn main() -> Result<()> {
     init_tracing(&cli.command);
 
     match cli.command {
-        Commands::Serve {
-            config,
-            listen,
-            init,
-        } => serve(config, listen, init).await,
+        Commands::Serve { config, listen } => serve(config, listen).await,
         Commands::Launch {
             target,
             config,
@@ -236,14 +229,27 @@ pub(crate) struct Loaded {
 }
 
 /// What to do when the config does not exist yet.
+///
+/// There is one answer now, and it is the same for every command: say what is
+/// missing and how to make it, and exit non-zero. Nothing writes a file here.
+///
+/// What used to be here was three modes over one write: `resolve_config` called
+/// `config::write_default_config` *before* it looked at the mode, so every
+/// command that needed a config created one, and the mode only decided what it
+/// said afterwards. That is where the example `zen` provider came from — a file
+/// nobody asked for, in a directory the user had not chosen, that looked
+/// configured and was not, and that `--init` then took credit for.
+///
+/// `setup` and the desktop window are the two ways to make a first config, and
+/// both gather real details. `serve` on a machine with no config is not a
+/// third: it cannot ask, so it points at the ones that can.
 enum ConfigMode {
-    /// `serve --init`: write a starter and exit 0. This is the scripted/CI
-    /// contract and has always printed exactly one line.
-    InitOnly,
-    /// `serve`: the same, but worded to point at `setup`.
-    ServeInteractive,
-    /// `launch` and `routes`: a starter config that nobody filled in is not a
-    /// useful thing to exit 0 on, so say so and fail.
+    /// `serve`: worded as a next step, since starting the gateway is the thing
+    /// the user wanted and this is the only thing in the way.
+    Serve,
+    /// `launch`, `routes` and `config`: these read a config that someone else
+    /// was supposed to have made, so the same message is an error about the
+    /// input rather than a step in a procedure.
     Required,
 }
 
@@ -254,27 +260,18 @@ fn resolve_config(path: Option<PathBuf>, mode: ConfigMode) -> Result<Loaded> {
     };
 
     if !path.exists() {
-        config::write_default_config(&path)?;
-        match mode {
-            ConfigMode::InitOnly => {
-                println!("Wrote starter config to {}", path.display());
-                std::process::exit(0);
-            }
-            ConfigMode::ServeInteractive => {
-                println!(
-                    "Wrote starter config to {} — set your API key env vars, then re-run.",
-                    path.display()
-                );
-                std::process::exit(0);
-            }
-            // The bug this mode exists to fix: `launch` on a fresh machine used
-            // to write a starter config and exit 0 without launching anything.
-            ConfigMode::Required => anyhow::bail!(
-                "wrote a starter config to {} — set your API key env vars, then \
-                 re-run (`turnpike setup` walks through this)",
-                path.display()
-            ),
-        }
+        let what = match mode {
+            ConfigMode::Serve => "starting the gateway",
+            ConfigMode::Required => "that",
+        };
+        anyhow::bail!(
+            "no config at {} — {what} needs one, and turnpike will not invent \
+             one for you. `turnpike setup` walks through creating it (providers, \
+             routes, and where your keys live); the desktop app's Settings \
+             window edits the same file. `turnpike doctor` lists what is missing \
+             at any point.",
+            path.display()
+        );
     }
 
     let mut cfg = config::load(&path)?;
@@ -285,13 +282,8 @@ fn resolve_config(path: Option<PathBuf>, mode: ConfigMode) -> Result<Loaded> {
     Ok(Loaded { path, cfg, store })
 }
 
-async fn serve(config_path: Option<PathBuf>, listen: Option<String>, init: bool) -> Result<()> {
-    let mode = if init {
-        ConfigMode::InitOnly
-    } else {
-        ConfigMode::ServeInteractive
-    };
-    let mut cfg = resolve_config(config_path, mode)?.cfg;
+async fn serve(config_path: Option<PathBuf>, listen: Option<String>) -> Result<()> {
+    let mut cfg = resolve_config(config_path, ConfigMode::Serve)?.cfg;
     if let Some(l) = listen {
         cfg.server.listen = l;
     }

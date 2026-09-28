@@ -21,7 +21,7 @@ The design documentation lives in `docs/` (see the module map entry for `src/pro
 # Configure: providers, routes, keys (keys can be stored encrypted)
 turnpike setup
 
-# Run the gateway (writes a default config on first run with --init)
+# Run the gateway (refuses to start until a config exists — see `turnpike setup`)
 turnpike serve
 
 # Launch Claude Code pinned to a route id (all model tiers → that route)

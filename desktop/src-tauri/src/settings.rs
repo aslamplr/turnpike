@@ -76,7 +76,13 @@ pub enum SettingsPayload {
     View {
         view: Box<ConfigView>,
     },
-    /// No config file. The app must not create one — see `load`.
+    /// No config file on disk. Reached only by [`load`], which reads the file
+    /// directly. It is **not** an error state in the window: the Settings screen
+    /// bootstraps from `config-edit --load`/`--view` (see `config_edit`), which
+    /// seeds the starter document in memory, so a first run renders the editor
+    /// and offers to create the file rather than reporting a missing path.
+    ///
+    /// The app still must not write one on its own — see [`load`].
     MissingConfig {
         path: String,
     },
@@ -89,11 +95,11 @@ pub enum SettingsPayload {
 pub async fn load() -> SettingsPayload {
     let config = resolve::resolve_config_path();
 
-    // The pre-check comes first, and it is load-bearing: `resolve_config` in the
-    // turnpike crate writes a starter config *before* its mode match, so
-    // `turnpike config` on a missing file writes one and then bails. The approved
-    // behavior is to say so and write nothing, so turnpike is never invoked here
-    // until the file exists.
+    // The pre-check comes first so a missing config is reported *as* missing,
+    // rather than as whatever error `turnpike config` would produce for it.
+    // `resolve_config` refuses a missing file now — it once wrote a starter
+    // before its mode match, which is what this check originally guarded
+    // against — so nothing here can leave a file behind either way.
     if !config.exists() {
         return SettingsPayload::MissingConfig {
             path: config.display().to_string(),
