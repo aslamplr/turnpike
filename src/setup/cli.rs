@@ -659,11 +659,34 @@ fn reset_stranded_strategy(doc: &mut Doc, id: &str) {
     }
 }
 
-/// `[search]`'s scalars.
+/// `[search]`'s scalars, each applied independently.
 ///
-/// `search_defaults()` is the same starting point the wizard uses, so a `[search]`
-/// block created here is the one `SearchManager::from_config` accepts.
+/// Creating the block is a side effect of naming a field: the first
+/// `set_search_scalar` is what calls `ensure_table`, so this op is also *how* a
+/// config with no `[search]` block gets one. The caller therefore names the
+/// engine it wants — the window's Add button sends `searxng` — because the
+/// schema default is `exa`, and an `exa` block with no key makes
+/// `SearchManager::from_config` return `None`. Through `view::search_view` that
+/// reads back to the user as "Off", i.e. as though nothing had been added.
+///
+/// Refuses an argument object with nothing in it. Every arm below is `if let
+/// Some`, so an empty object would fall through all of them, change nothing and
+/// report success — the silent no-op this module's ops exist to refuse, and the
+/// reason the window's Add path could do nothing at all while looking like it
+/// worked.
 fn set_search(doc: &mut Doc, a: &SetSearch) -> Option<String> {
+    if a.provider.is_none()
+        && a.max_loops.is_none()
+        && a.base_url.is_none()
+        && a.api_key_env.is_none()
+        && !a.clear_inline_key
+    {
+        return Some(
+            "set-search needs at least one of provider, max_loops, base_url, \
+             api_key_env or clear_inline_key"
+                .to_string(),
+        );
+    }
     if a.clear_inline_key {
         doc.remove_search_inline_key_keeping_comment();
     }
@@ -1355,6 +1378,59 @@ mod tests {
             .unwrap_err()
         );
         assert!(err.contains("bogus"), "unexpected: {err}");
+    }
+
+    /// The window's Add path, as a property of the op rather than of the panel:
+    /// with no `[search]` block, `set-search {}` used to fall through every
+    /// `if let Some` arm, change nothing and report success — so Add looked like
+    /// it worked and the panel stayed "Off". The op refuses instead, and the
+    /// refusal leaves the document byte-identical.
+    #[test]
+    fn set_search_with_no_fields_is_refused_not_a_silent_no_op() {
+        let session = skeleton_session("search-empty");
+        assert!(!session.doc.contains("[search]"));
+
+        let reply = apply("set-search", &session, "{}").unwrap();
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("at least one"),
+            "expected the empty-argument refusal, got {:?}",
+            reply.error
+        );
+        assert_eq!(
+            reply.session.unwrap().doc,
+            session.doc,
+            "a refusal changed the document"
+        );
+    }
+
+    /// The other half: naming an engine *does* create the block, which is what
+    /// the window's Add sends. `searxng`, because it is the keyless one — the
+    /// schema default `exa` with no key makes `from_config` return `None`, which
+    /// `view::search_view` renders as "Off", i.e. as though nothing had been
+    /// added. Asserted on `from_config`, not on the text: a block that exists but
+    /// does not run is exactly the failure being fixed.
+    #[test]
+    fn set_search_naming_an_engine_creates_a_working_table() {
+        let mut session = skeleton_session("search-create");
+        // A valid config that simply has no `[search]` block: the skeleton itself
+        // fails `validate` (a provider-less config), and this reloads through it.
+        session.doc = "[server]\nlisten = \"127.0.0.1:8710\"\n\n\
+                       [providers.zen]\nspec = \"anthropic\"\nbase_url = \"https://x\"\n"
+            .to_string();
+
+        let session = chain(&session, &[("set-search", r#"{"provider":"searxng"}"#)]);
+        assert!(session.doc.contains("[search]"), "{}", session.doc);
+
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        assert_eq!(cfg.search.provider, "searxng");
+        assert!(
+            crate::search::SearchManager::from_config(&cfg.search).is_some(),
+            "the block the Add button writes must actually turn search on"
+        );
     }
 
     /// Removing `[search]` drops the table, and the doc still validates — the

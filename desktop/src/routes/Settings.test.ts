@@ -259,6 +259,52 @@ describe("Settings — an edit that succeeds", () => {
   });
 });
 
+/// The other half of the Search panel's story, and the one an op name alone does
+/// not pin: adding `[search]` only helps if the block it creates actually runs,
+/// and that depends entirely on the engine the window names.
+describe("Settings — adding [search]", () => {
+  it("names the keyless engine, so the new block turns search on", async () => {
+    await mount();
+    // What the CLI answers for `{provider:"searxng"}`: a `[search]` block
+    // `SearchManager::from_config` accepts, so `view::search_view` reports it.
+    // `not required` is the tier searxng's key slot really reads.
+    fake("config_edit_apply", () =>
+      session({
+        view: {
+          kind: "view",
+          view: configView({
+            search: searchView({
+              provider: "searxng",
+              key: { tier: "not required", missing: false },
+            }),
+          }),
+        },
+      }),
+    );
+
+    await openTab("Search");
+    await userEvent.click(screen.getByRole("button", { name: "Add [search]" }));
+
+    // The bug this pins: the shim sent `{}`, and every arm of the CLI's
+    // `set_search` is `if let Some` — so nothing was written, nothing was
+    // reported, and the panel stayed "Off" with the Add button still under it.
+    // `searxng` is what makes the block *work*: the schema default `exa` with no
+    // key is refused by `SearchManager::from_config`, so `view::search_view`
+    // would return `None` and render "Off" exactly as before.
+    expect(lastCall("config_edit_apply")).toMatchObject({
+      op: "set-search",
+      args: { provider: "searxng" },
+    });
+
+    // And the state turns over: the off state and its button give way to the
+    // editor, which is what lets the user move the select to exa and name a key.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Add [search]" })).not.toBeInTheDocument(),
+    );
+    expect(screen.getByLabelText("provider")).toBeInTheDocument();
+  });
+});
+
 /// The whole point of the attribution: `dirty` alone can only say "somewhere",
 /// and a user who scrolled past the edit has no way back to it. Every test here
 /// drives a real click, so the panel name travels the shim → `apply` → `mark`

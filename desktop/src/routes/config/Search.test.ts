@@ -71,7 +71,7 @@ describe("Search — the off state", () => {
     expect(screen.getByRole("button", { name: "Add [search]" })).toBeInTheDocument();
   });
 
-  it("sends set-search with no fields at all", async () => {
+  it("signals the add without naming an engine itself", async () => {
     const seen: unknown[] = [];
     mount({ search: null }, {
       onAddSearch: async (...args: unknown[]) => {
@@ -81,11 +81,11 @@ describe("Search — the off state", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Add [search]" }));
 
-    // `onAddSearch` is a no-arg thunk — the block carries its own `provider` key
-    // and the select starts it at the schema default, so there is nothing for
-    // the window to pass. The empty array pins that: a later change that started
-    // sending `{provider: …}` here would show up as one argument, and the op
-    // would then be reached with a field it does not read.
+    // A no-arg thunk, deliberately: *which* engine the new block is created with
+    // is the window's call, not this panel's — the panel has no view to derive it
+    // from (it is rendering the off state) and picking one here would put a
+    // schema default in the component. The empty array pins that the component
+    // passes nothing; `Settings.test.ts` pins what the shim then sends.
     expect(seen).toEqual([[]]);
   });
 

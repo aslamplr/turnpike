@@ -272,6 +272,17 @@ of dropped. The sweep stops there deliberately: the other arg structs still igno
 what they do not know, and widening it is a behavior change (a caller sending a
 stray field would move from silently-ignored to refused) that wants its own pass.
 
+**`set-search` refuses an empty object, and is also how a `[search]` block gets
+made.** Every field is optional, but an object carrying none of them — and no
+`clear_inline_key` — would fall through every arm and report success having changed
+nothing, so the op answers with a refusal instead. Creating the block is a side
+effect of naming a field: the first `set_search_scalar` calls `ensure_table`. The
+caller therefore names the engine, and the desktop shell's Add button names
+`searxng`, the engine that needs no key. The schema default is `exa`, and an `exa`
+block with no key makes `SearchManager::from_config` return `None`, which through
+`view::search_view` reads back as "Off" — the same screen the user was already on,
+so the Add would look like it had done nothing.
+
 **`remove-search` takes no arguments.** It reads the provider off the *document*
 to stage `search.<provider>` for deletion — the key has no home without the block —
 so it needs nothing from the caller. It must be sent `{}` and never `""`:

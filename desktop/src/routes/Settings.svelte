@@ -416,14 +416,19 @@
   const setSearch = (args: Record<string, unknown>) =>
     apply("set-search", args, "Search");
 
-  /// Adding `[search]` needs no provider id: the block carries its own
-  /// `provider` key, and the select starts it at the schema default. So the op
-  /// is `set-search` with no fields — which `parse_args` accepts as `{}`.
+  /// Adding `[search]` names an engine, and it names **searxng**.
+  ///
+  /// The schema default is exa, but exa has no key yet on a config that never
+  /// had a `[search]` block, and `view::search_view` reuses
+  /// `SearchManager::from_config` — so an exa block with no key reads back as
+  /// `None` and the panel would still render "Off". Naming the keyless engine
+  /// is what makes the new block *work*, which is what turns the off state into
+  /// the editor: the select there can then move to exa and a key be named.
   ///
   /// A thunk, not the bare op: `Search.svelte`'s button calls it with no
   /// arguments, and `apply`'s second parameter is the args object — passing the
   /// click event through would put a `MouseEvent` where the CLI expects JSON.
-  const addSearch = () => apply("set-search", {}, "Search");
+  const addSearch = () => apply("set-search", { provider: "searxng" }, "Search");
 
   /// Removing `[search]` takes **no args**, so it must send `{}` and never
   /// `""` — `parse_args` refuses an empty string outright. The op reads the
