@@ -72,6 +72,15 @@ export const configEditSave = (session: string) =>
 export const configEditDiscard = (session: string) =>
   invoke<void>("config_edit_discard", { session });
 
+/// Whether the session's **staged** document would pass the write gate, and why
+/// not — the question Save will ask, asked before the button is pressed.
+///
+/// `null` is "it would pass"; a string is the refusal, in the wizard's own
+/// words. Deliberately not `doctorView`, which reads the file on disk and so
+/// cannot see an edit that has not been saved yet.
+export const configEditValidate = (session: string) =>
+  invoke<string | null>("config_edit_validate", { session });
+
 /// `turnpike doctor` for the config at `path`, as data rather than a renderer.
 /// Returns an empty list rather than failing: a panel with no findings and a
 /// panel whose check could not run look the same to the reader either way.

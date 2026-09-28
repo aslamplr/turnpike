@@ -547,3 +547,90 @@ describe("Settings — discard", () => {
     await waitFor(() => expect(clean()).toBeInTheDocument());
   });
 });
+
+describe("Settings — validate", () => {
+  const validateButton = () => screen.getByRole("button", { name: "Validate" });
+
+  it("asks about the staged session and reports the gate's own words", async () => {
+    await mount();
+    fake("config_edit_validate", () => "config defines no [providers.*]");
+
+    await userEvent.click(validateButton());
+
+    await screen.findByText("config defines no [providers.*]");
+    // The staged session's id, not the path on disk — the whole point of the
+    // command is that it can see an edit that has not been saved yet.
+    expect(lastCall("config_edit_validate")).toEqual({ session: "s1" });
+  });
+
+  it("says so when the gate would pass", async () => {
+    await mount();
+    fake("config_edit_validate", () => null);
+    await userEvent.click(validateButton());
+    // `null` is the CLI's "it would pass", and the window has to say that in
+    // words: leaving the panel blank would be indistinguishable from a check
+    // nobody ran.
+    await screen.findByText("This config would save.");
+  });
+
+  it("drops the verdict once an edit lands", async () => {
+    await mount();
+    fake("config_edit_validate", () => null);
+    await userEvent.click(validateButton());
+    await screen.findByText("This config would save.");
+
+    // Every edit installs a new staged document. A verdict surviving it would be
+    // an answer about the document that was just replaced, still reading as the
+    // current one — and a reassuring one.
+    fake("config_edit_apply", () => session());
+    await openTab("Routes");
+    await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
+
+    await waitFor(() =>
+      expect(screen.queryByText("This config would save.")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("drops the verdict on discard, which re-seeds from the file", async () => {
+    await mount();
+    fake("config_edit_apply", () => session());
+    await openTab("Routes");
+    await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
+    await waitFor(() => expect(discardButton()).toBeEnabled());
+
+    fake("config_edit_validate", () => "config defines no [providers.*]");
+    await userEvent.click(validateButton());
+    await screen.findByText("config defines no [providers.*]");
+
+    fake("config_edit_discard", () => undefined);
+    await userEvent.click(discardButton());
+
+    await waitFor(() =>
+      expect(screen.queryByText("config defines no [providers.*]")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("reports a check that could not run as a failure, never as a refusal", async () => {
+    await mount();
+    // A session that is gone, or a CLI that would not run. Neither is a verdict,
+    // and both come back as a thrown string.
+    fake("config_edit_validate", () => {
+      throw "the check did not finish";
+    });
+
+    await userEvent.click(validateButton());
+
+    await screen.findByText("the check did not finish");
+    // The distinction the whole split exists for: "could not check" must not
+    // render as "invalid", and there must be no verdict line at all.
+    expect(screen.queryByText("This config would save.")).not.toBeInTheDocument();
+  });
+
+  it("is reachable before any edit", async () => {
+    await mount();
+    // Not gated on `dirty`: whether the file on disk would save is a fair
+    // question on a fresh session, and on a first run it is the only check with
+    // an answer — Doctor is reading a file that does not exist yet.
+    expect(validateButton()).toBeEnabled();
+  });
+});

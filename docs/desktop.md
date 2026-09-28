@@ -414,9 +414,9 @@ on/off, the resolved config path — so the landing tab is a read of the whole
 document rather than a form.
 
 **The save bar and the sub-tab strip are lifted above the tab bodies**, not
-rendered per-tab. The bar is the one `save`/`discard` pair, always mounted, so an
-edit made on Routes is one click from being saved instead of a trip back to the
-landing page.
+rendered per-tab. The bar is the `save`/`discard` pair plus **Validate**, always
+mounted, so an edit made on Routes is one click from being saved instead of a trip
+back to the landing page.
 
 **Nothing is written until Save.** The window holds a *session*, not the file: the
 staged document lives as an opaque TOML string on the Rust side
@@ -424,6 +424,21 @@ staged document lives as an opaque TOML string on the Rust side
 one `commit_doc`; Discard forgets the session and re-seeds from the unchanged file.
 The bar between them says which state you are in, and Save is disabled while no edit
 is pending.
+
+**Validate asks the write gate the question Save will ask**, of the *staged*
+document: `config-edit --validate`, the same check `commit_doc` runs, so the window
+and the CLI cannot give two answers. It is deliberately not `doctor_view`, which
+reads the **file on disk** — absent on a first run, and after an edit not what the
+user is looking at — so it would report a healthy config while the staged one is
+unsavable, which is the one moment the answer matters. The verdict lands beside the
+session, in the CLI's own words. A refusal is an *answer*, not a failure — the CLI
+exits 0 having said why — so it does not go through `problem`; an unrunnable check
+does, because "could not check" must never render as "invalid". `take()` and
+`reloaded()` both clear the verdict, so every path that installs a document drops
+the answer about the last one: a "would save" cannot outlive the edit it described
+and read as current. The button is enabled regardless of `dirty` — asking whether
+the file would save is a fair question on a fresh, unedited session, and gating it
+on an edit would hide the one check that reports on a first-run config.
 
 **The bar names the panels holding the edit**, and each named panel's heading carries
 an `unsaved` badge. `dirty` alone could only say "somewhere", so a user who scrolled
@@ -520,6 +535,20 @@ The view reports a key's **tier** (`env OPENCODE_API_KEY`, `store`,
 `inline (plaintext)`, `missing`, `not required`) and never a value. Provider
 `extra_headers` are reported by **name only**, because `zen-go`'s
 `x-opencode-session` carries a session token.
+
+That boundary covers the **write** side too, and it is what shapes the extra-header
+editor. `set-provider-header` takes a value the window may send and must never read
+back, so the editor is one-directional by construction: the panel renders the
+*names* the view gives it, and the value field it writes from is cleared on submit
+and seeded from nothing. There is no shape of the panel that displays a stored
+header value — the same door the staged key keeps shut, arrived at the same way.
+
+The two props are `onSetHeader(id, name, value)` and `onRemoveHeader(id, name)`
+rather than one taking `value: string | null`, even though `null` is the CLI's own
+spelling for removal. Folding them together would make "set a header to the empty
+string" and "delete this header" the same call, and it would spread the `null`
+convention across a control whose other half writes strings. Named per intent, the
+one place the convention lives is `Settings.svelte`'s `removeProviderHeader` shim.
 
 ### Missing config
 
@@ -806,7 +835,9 @@ its remove buttons send, and a `noAutofill` assertion per text field; each panel
 `unsaved` marker rendering from its own flag and not its sibling's; `Settings.svelte`'s
 session lifecycle — the `dirty`-and-`touched`-only-on-success rule (a refusal arrives
 as a thrown string and must not light up Save), the `config_edit_apply` op/args wire
-shape, the save and discard paths, and which panel each op is attributed to (including
+shape, the save and discard paths, the Validate verdict (reported from the command,
+cleared by every path that installs a document, and never rendered for a check that
+could not run), and which panel each op is attributed to (including
 the ordering rule: the bar reads `Providers, Routes` off the panel list, never off the
 order the edits arrived in) — plus the sub-tab shell: five tabs in order, Overview
 landing first, exactly one panel mounted at a time, the Save bar reachable from every

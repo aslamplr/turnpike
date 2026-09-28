@@ -197,6 +197,7 @@ pub fn run() {
             config_edit::config_edit_unstage_key,
             config_edit::config_edit_save,
             config_edit::config_edit_discard,
+            config_edit::config_edit_validate,
             config_edit::doctor_view,
         ])
         .setup(|app| {

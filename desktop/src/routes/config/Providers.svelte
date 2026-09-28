@@ -28,6 +28,8 @@
     onAdd,
     onRemove,
     onSetBaseUrl,
+    onSetHeader,
+    onRemoveHeader,
     onKeyEnv,
     onStageKey,
     onUnstageKey,
@@ -53,6 +55,20 @@
     /// `add-provider` validates it). Naming the one field keeps that door shut at
     /// the type level rather than by convention.
     onSetBaseUrl: (id: string, value: string) => Promise<void>;
+    /// One `[providers.<id>.extra_headers]` entry — the write that makes
+    /// `zen-go` reachable at all, since it rejects a request without
+    /// `x-opencode-session`.
+    ///
+    /// Two props rather than one taking `value: string | null`, so the panel's
+    /// two controls each name their own intent: `null`-means-remove is the CLI's
+    /// convention, and spelling it here would make "set an empty value" and
+    /// "delete this header" the same call.
+    ///
+    /// The value is **write-only**. A header value can be a session token, so
+    /// the view reports names only (`view.rs`) and there is no shape of this
+    /// panel that reads one back — the same door the key editor keeps shut.
+    onSetHeader: (id: string, name: string, value: string) => Promise<void>;
+    onRemoveHeader: (id: string, name: string) => Promise<void>;
     onKeyEnv: (id: string, envVar: string) => Promise<void>;
     onStageKey: (slot: string, value: string) => Promise<void>;
     onUnstageKey: (slot: string) => Promise<void>;
@@ -73,6 +89,15 @@
   let editingBase = $state<string | null>(null);
   let baseDraft = $state("");
 
+  /// Which provider's extra-header editor is open, plus the draft for the entry
+  /// about to be written.
+  ///
+  /// A third piece of state rather than a mode on either editor above, because
+  /// this one holds a name *and* a value, and the value is the write-only half.
+  let editingHeaders = $state<string | null>(null);
+  let headerName = $state("");
+  let headerValue = $state("");
+
   let adding = $state(false);
   let newId = $state("");
   let newSpec = $state("anthropic");
@@ -84,10 +109,34 @@
   /// holds `provider.zen` only by coincidence of spelling.
   const isStaged = (slot: string) => stagedKeys.includes(slot);
 
+  /// The three row editors are mutually exclusive: each opener closes the other
+  /// two. Not cosmetic — two of them can be open at once otherwise (the state is
+  /// independent), which stacks two bordered panels inside one row and would put
+  /// two differently-meant fields named for a value on screen together.
   function openKey(id: string) {
     editingKey = id;
+    editingBase = null;
+    editingHeaders = null;
     keyMode = "env";
     keyDraft = "";
+  }
+
+  function openHeaders(id: string) {
+    editingHeaders = id;
+    editingBase = null;
+    editingKey = null;
+    headerName = "";
+    headerValue = "";
+  }
+
+  /// Writes one header. The drafts are cleared on the way out so a token does not
+  /// sit in the DOM after it has been sent — the panel's own list re-renders from
+  /// the view the CLI returns, so progress is visible without them.
+  async function submitHeader(id: string) {
+    if (!headerName.trim() || !headerValue.trim()) return;
+    await onSetHeader(id, headerName.trim(), headerValue.trim());
+    headerName = "";
+    headerValue = "";
   }
 
   async function submitKey(id: string) {
@@ -106,6 +155,8 @@
   /// unchanged, since a URL is not a credential.
   function openBase(id: string) {
     editingBase = id;
+    editingKey = null;
+    editingHeaders = null;
     baseDraft = providers.find((p) => p.id === id)?.base_url ?? "";
   }
 
@@ -166,6 +217,13 @@
           >
             Edit address
           </button>
+          <button
+            class="ghost"
+            onclick={() => (editingHeaders === p.id ? (editingHeaders = null) : openHeaders(p.id))}
+            disabled={busy}
+          >
+            Edit headers
+          </button>
           <button class="ghost" onclick={() => (editingKey === p.id ? (editingKey = null) : openKey(p.id))} disabled={busy}>
             Change key
           </button>
@@ -200,6 +258,73 @@
             <div class="actions">
               <button onclick={() => submitBase(p.id)} disabled={busy || !baseDraft.trim()}>Save</button>
               <button class="ghost" onclick={() => (editingBase = null)} disabled={busy}>Cancel</button>
+            </div>
+          </div>
+        {/if}
+
+        {#if editingHeaders === p.id}
+          <div class="edit">
+            {#if p.extra_header_names.length === 0}
+              <div class="sub">No extra headers.</div>
+            {:else}
+              <ul class="hlist">
+                {#each p.extra_header_names as name (name)}
+                  <li>
+                    <span class="mono grow">{name}</span>
+                    <!-- The accessible name carries the header it removes: the
+                         list can hold several rows whose visible text is
+                         "Remove", and the provider's own Remove button is a
+                         third. -->
+                    <button
+                      class="ghost bad"
+                      aria-label="Remove header {name}"
+                      onclick={() => onRemoveHeader(p.id, name)}
+                      disabled={busy}
+                    >
+                      Remove
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+            <div class="edit-fields">
+              <label for="hname-{p.id}">header name</label>
+              <input
+                id="hname-{p.id}"
+                bind:value={headerName}
+                placeholder="x-opencode-session"
+                disabled={busy}
+                {...noAutofill}
+              />
+              <!-- Labelled "header value", not "value": the key editor's own
+                   field carries that name, and two fields sharing one label
+                   make `getByLabelText` ambiguous for a screen reader and for
+                   the tests alike. -->
+              <label for="hval-{p.id}">header value</label>
+              <input
+                id="hval-{p.id}"
+                type="password"
+                bind:value={headerValue}
+                disabled={busy}
+                {...noAutofill}
+              />
+            </div>
+            <div class="sub">
+              Sent on every request to this provider. Masked and never shown
+              again — one of these is <code>zen-go</code>'s
+              <code>x-opencode-session</code>, a session token. Naming an
+              existing header overwrites it.
+            </div>
+            <div class="actions">
+              <button
+                onclick={() => submitHeader(p.id)}
+                disabled={busy || !headerName.trim() || !headerValue.trim()}
+              >
+                Set header
+              </button>
+              <button class="ghost" onclick={() => (editingHeaders = null)} disabled={busy}>
+                Cancel
+              </button>
             </div>
           </div>
         {/if}
@@ -317,5 +442,18 @@
     grid-template-columns: max-content minmax(0, 1fr);
     gap: 8px 12px;
     align-items: center;
+  }
+  .hlist {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .hlist li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
 </style>

@@ -59,6 +59,17 @@
   let stagedKeys = $state<string[]>([]);
   /// The last refusal or failure, in the CLI's own words.
   let problem = $state<string | null>(null);
+  /// The answer to the last explicit Validate — `null` for "not asked yet, or
+  /// it would pass", a string for the write gate's own refusal.
+  ///
+  /// Distinct from `problem`, which is a *failure*: an edit the CLI refused, or
+  /// a command that would not run. This is neither — it is the answer to a
+  /// question the user asked on purpose, and it is about the staged document as
+  /// a whole, the same question Save asks. `checked` is what keeps `null`
+  /// meaning both "would pass" and "never asked" from rendering the same thing:
+  /// the verdict line only appears once the user has actually asked.
+  let verdict = $state<string | null>(null);
+  let checked = $state(false);
 
   /// The config path, for the Doctor panel's "on disk" line and the fresh-setup
   /// copy. Known before a session exists, which is exactly when it is needed.
@@ -146,6 +157,11 @@
   function reloaded() {
     dirty = false;
     touched = [];
+    // A verdict describes a staged document. After a reload the document is the
+    // file again, so a verdict asked about the edits that were just thrown away
+    // would be the one wrong answer — and a reassuring one.
+    verdict = null;
+    checked = false;
   }
 
   /// Which panel a staged slot belongs to. The slot names it: `provider.zen` is
@@ -179,6 +195,13 @@
     freshSetup = next.fresh ?? false;
     stagedKeys = next.staged_keys ?? [];
     if (next.error) problem = next.error;
+    // A verdict describes the document that was staged when it was asked for.
+    // Every edit installs a new one through here, so a check surviving an edit
+    // would be an answer about a document that no longer exists — and it would
+    // read as the current one. Clearing it here covers load, save, discard and
+    // every op at once, because they all land in this one function.
+    verdict = null;
+    checked = false;
   }
 
   async function load() {
@@ -290,6 +313,34 @@
     }
   }
 
+  /// Ask the write gate the question Save will ask, of the document as it is
+  /// staged right now.
+  ///
+  /// Deliberately not `doctorView`: Doctor reads the **file on disk**, so on a
+  /// first run it would report on a file that does not exist, and after an edit
+  /// it would report on the version the user is about to replace. This is the
+  /// only check that can see what Save would actually write.
+  ///
+  /// A refusal is an *answer*, not a failure — the CLI exits 0 having said why —
+  /// so it lands in `verdict`, beside the session it describes, rather than in
+  /// `problem` above it. A session that is gone or a CLI that would not run is
+  /// neither, and does go to `problem`: no verdict is not a verdict of invalid.
+  async function validate() {
+    if (!session) return;
+    busy = true;
+    problem = null;
+    try {
+      verdict = await api.configEditValidate(session);
+      checked = true;
+    } catch (e) {
+      problem = String(e);
+      verdict = null;
+      checked = false;
+    } finally {
+      busy = false;
+    }
+  }
+
   /// Discard is a reload: forget the staged session and seed a fresh one from
   /// the file, which is untouched.
   async function discard() {
@@ -330,6 +381,22 @@
   /// `spec_from` — so a generic prop would put an unvalidated write in reach).
   const setProviderBaseUrl = (id: string, value: string) =>
     apply("set-provider", { id, key: "base_url", value }, "Providers");
+
+  /// One `[providers.<id>.extra_headers]` entry.
+  ///
+  /// The write the whole of Issue 3 is about: `zen-go` rejects a request that
+  /// carries no `x-opencode-session`, and until this op existed neither the
+  /// wizard nor the window could write one. The value is write-only — it goes
+  /// out and is never read back, the same door the staged key keeps shut.
+  const setProviderHeader = (id: string, name: string, value: string) =>
+    apply("set-provider-header", { id, name, value }, "Providers");
+
+  /// `null` is the CLI's "remove this key" spelling, the same one `set-route`
+  /// uses for an optional. Sent from a *separate* prop rather than folded into
+  /// `setProviderHeader`, so "set an empty value" and "delete this header" can
+  /// never collapse into the same call.
+  const removeProviderHeader = (id: string, name: string) =>
+    apply("set-provider-header", { id, name, value: null }, "Providers");
 
   const setRouteScalar = (id: string, key: string, value: string | null) =>
     apply("set-route", { id, key, value }, "Routes");
@@ -411,6 +478,20 @@
     <div class="panel"><div class="note">{problem}</div></div>
   {/if}
 
+  <!-- The answer to an explicit Validate, beside the session it describes.
+       `checked` is what separates "would pass" from "not asked": both are
+       `verdict === null`, and a green line that appears before the user has
+       asked anything would be a claim about a document nobody checked. -->
+  {#if checked}
+    <div class="panel">
+      {#if verdict}
+        <div class="refusal">{verdict}</div>
+      {:else}
+        <div class="sub">This config would save.</div>
+      {/if}
+    </div>
+  {/if}
+
   <!-- The gate above is on `payload.kind` rather than on `v` because the
        fresh-setup heading renders with no view at all; this is where the
        narrowing that gate gave up is put back, once, for the panel props. -->
@@ -425,6 +506,11 @@
       <div class="actions">
         <button onclick={save} disabled={busy || !dirty}>Save</button>
         <button class="ghost" onclick={discard} disabled={busy || !dirty}>Discard changes</button>
+        <!-- Enabled regardless of `dirty`: asking whether the file on disk
+             would save is a fair question on a fresh, unedited session, and
+             gating it on an edit would hide the one check that reports on a
+             first-run config. -->
+        <button class="ghost" onclick={validate} disabled={busy}>Validate</button>
       </div>
     </div>
   </div>
@@ -472,6 +558,8 @@
         onAdd={addProvider}
         onRemove={removeProvider}
         onSetBaseUrl={setProviderBaseUrl}
+        onSetHeader={setProviderHeader}
+        onRemoveHeader={removeProviderHeader}
         onKeyEnv={setKeyEnv}
         onStageKey={stageKey}
         onUnstageKey={unstageKey}

@@ -52,6 +52,8 @@ function mount(
       onAdd: async () => {},
       onRemove: async () => {},
       onSetBaseUrl: async () => {},
+      onSetHeader: async () => {},
+      onRemoveHeader: async () => {},
       onKeyEnv: async () => {},
       onStageKey: async () => {},
       onUnstageKey: async () => {},
@@ -321,6 +323,7 @@ describe("Providers — the panel's edges", () => {
     mount({ providers: [provider()], busy: true });
     for (const name of [
       "Edit address",
+      "Edit headers",
       "Change key",
       "Remove",
       "Add provider",
@@ -448,6 +451,164 @@ describe("Providers — the address editor", () => {
   });
 });
 
+/// The extra-header editor is the write path `zen-go` cannot work without: it
+/// refuses a request carrying no `x-opencode-session`, and until this existed
+/// neither the wizard nor this window had a way to write one.
+///
+/// Four properties are easy to get backwards and are what this pins:
+///
+/// 1. A **set** and a **remove** are two different props, so "set an empty
+///    value" can never collapse into "delete this header". The CLI spells
+///    removal as `value: null`; that spelling is confined to one shim, not
+///    spread across an editor whose other half writes strings.
+/// 2. Remove names the header it removes. The list can hold several rows whose
+///    visible text is `Remove`, and the provider's own Remove button is a third
+///    — an unqualified `Remove` query would be ambiguous for a screen reader
+///    and for the tests.
+/// 3. The value field is **masked**. One of these is a session token, and the
+///    whole redaction story on the read side is pointless if the write side
+///    prints it.
+/// 4. The name and value are both required: an empty name addresses nothing, and
+///    an empty value is what `remove` means — a `set` carrying one would write a
+///    header that shadows nothing while looking like a successful edit.
+describe("Providers — the extra-header editor", () => {
+  async function openHeaders() {
+    await userEvent.click(
+      screen.getByRole("button", { name: "Edit headers" }),
+    );
+  }
+
+  it("sends the name and the value, and nothing else", async () => {
+    const seen: Array<[string, string, string]> = [];
+    mount(
+      {
+        providers: [
+          provider({ id: "zen-go", extra_header_names: ["x-trace"] }),
+        ],
+      },
+      {
+        onSetHeader: async (id: string, name: string, value: string) => {
+          seen.push([id, name, value]);
+        },
+      },
+    );
+
+    await openHeaders();
+    await userEvent.type(
+      screen.getByLabelText("header name"),
+      "x-opencode-session",
+    );
+    await userEvent.type(screen.getByLabelText("header value"), "tok-abc");
+    await userEvent.click(screen.getByRole("button", { name: "Set header" }));
+
+    expect(seen).toEqual([
+      ["zen-go", "x-opencode-session", "tok-abc"],
+    ]);
+  });
+
+  it("removes through the remove prop, naming the header", async () => {
+    // The two header names exist so the *qualified* accessible name is what
+    // picks the row — an unqualified query would match both and throw.
+    const removed: Array<[string, string]> = [];
+    mount(
+      {
+        providers: [
+          provider({
+            extra_header_names: ["x-opencode-session", "x-trace"],
+          }),
+        ],
+      },
+      {
+        onRemoveHeader: async (id: string, name: string) => {
+          removed.push([id, name]);
+        },
+      },
+    );
+
+    await openHeaders();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Remove header x-trace" }),
+    );
+
+    expect(removed).toEqual([["zen", "x-trace"]]);
+  });
+
+  it("never renders a stored header value", async () => {
+    // The view carries names only, so there is nothing to leak — but the editor
+    // must not invent a placeholder that reads like the stored value either.
+    mount({
+      providers: [provider({ extra_header_names: ["x-opencode-session"] })],
+    });
+    await openHeaders();
+
+    const value = screen.getByLabelText("header value") as HTMLInputElement;
+    expect(value.type).toBe("password");
+    expect(value.value).toBe("");
+  });
+
+  it("will not submit without both a name and a value", async () => {
+    const seen: unknown[] = [];
+    mount(
+      { providers: [provider()] },
+      {
+        onSetHeader: async (...args: unknown[]) => {
+          seen.push(args);
+        },
+      },
+    );
+
+    await openHeaders();
+    const submit = screen.getByRole("button", { name: "Set header" });
+    expect(submit).toBeDisabled();
+
+    await userEvent.type(screen.getByLabelText("header name"), "x-trace");
+    expect(submit).toBeDisabled();
+    await userEvent.type(screen.getByLabelText("header value"), "   ");
+    expect(submit).toBeDisabled();
+    expect(seen).toEqual([]);
+  });
+
+  it("says when there are no headers rather than showing an empty list", async () => {
+    mount({ providers: [provider({ extra_header_names: [] })] });
+    await openHeaders();
+    expect(screen.getByText("No extra headers.")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Remove header/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps at most one row editor open at a time", async () => {
+    // The three editors hold independent state, so without an explicit close
+    // they stack — two bordered panels inside one row, with two differently
+    // meant fields on screen together.
+    mount({ providers: [provider()] });
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit address" }));
+    await openHeaders();
+    expect(screen.queryByLabelText("base_url")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Change key" }));
+    expect(screen.queryByLabelText("header name")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("key home")).toBeInTheDocument();
+  });
+
+  it("opens the editor only for the row whose button was clicked", async () => {
+    mount({
+      providers: [
+        provider(),
+        provider({ id: "zen-go", base_url: "https://x.test" }),
+      ],
+    });
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Edit headers" })[1],
+    );
+
+    expect(
+      (screen.getByLabelText("header name") as HTMLInputElement).id,
+    ).toBe("hname-zen-go");
+  });
+});
+
 /// Every text-entry control in this panel has to be opted out of the browser's
 /// own help: left on, it offers a dropdown of saved form history over a provider
 /// id or an env-var name, and `autocorrect` rewrites a pasted value. Both are
@@ -490,5 +651,15 @@ describe("Providers — no field invites the browser's autofill", () => {
     // Autofill over a base URL would offer a saved address from somewhere else —
     // the same reason the add form's copy of this field is opted out.
     expectNoAutofill(screen.getByLabelText("base_url"));
+  });
+
+  it("opts both header fields out", async () => {
+    mount({ providers: [provider()] });
+    await userEvent.click(screen.getByRole("button", { name: "Edit headers" }));
+
+    // A header name is an identifier, and a header value is a token: neither is
+    // prose, and a saved-password dropdown over either is the wrong help.
+    expectNoAutofill(screen.getByLabelText("header name"));
+    expectNoAutofill(screen.getByLabelText("header value"));
   });
 });

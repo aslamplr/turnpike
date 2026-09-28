@@ -248,6 +248,7 @@ input and testable without a tty.
 | `remove-provider` | `id` | `remove_provider` |
 | `set-provider` | `id`, `key`, `value` | `set_provider_scalar` |
 | `set-provider-key-env` | `id`, `env_var` | `set_provider_key_env` |
+| `set-provider-header` | `id`, `name`, `value` | `set_provider_header` / `remove_provider_header` |
 | `add-route` | `id`, `provider`, `model`, … | `add_route` |
 | `remove-route` | `id` | `remove_route` |
 | `set-route` | `id`, `key`, `value` | `set_route_scalar` |

@@ -141,11 +141,12 @@ impl Reply {
 /// One flat enum of *every* operation rather than a nested subcommand tree: the
 /// caller sends a JSON object either way, and a flat list keeps the desktop
 /// side's dispatch table and this one lined up one-to-one.
-pub const OPS: [&str; 17] = [
+pub const OPS: [&str; 18] = [
     "add-provider",
     "remove-provider",
     "set-provider",
     "set-provider-key-env",
+    "set-provider-header",
     "add-route",
     "remove-route",
     "set-route",
@@ -188,6 +189,16 @@ struct SetProviderKeyEnv {
     id: String,
     /// The environment variable name to point `api_key_env` at.
     env_var: String,
+}
+
+/// One `[providers.<id>.extra_headers]` entry.
+#[derive(Debug, Deserialize)]
+struct SetProviderHeader {
+    id: String,
+    /// The HTTP header name — the TOML key of the sub-table.
+    name: String,
+    /// `null` removes the entry, exactly as it does for `set-route`.
+    value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,6 +432,29 @@ pub fn apply(op: &str, session: &Session, args: &str) -> Result<Reply> {
                     None
                 }
                 Err(e) => Some(e.to_string()),
+            }
+        }
+        "set-provider-header" => {
+            let a: SetProviderHeader = parse_args(args)?;
+            match a.value.as_deref() {
+                // A `null` value means "remove", the same answer the wizard's
+                // emptied prompt gives. `false` — the entry was not there — is a
+                // refusal rather than a silent no-op, so the caller can tell an
+                // edit that landed from one aimed at a name that has no entry.
+                None => {
+                    if doc.remove_provider_header(&a.id, &a.name) {
+                        None
+                    } else {
+                        Some(format!(
+                            "no extra header {:?} on provider {:?}",
+                            a.name, a.id
+                        ))
+                    }
+                }
+                Some(v) => match doc.set_provider_header(&a.id, &a.name, v) {
+                    Ok(()) => None,
+                    Err(e) => Some(e.to_string()),
+                },
             }
         }
         "add-route" => {
@@ -1126,6 +1160,125 @@ mod tests {
         // The starter's strategy key was there; removing it must not have taken
         // the table with it.
         assert!(cfg.routes.contains_key("claude-sonnet-5"));
+    }
+
+    /// Issue 3's live path: `zen-go` needs `x-opencode-session` to be accepted
+    /// at all, and before this op existed nothing in the CLI or the window could
+    /// write one.
+    ///
+    /// Asserted on the **reloaded config**, not on the reply's error — a field
+    /// name the arg struct does not carry is dropped by serde and comes back as
+    /// `error: null`, which is exactly how the `set-search` bug above hid.
+    #[test]
+    fn set_provider_header_lands_in_the_document() {
+        let session = chain(
+            &starter_session("header-set"),
+            &[(
+                "set-provider-header",
+                r#"{"id":"zen-go","name":"x-opencode-session","value":"tok-abc"}"#,
+            )],
+        );
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        assert_eq!(
+            cfg.providers["zen-go"]
+                .extra_headers
+                .get("x-opencode-session"),
+            Some(&"tok-abc".to_string()),
+            "the header did not reach the document"
+        );
+    }
+
+    /// `null` removes, the same answer `set-route` gives for an optional — and
+    /// the removal is observable in the reloaded config, not just in the reply.
+    #[test]
+    fn set_provider_header_with_a_null_value_removes_the_entry() {
+        let session = chain(
+            &starter_session("header-null"),
+            &[
+                (
+                    "set-provider-header",
+                    r#"{"id":"zen-go","name":"x-opencode-session","value":"tok"}"#,
+                ),
+                (
+                    "set-provider-header",
+                    r#"{"id":"zen-go","name":"x-opencode-session","value":null}"#,
+                ),
+            ],
+        );
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        assert!(
+            cfg.providers["zen-go"].extra_headers.is_empty(),
+            "the entry survived its removal"
+        );
+        // …and the emptied sub-table went with it.
+        assert!(
+            !session.doc.contains("extra_headers"),
+            "empty sub-table left in the document:\n{}",
+            session.doc
+        );
+    }
+
+    /// Removing a name that has no entry is a **refusal**, not a no-op.
+    ///
+    /// The window has to be able to tell an edit that landed from one aimed at
+    /// something that was not there — a silent success would leave the UI
+    /// claiming a header is gone while it is still on the wire.
+    #[test]
+    fn removing_a_header_that_is_not_there_is_refused() {
+        let session = starter_session("header-absent");
+        let reply = apply(
+            "set-provider-header",
+            &session,
+            r#"{"id":"zen-go","name":"x-nope","value":null}"#,
+        )
+        .unwrap();
+
+        let err = reply.error.expect("an absent header should be refused");
+        assert!(err.contains("x-nope"), "got: {err}");
+        assert!(err.contains("zen-go"), "got: {err}");
+        // The session still comes back, unchanged — a refusal is not a failure
+        // to answer.
+        assert_eq!(reply.session.unwrap().doc, session.doc);
+    }
+
+    /// An unknown provider is refused by the writer, and the reply carries it.
+    #[test]
+    fn setting_a_header_on_an_unknown_provider_is_refused() {
+        let session = starter_session("header-noprovider");
+        let reply = apply(
+            "set-provider-header",
+            &session,
+            r#"{"id":"nobody","name":"x-foo","value":"v"}"#,
+        )
+        .unwrap();
+
+        let err = reply.error.expect("an unknown provider should be refused");
+        assert!(err.contains("nobody"), "got: {err}");
+        assert_eq!(reply.session.unwrap().doc, session.doc);
+    }
+
+    /// A value is a credential (`x-opencode-session` carries a subscription
+    /// token) and must never ride back in the reply's redacted view — the view
+    /// reports header *names* only.
+    #[test]
+    fn the_reply_view_never_carries_a_header_value() {
+        let session = chain(
+            &starter_session("header-redact"),
+            &[(
+                "set-provider-header",
+                r#"{"id":"zen-go","name":"x-opencode-session","value":"tok-SENTINEL"}"#,
+            )],
+        );
+        let view = view(&session).unwrap();
+        let rendered = format!("{view:?}");
+        assert!(
+            !rendered.contains("tok-SENTINEL"),
+            "a header value crossed the redaction boundary:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("x-opencode-session"),
+            "the header name should still be reported:\n{rendered}"
+        );
     }
 
     #[test]

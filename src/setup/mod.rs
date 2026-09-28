@@ -275,7 +275,11 @@ impl WizardState {
         let idx = p.choose("Edit which provider?", &as_refs(ids), 0)?;
         let id = ids[idx].clone();
 
-        let field = p.choose("Which field?", &["base_url", "spec", "Back"], 2)?;
+        let field = p.choose(
+            "Which field?",
+            &["base_url", "spec", "extra_headers", "Back"],
+            3,
+        )?;
         match field {
             0 => {
                 let v = p.ask("Base URL")?;
@@ -289,6 +293,56 @@ impl WizardState {
                     Spec::Openai
                 };
                 report(self.doc.set_provider_scalar(&id, "spec", spec.as_str()));
+            }
+            2 => self.edit_provider_headers(p, &id)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Add, change or drop one `[providers.<id>.extra_headers]` entry.
+    ///
+    /// The list is shown by **name only**, and the name is what the prompts ask
+    /// for: `zen-go`'s `x-opencode-session` carries a subscription token, so a
+    /// wizard that echoed the stored entries the way it echoes `base_url` would
+    /// put a credential in the scrollback of whatever the user is
+    /// screen-sharing. Names alone still answer the question this menu has to
+    /// answer — "is the header wired up at all?" — and the value is one `ask`
+    /// away for anyone who needs to retype it.
+    fn edit_provider_headers(&mut self, p: &mut dyn Prompter, id: &str) -> Result<()> {
+        let names: Vec<String> = self
+            .doc
+            .provider(id)
+            .map(|c| c.extra_headers.keys().cloned().collect())
+            .unwrap_or_default();
+
+        println!();
+        if names.is_empty() {
+            println!("  (no extra headers)");
+        }
+        for name in &names {
+            println!("  {name}  (value hidden)");
+        }
+
+        let action = p.choose("Extra headers:", &["Set", "Remove", "Back"], 2)?;
+        match action {
+            0 => {
+                let name = p.ask("Header name (e.g. x-opencode-session)")?;
+                let value = p.ask_secret("Header value")?;
+                report(self.doc.set_provider_header(id, &name, &value));
+            }
+            1 => {
+                if names.is_empty() {
+                    println!("  nothing to remove");
+                } else {
+                    let idx = p.choose("Remove which header?", &as_refs(&names), 0)?;
+                    let name = names[idx].clone();
+                    if self.doc.remove_provider_header(id, &name) {
+                        println!("  removed {name}");
+                    } else {
+                        println!("  no extra header {name:?} to remove");
+                    }
+                }
             }
             _ => {}
         }

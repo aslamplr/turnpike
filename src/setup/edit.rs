@@ -284,6 +284,111 @@ base_url = "http://localhost:8888"
         self.set_scalar(&["providers", id], key, value)
     }
 
+    /// Set one `[providers.<id>.extra_headers]` entry, creating the sub-table on
+    /// first use.
+    ///
+    /// The header **name is a TOML key**, and an HTTP header name is not
+    /// bare-key-safe in general (`X-Api-Key` is, `X-Foo.Bar` is not), so the
+    /// write goes through `quoted_key` + `insert_formatted` for the reason
+    /// `quoted_key`'s doc gives: `Table::insert`'s occupied path calls
+    /// `entry.key_mut().fmt()`, which clears an explicit repr and puts a quoted
+    /// name back to bare.
+    ///
+    /// The sub-table is created **explicitly, at `isize::MAX`**, not implicitly
+    /// like `ensure_table`'s single top-level name. Its parent is
+    /// `[providers.<id>]`, whose position is inherited by any child that does not
+    /// pin one — so an unpinned `extra_headers` renders beside the provider
+    /// instead of after it. `add_provider`/`add_route` pin for the same reason.
+    pub fn set_provider_header(&mut self, id: &str, name: &str, value: &str) -> Result<()> {
+        if !self.provider_ids().iter().any(|p| p == id) {
+            anyhow::bail!("no provider named {id:?}");
+        }
+        self.ensure_provider_headers(id)?;
+
+        let table = self
+            .provider_headers_mut(id)
+            .with_context(|| format!("no [providers.{id}.extra_headers] table to edit"))?;
+        let new = match table.get_mut(name).and_then(|i| i.as_value_mut()) {
+            Some(slot) => {
+                let mut item = toml_edit::value(value);
+                if let Some(dst) = item.as_value_mut() {
+                    dst.decor_mut().clone_from(slot.decor());
+                }
+                table.insert_formatted(&quoted_key(name), item);
+                return Ok(());
+            }
+            None => toml_edit::value(value),
+        };
+        table.insert_formatted(&quoted_key(name), new);
+        Ok(())
+    }
+
+    /// Drop one `[providers.<id>.extra_headers]` entry. Returns whether it was
+    /// there.
+    ///
+    /// When that was the last entry the sub-table goes too. A bare
+    /// `[providers.<id>.extra_headers]` header is valid TOML meaning an empty
+    /// map, but it is a line the wizard invented that `default_config_text()`
+    /// never writes — the same argument `remove_route_target` makes for dropping
+    /// an emptied `target` array rather than leaving `target = []`.
+    pub fn remove_provider_header(&mut self, id: &str, name: &str) -> bool {
+        let removed = self
+            .provider_headers_mut(id)
+            .and_then(|t| t.remove(name))
+            .is_some();
+        if !removed {
+            return false;
+        }
+        // `is_empty` on the table counts nested *tables* too, and this one holds
+        // only scalars — but check the rendered document either way, because
+        // that is the thing whose line count changes.
+        let empty = self
+            .provider_headers_mut(id)
+            .map(|t| t.is_empty())
+            .unwrap_or(false);
+        if empty {
+            if let Some(p) = self.provider_table_mut(id) {
+                p.remove("extra_headers");
+            }
+        }
+        true
+    }
+
+    /// Create `[providers.<id>.extra_headers]` if it is absent.
+    ///
+    /// Unlike the top-level `ensure_table`, this walks to `providers.<id>` first
+    /// and creates only the *third* level — the provider itself must already
+    /// exist (`set_provider_header` refuses otherwise), and a missing provider is
+    /// a refusal, never something to invent here.
+    fn ensure_provider_headers(&mut self, id: &str) -> Result<()> {
+        let provider = self
+            .provider_table_mut(id)
+            .with_context(|| format!("no provider named {id:?}"))?;
+        if provider.get("extra_headers").is_none() {
+            let mut t = Table::new();
+            t.set_position(Some(isize::MAX));
+            provider.insert("extra_headers", Item::Table(t));
+        }
+        Ok(())
+    }
+
+    /// `[providers.<id>]` as a concrete `Table` — the only shape with
+    /// `insert_formatted`, which a quoted header name needs.
+    fn provider_table_mut(&mut self, id: &str) -> Option<&mut Table> {
+        self.doc
+            .get_mut("providers")?
+            .as_table_like_mut()?
+            .get_mut(id)?
+            .as_table_mut()
+    }
+
+    /// `[providers.<id>.extra_headers]` as a concrete `Table`.
+    fn provider_headers_mut(&mut self, id: &str) -> Option<&mut Table> {
+        self.provider_table_mut(id)?
+            .get_mut("extra_headers")?
+            .as_table_mut()
+    }
+
     /// Write `api_key_env` and drop any inline `api_key` in the same edit.
     ///
     /// The pair moves together on purpose: `api_key_env` outranks the inline
@@ -1680,6 +1785,226 @@ base_url = "http://localhost:8888"
             cfg.routes["claude-sonnet-5"].strategy,
             crate::config::Strategy::Static
         );
+    }
+
+    /// The whole point of the writer: a header written here is a header the
+    /// config layer reads back.
+    ///
+    /// A writer that mutated the document into something `config::load_from_str`
+    /// did not see would pass any assertion made against `as_str()`, which is
+    /// why this goes through the parsed config.
+    #[test]
+    fn set_provider_header_round_trips_through_the_config() {
+        let mut doc = fixture();
+        doc.set_provider_header("zen-go", "x-opencode-session", "tok-abc")
+            .unwrap();
+
+        let cfg = doc.validated().unwrap();
+        assert_eq!(
+            cfg.providers["zen-go"]
+                .extra_headers
+                .get("x-opencode-session"),
+            Some(&"tok-abc".to_string())
+        );
+        // And nothing else moved.
+        assert_eq!(
+            cfg.providers["zen-go"].base_url,
+            "https://opencode.ai/zen/go"
+        );
+        assert!(cfg.providers["zen"].extra_headers.is_empty());
+    }
+
+    /// The sub-table is never rendered *between* a provider and its own keys.
+    ///
+    /// `[providers.<id>]` carries a position, and a child table with no position
+    /// of its own inherits the parent's — so an unpinned `extra_headers` would
+    /// be emitted at the parent's slot, splitting `base_url` off from the
+    /// provider it belongs to and making it read as a key of whatever block
+    /// preceded. Pinning it at `isize::MAX` puts it at the end of the file,
+    /// which is where `add_provider` puts a new table for the same reason.
+    #[test]
+    fn extra_headers_never_split_a_provider_from_its_keys() {
+        let mut doc = fixture();
+        doc.set_provider_header("zen-go", "x-opencode-session", "tok")
+            .unwrap();
+
+        let out = doc.as_str();
+        let provider = out.find("[providers.zen-go]").expect("provider block");
+        let headers = out
+            .find("[providers.zen-go.extra_headers]")
+            .expect("headers block");
+        assert!(
+            headers > provider,
+            "headers block rendered before its provider:\n{out}"
+        );
+        // The provider's own keys still sit under it: the block header is
+        // immediately followed by its scalars, with no table opener squeezed
+        // between — which is the shape an unpinned child table produces.
+        assert!(
+            out.contains(
+                "[providers.zen-go]\nspec = \"openai\"\n\
+                 base_url = \"https://opencode.ai/zen/go\"\n"
+            ),
+            "the provider's own keys no longer sit under it:\n{out}"
+        );
+        // And it is a pure append: everything the fixture held is still there,
+        // byte for byte, before the new block.
+        let base = fixture();
+        for line in base.as_str().lines().filter(|l| !l.trim().is_empty()) {
+            assert!(
+                out.contains(line),
+                "a line of the document moved or was lost: {line:?}\n{out}"
+            );
+        }
+        assert_eq!(
+            out[..headers].trim_end(),
+            base.as_str().trim_end(),
+            "the write was not a pure append"
+        );
+    }
+
+    /// A header name that is not a bare TOML key must be written as a quoted
+    /// key, and — because `Table::insert` clears an explicit repr — that repr
+    /// has to survive the write.
+    ///
+    /// `X-Foo.Bar` is the shape that matters: an HTTP header name may carry a
+    /// dot, and bare it would parse as `X-Foo` with a nested `Bar`.
+    #[test]
+    fn a_dotted_header_name_stays_a_quoted_key() {
+        let mut doc = fixture();
+        doc.set_provider_header("zen", "X-Foo.Bar", "v").unwrap();
+
+        let out = doc.as_str();
+        assert!(out.contains("\"X-Foo.Bar\""), "key not quoted:\n{out}");
+
+        let cfg = doc.validated().unwrap();
+        assert_eq!(
+            cfg.providers["zen"]
+                .extra_headers
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["X-Foo.Bar"]
+        );
+    }
+
+    /// Overwriting a header keeps the line's own formatting, the same way a
+    /// scalar edit does.
+    #[test]
+    fn overwriting_a_header_keeps_its_comment() {
+        let mut doc = Doc::parse(
+            "[providers.zen]\nspec = \"anthropic\"\nbase_url = \"https://x\"\n\n\
+             [providers.zen.extra_headers]\n\"x-opencode-session\" = \"old\" # rotated monthly\n",
+        )
+        .unwrap();
+
+        doc.set_provider_header("zen", "x-opencode-session", "new")
+            .unwrap();
+
+        let out = doc.as_str();
+        assert!(
+            out.contains("= \"new\" # rotated monthly"),
+            "comment lost on overwrite:\n{out}"
+        );
+        assert!(!out.contains("\"old\""), "stale value survived:\n{out}");
+        let cfg = doc.validated().unwrap();
+        assert_eq!(
+            cfg.providers["zen"].extra_headers.get("x-opencode-session"),
+            Some(&"new".to_string())
+        );
+    }
+
+    /// Removing the last entry takes the block with it — a bare
+    /// `[providers.<id>.extra_headers]` is a line the wizard invented, not one
+    /// `default_config_text` writes.
+    #[test]
+    fn removing_the_last_header_drops_the_sub_table() {
+        let mut doc = fixture();
+        doc.set_provider_header("zen-go", "x-opencode-session", "tok")
+            .unwrap();
+        assert!(doc.as_str().contains("[providers.zen-go.extra_headers]"));
+
+        assert!(doc.remove_provider_header("zen-go", "x-opencode-session"));
+
+        let out = doc.as_str();
+        assert!(
+            !out.contains("extra_headers"),
+            "empty sub-table left behind:\n{out}"
+        );
+        assert!(
+            !out.contains("\"tok\""),
+            "the value was not removed:\n{out}"
+        );
+        // A removal that took the block with it leaves the file exactly as it
+        // was before the header was ever set.
+        assert_eq!(out, fixture().as_str(), "removal was not a clean undo");
+        let cfg = doc.validated().unwrap();
+        assert!(cfg.providers["zen-go"].extra_headers.is_empty());
+        assert_eq!(cfg.providers["zen-go"].spec, Spec::Openai);
+    }
+
+    /// …but only when it *was* the last one: a sibling keeps the block alive.
+    #[test]
+    fn removing_one_header_leaves_its_siblings() {
+        let mut doc = fixture();
+        doc.set_provider_header("zen-go", "x-opencode-session", "tok")
+            .unwrap();
+        doc.set_provider_header("zen-go", "x-trace", "1").unwrap();
+
+        assert!(doc.remove_provider_header("zen-go", "x-opencode-session"));
+
+        let cfg = doc.validated().unwrap();
+        assert_eq!(
+            cfg.providers["zen-go"]
+                .extra_headers
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["x-trace"]
+        );
+    }
+
+    /// Absent name, absent provider: both are `false`, and neither invents a
+    /// table on the way out.
+    #[test]
+    fn removing_a_header_that_is_not_there_changes_nothing() {
+        let mut doc = fixture();
+        let before = doc.as_str();
+
+        assert!(!doc.remove_provider_header("zen", "x-nope"));
+        assert!(!doc.remove_provider_header("nobody", "x-nope"));
+
+        assert_eq!(doc.as_str(), before, "document changed on a no-op removal");
+    }
+
+    /// An unknown provider is a refusal, not a new provider with a header on it.
+    #[test]
+    fn set_provider_header_refuses_an_unknown_provider() {
+        let mut doc = fixture();
+        let before = doc.as_str();
+        let err = doc
+            .set_provider_header("nobody", "x-foo", "v")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nobody"), "got: {err}");
+        assert_eq!(doc.as_str(), before, "document changed on a refused write");
+    }
+
+    /// Adding a header must not cost a comment — the same property the whole
+    /// `toml_edit` design exists to protect, asserted over the full set.
+    #[test]
+    fn header_writes_preserve_every_comment() {
+        let expected = fixture().comments();
+        let mut doc = fixture();
+
+        doc.set_provider_header("zen-go", "x-opencode-session", "tok")
+            .unwrap();
+        doc.set_provider_header("zen-go", "x-opencode-session", "tok2")
+            .unwrap();
+        doc.remove_provider_header("zen-go", "x-opencode-session");
+
+        let after = doc.comments();
+        for c in &expected {
+            assert!(after.contains(c), "comment lost: {c}\n{}", doc.as_str());
+        }
     }
 
     /// A target add/remove cycle preserves every comment in the document.

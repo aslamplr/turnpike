@@ -293,15 +293,14 @@ async fn view_of_session(session: &Session) -> SettingsPayload {
         Err(e) => return SettingsPayload::Error { message: e },
     };
 
-    let out = spawn_blocking(move || {
-        run_cli(&bin, &["config-edit", "--view"], Some(&stdin))
-    })
-    .await;
+    let out = spawn_blocking(move || run_cli(&bin, &["config-edit", "--view"], Some(&stdin))).await;
 
     match out {
         Ok(Ok(text)) => match serde_json::from_str::<Reply>(&text) {
             // `--view` prints the session beside the view; only the view is read.
-            Ok(Reply { view: Some(view), .. }) => SettingsPayload::View {
+            Ok(Reply {
+                view: Some(view), ..
+            }) => SettingsPayload::View {
                 view: Box::new(view),
             },
             Ok(_) => SettingsPayload::Error {
@@ -532,6 +531,58 @@ pub async fn config_edit_save(
 #[tauri::command]
 pub fn config_edit_discard(state: tauri::State<'_, EditState>, session: String) {
     state.lock().remove(&session);
+}
+
+/// Whether the session's **staged document** would pass the write gate, and why
+/// not.
+///
+/// This is the one command that is not an edit and not a read. It asks the
+/// question Save will ask, *before* Save is pressed — `config-edit --validate`,
+/// the same gate `commit_doc` calls, so a second implementation cannot give a
+/// second answer.
+///
+/// It cannot be `doctor_view`. Doctor reads the **file on disk**, which on a
+/// first run does not exist and in any case does not hold the edits the user is
+/// looking at — so it would report a healthy config while the staged one is
+/// unsavable. The whole value here is that it sees what Save would write.
+///
+/// `Ok(None)` is "it would pass"; `Ok(Some(reason))` is "it would not, and here
+/// is why" — a successful answer to the question asked, not an `Err`. `Err` is
+/// reserved for a session that is gone or a CLI that would not run, which the
+/// window reports differently: no verdict, rather than a verdict of invalid.
+#[tauri::command]
+pub async fn config_edit_validate(
+    state: tauri::State<'_, EditState>,
+    session: String,
+) -> Result<Option<String>, String> {
+    let Some(current) = state.get(&session) else {
+        return Err("this session is no longer open".to_string());
+    };
+    let Ok(bin) = binary() else {
+        return Err(
+            "could not find the `turnpike` binary — set TURNPIKE_BIN to its path".to_string(),
+        );
+    };
+    let stdin = current.session_json()?;
+
+    // `run_cli` turns a non-zero exit into an `Err`, but `--validate` exits 0
+    // either way: a refusal is a `Reply` with `error` set and the session echoed
+    // back unchanged, printed and returned as success. So unlike `doctor_view`,
+    // the reason arrives on stdout and is read from the reply below.
+    let out =
+        spawn_blocking(move || run_cli(&bin, &["config-edit", "--validate"], Some(&stdin))).await;
+
+    let text = match out {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(format!("the check did not finish: {e}")),
+    };
+
+    let reply: Reply = match serde_json::from_str(&text) {
+        Ok(r) => r,
+        Err(e) => return Err(format!("could not parse the check's reply: {e}")),
+    };
+    Ok(reply.error)
 }
 
 /// `turnpike doctor --json`, read-only.
