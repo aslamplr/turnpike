@@ -432,7 +432,8 @@ reads the **file on disk** — absent on a first run, and after an edit not what
 user is looking at — so it would report a healthy config while the staged one is
 unsavable, which is the one moment the answer matters. The verdict lands beside the
 session, in the CLI's own words. A refusal is an *answer*, not a failure — the CLI
-exits 0 having said why — so it does not go through `problem`; an unrunnable check
+exits 0 having said why, and the command resolves with the reason rather than
+throwing — so it does not go through `problem`; an unrunnable check
 does, because "could not check" must never render as "invalid". `take()` and
 `reloaded()` both clear the verdict, so every path that installs a document drops
 the answer about the last one: a "would save" cannot outlive the edit it described
@@ -507,6 +508,9 @@ rules of equal specificity over one class is a coin toss on which stylesheet lan
 
 A refusal — a strategy on a one-target route, or removing a provider a route still
 references — surfaces the CLI's **own** message and leaves the session untouched.
+It arrives as a *resolved* reply with `error` set rather than as a rejection, which
+is `config-edit`'s exit-0 convention for "the doc said no"; only a process-level
+failure throws.
 The window has no force-delete the wizard does not have.
 
 ### Logs
@@ -834,8 +838,9 @@ Covered today, seven suites: `kit.svelte`'s `keyTone`/`windows` and the shape of
 and its fail/warn tallies; `Routes.svelte`'s strategy gate, the `i - 1` array index
 its remove buttons send, and a `noAutofill` assertion per text field; each panel's
 `unsaved` marker rendering from its own flag and not its sibling's; `Settings.svelte`'s
-session lifecycle — the `dirty`-and-`touched`-only-on-success rule (a refusal arrives
-as a thrown string and must not light up Save), the `config_edit_apply` op/args wire
+session lifecycle — the `dirty`-and-`touched`-only-on-success rule (a refusal comes
+back as a **resolved** payload with `error` set, not a thrown string, and must not
+light up Save), the `config_edit_apply` op/args wire
 shape, the save and discard paths, the Validate verdict (reported from the command,
 cleared by every path that installs a document, and never rendered for a check that
 could not run), and which panel each op is attributed to (including

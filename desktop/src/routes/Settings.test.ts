@@ -16,10 +16,12 @@ import type {
 /// the sub-tab shell it grew when the one long scroll became five tabs.
 ///
 /// The one rule that matters most is the `dirty` flag: it is set *only* on the
-/// path that actually changed something. A refusal arrives as a thrown string
-/// carrying the wizard's own message and leaves the session untouched, so a
-/// refusal must not light up Save — otherwise the window invites the user to
-/// write a document the CLI just declined.
+/// path that actually changed something. A refusal arrives as a **resolved**
+/// payload with `error` set and the document unchanged — `config-edit`'s exit-0
+/// "the doc said no" — so `apply` reads `error` rather than treating a settled
+/// promise as a landed edit. A refusal must not light up Save, or the window
+/// invites the user to write a document the CLI just declined; a process failure
+/// (no session, no binary) rejects instead, and must settle the same way.
 ///
 /// Nothing here is asserted through the panels' internals; each edit is driven
 /// by the same click a user makes, so the shims between panel and `apply` are
@@ -418,9 +420,9 @@ describe("Settings — which panel is holding the edit", () => {
 
   it("marks nothing for an edit the CLI refused", async () => {
     await mount();
-    fake("config_edit_apply", () => {
-      throw "a failover strategy needs at least two targets";
-    });
+    // The realistic refusal shape: the op *resolves*, with the wizard's own words
+    // on `error`. The document did not move, so nothing may be marked.
+    fake("config_edit_apply", () => session({ error: "a failover strategy needs at least two targets" }));
 
     await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
@@ -467,20 +469,20 @@ describe("Settings — which panel is holding the edit", () => {
     expect(screen.queryAllByTitle("unsaved changes")).toHaveLength(0);
   });
 
-  it("keeps a session error from being read as a marker", async () => {
+  it("marks nothing when the op never ran", async () => {
     await mount();
-    // A session can come back carrying an `error` — `take()` copies it into
-    // `problem` — and that is a complaint about the document, not an edit to it.
-    // Here the op *succeeds* (the fake resolves), so `dirty` and the Routes
-    // marker are both right; what must not happen is the error text retracting
-    // the marker or the bar naming a panel that did not hold the edit.
-    fake("config_edit_apply", () => session({ error: "the seed is already editable" }));
+    // The other shape: the op *rejects* — a Tauri `Err`, a process-level failure
+    // rather than the document saying no. It settles the session the same way a
+    // refusal does, since either way nothing changed on disk or in the session.
+    fake("config_edit_apply", () => {
+      throw "the config session is gone";
+    });
     await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
 
-    await screen.findByText("the seed is already editable");
-    await waitFor(() => expect(dirtyLine(" in Routes")).toBeInTheDocument());
-    expect(marked("Routes")).toBeInTheDocument();
+    await screen.findByText("the config session is gone");
+    expect(clean()).toBeInTheDocument();
+    expect(screen.queryAllByTitle("unsaved changes")).toHaveLength(0);
   });
 
   it("does not advance the round-robin or re-seed the view on a tab switch", async () => {
@@ -502,10 +504,11 @@ describe("Settings — which panel is holding the edit", () => {
 describe("Settings — an edit the CLI refuses", () => {
   it("keeps the session clean and shows the wizard's own words", async () => {
     await mount();
-    // `apply` rethrows the CLI's message verbatim — a string, not an Error.
-    fake("config_edit_apply", () => {
-      throw "a failover strategy needs at least two targets";
-    });
+    // A refusal is the CLI answering, not failing: the op resolves with `error`
+    // set and the document untouched.
+    fake("config_edit_apply", () =>
+      session({ error: "a failover strategy needs at least two targets" }),
+    );
 
     await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
@@ -519,9 +522,7 @@ describe("Settings — an edit the CLI refuses", () => {
 
   it("clears a previous refusal once an edit is accepted", async () => {
     await mount();
-    fake("config_edit_apply", () => {
-      throw "one target";
-    });
+    fake("config_edit_apply", () => session({ error: "one target" }));
     await openTab("Routes");
     await userEvent.click(screen.getByRole("button", { name: "Remove route" }));
     await screen.findByText("one target");

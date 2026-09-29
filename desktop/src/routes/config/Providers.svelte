@@ -43,8 +43,10 @@
     /// `api_key_env` *and* strips an inline key), so anything finer would be a
     /// claim the window cannot back. `settings.svelte` owns the answer.
     changed: boolean;
-    onAdd: (id: string, spec: string, baseUrl: string) => Promise<void>;
-    onRemove: (id: string) => Promise<void>;
+    /// `true` when the document actually changed, `false` when the CLI refused
+    /// the op — which is what the editors below key their teardown on.
+    onAdd: (id: string, spec: string, baseUrl: string) => Promise<boolean>;
+    onRemove: (id: string) => Promise<boolean>;
     /// One provider's `base_url`, and only that field.
     ///
     /// `Routes` takes a generic `onSetScalar(id, key, value)` because it edits
@@ -54,7 +56,7 @@
     /// `set-provider` writes *without* passing through `spec_from` (only
     /// `add-provider` validates it). Naming the one field keeps that door shut at
     /// the type level rather than by convention.
-    onSetBaseUrl: (id: string, value: string) => Promise<void>;
+    onSetBaseUrl: (id: string, value: string) => Promise<boolean>;
     /// One `[providers.<id>.extra_headers]` entry — the write that makes
     /// `zen-go` reachable at all, since it rejects a request without
     /// `x-opencode-session`.
@@ -67,11 +69,14 @@
     /// The value is **write-only**. A header value can be a session token, so
     /// the view reports names only (`view.rs`) and there is no shape of this
     /// panel that reads one back — the same door the key editor keeps shut.
-    onSetHeader: (id: string, name: string, value: string) => Promise<void>;
-    onRemoveHeader: (id: string, name: string) => Promise<void>;
-    onKeyEnv: (id: string, envVar: string) => Promise<void>;
-    onStageKey: (slot: string, value: string) => Promise<void>;
-    onUnstageKey: (slot: string) => Promise<void>;
+    onSetHeader: (id: string, name: string, value: string) => Promise<boolean>;
+    onRemoveHeader: (id: string, name: string) => Promise<boolean>;
+    onKeyEnv: (id: string, envVar: string) => Promise<boolean>;
+    /// The plan-key ops. `stage-key` cannot be refused — it writes a slot, not a
+    /// document key — so these may resolve to nothing; `submitKey` reads only the
+    /// *document* op's answer before it drops the draft.
+    onStageKey: (slot: string, value: string) => Promise<unknown>;
+    onUnstageKey: (slot: string) => Promise<unknown>;
     error: string | null;
   } = $props();
 
@@ -129,23 +134,33 @@
     headerValue = "";
   }
 
-  /// Writes one header. The drafts are cleared on the way out so a token does not
-  /// sit in the DOM after it has been sent — the panel's own list re-renders from
-  /// the view the CLI returns, so progress is visible without them.
+  /// Writes one header. The drafts are cleared only after a write that landed,
+  /// so a token does not sit in the DOM after it has been sent — the panel's own
+  /// list re-renders from the view the CLI returns, so progress is visible
+  /// without them.
+  ///
+  /// The `ok` check is the whole point for *this* editor: a header value is
+  /// write-only (the view reports names only), so a refusal that cleared the
+  /// draft would destroy the one thing in this panel the user cannot re-derive
+  /// by looking at the screen.
   async function submitHeader(id: string) {
     if (!headerName.trim() || !headerValue.trim()) return;
-    await onSetHeader(id, headerName.trim(), headerValue.trim());
+    const ok = await onSetHeader(id, headerName.trim(), headerValue.trim());
+    if (!ok) return;
     headerName = "";
     headerValue = "";
   }
 
   async function submitKey(id: string) {
     if (!keyDraft.trim()) return;
-    if (keyMode === "env") {
-      await onKeyEnv(id, keyDraft.trim());
-    } else {
-      await onStageKey(slotFor(id), keyDraft);
-    }
+    // Only the env home writes a document key, and only it can be refused; the
+    // paste home stages into the plan. Both leave the draft in place on failure,
+    // which for the paste home means only a thrown process error.
+    const ok =
+      keyMode === "env"
+        ? await onKeyEnv(id, keyDraft.trim())
+        : ((await onStageKey(slotFor(id), keyDraft)), true);
+    if (!ok) return;
     keyDraft = "";
     editingKey = null;
   }
@@ -168,13 +183,17 @@
     // `config::validate` does not catch (it checks provider *existence*, not the
     // URL; that is `doctor`'s `base-url-shape` lint).
     if (!baseDraft.trim()) return;
-    await onSetBaseUrl(id, baseDraft.trim());
+    // A duplicate-provider refusal is not about the URL, so the draft stays put
+    // with the wizard's own message above it rather than vanishing.
+    if (!(await onSetBaseUrl(id, baseDraft.trim()))) return;
     editingBase = null;
   }
 
   async function addProvider() {
     if (!newId.trim() || !newBase.trim()) return;
-    await onAdd(newId.trim(), newSpec, newBase.trim());
+    // `add-provider` refuses a duplicate id. Keeping the form open preserves
+    // what the user typed so the id can be changed rather than retyped.
+    if (!(await onAdd(newId.trim(), newSpec, newBase.trim()))) return;
     newId = "";
     newBase = "";
     adding = false;

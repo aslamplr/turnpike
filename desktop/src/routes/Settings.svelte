@@ -236,31 +236,48 @@
 
   /// Every edit goes through here: one op, the whole new session back.
   ///
-  /// A refusal arrives as a thrown string carrying the wizard's own message and
-  /// leaves the session untouched — so `dirty` is only set on the path that
-  /// actually changed something. That distinction is the reason this is one
-  /// helper rather than a `try` in each handler.
+  /// A refusal arrives as a **resolved** payload with `error` set and the
+  /// session unchanged — a process-level failure is what throws — so this
+  /// returns whether the document actually changed. `dirty` and `mark` are only
+  /// reached on the success path, and the panels key their draft-clearing on the
+  /// return value rather than on the `await` finishing: awaiting a refusal looks
+  /// exactly like awaiting a success, which is best illustrated by a write-only
+  /// token like an extra-header value, silently discarded if the panel treated
+  /// the two as one.
   ///
   /// `panel` is the panel the op belongs to, which is the finest claim this side
   /// can honestly make: one op may touch several document keys (`set-provider-
   /// key-env` writes `api_key_env` *and* strips an inline key) and the view it
   /// gets back is redacted, so a per-row attribution would be a guess.
-  async function apply(op: string, args: Record<string, unknown>, panel: Panel) {
-    if (!session) return;
+  async function apply(
+    op: string,
+    args: Record<string, unknown>,
+    panel: Panel,
+  ): Promise<boolean> {
+    if (!session) return false;
     busy = true;
     problem = null;
     try {
       const next = await api.configEditApply(session, op, args);
+      // `take` installs the returned document and surfaces `next.error`, so the
+      // refusal reads in the wizard's own words and nothing else here has to
+      // know how a refusal is shaped.
       take(next);
+      if (next.error) return false;
       dirty = true;
       mark(panel);
+      return true;
     } catch (e) {
       problem = String(e);
+      return false;
     } finally {
       busy = false;
     }
   }
 
+  /// Keys go to the *plan*, not the document, and the ops that touch the plan
+  /// have nothing to refuse — so this mirror of `apply` returns nothing. The
+  /// panels await it only to keep typing disabled while it runs.
   async function stageKey(slot: string, value: string) {
     if (!session) return;
     busy = true;
@@ -268,6 +285,7 @@
     try {
       const next = await api.configEditStageKey(session, slot, value);
       take(next);
+      if (next.error) return;
       dirty = true;
       mark(panelForSlot(slot));
     } catch (e) {

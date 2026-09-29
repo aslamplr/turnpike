@@ -12,6 +12,8 @@ shell consumes.
 ```text
 turnpike setup       [--config <path>]
 turnpike config-edit --load [--config <path>]
+turnpike config-edit --view [--config <path>]
+turnpike config-edit --validate [--config <path>]
 turnpike config-edit --op <name> [--config <path>]   # session JSON on stdin and stdout
 turnpike config      [--config <path>] [--json]
 turnpike doctor      [--config <path>] [--json] [--live] [--no-live]
@@ -218,8 +220,17 @@ would be worse than no GUI, so it does not write config at all; it drives this.
 
 ```text
 turnpike config-edit --load [--config <path>]
+turnpike config-edit --view [--config <path>]
+turnpike config-edit --validate [--config <path>]
 turnpike config-edit --op <name> [--config <path>]
 ```
+
+Four ways in, all four driving the same writer. `--load` takes no stdin and seeds a
+session; the other three read one. `--view` answers with the *redacted view* of the
+session's document rather than the file on disk, which is what lets the window
+render a config that does not exist yet — `turnpike config` reads the file, and on
+a first run there is no file. `--validate` is the write gate asked as a question,
+so the desktop shell can report the verdict before Save is pressed.
 
 It is a filter, and it is deliberately **stateless**. Each invocation reads a
 *session document* on stdin and writes the new one on stdout:
@@ -426,9 +437,10 @@ Three things the view deliberately does *not* compute for itself:
 
 `resolve_config(path, ConfigMode::Required)` is what loads it, so the view is
 **hydrated** — the key tiers it reports are the live precedence result, not the
-raw TOML. On a missing file that load fails, and `turnpike config` reports the
-same message `serve` would: no config, here is how to make one. Nothing is
-written — there is no mode that writes a starter, which is what makes this
+raw TOML. On a missing file that load fails, and `turnpike config` reports what
+`serve` reports — no config, and how to make one — differing only in the subject:
+`serve` says *starting the gateway* needs one, `config` says *that* does. Nothing
+is written — there is no mode that writes a starter, which is what makes this
 command safe for a GUI that starts on login. See
 [desktop.md](desktop.md#missing-config).
 

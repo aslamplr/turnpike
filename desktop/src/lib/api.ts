@@ -37,10 +37,13 @@ export const configEditLoad = () => invoke<SessionPayload>("config_edit_load");
 
 /// Apply exactly one edit and return the whole new session.
 ///
-/// Refusals — a non-`static` strategy on a one-target route, removing a provider
-/// a route still references — come back as a thrown string carrying the wizard's
-/// own message, and the session is unchanged. The UI must not be able to produce
-/// a state the wizard refuses.
+/// A refusal — a non-`static` strategy on a one-target route, removing a provider
+/// a route still references — is a **resolved** payload with `error` set and the
+/// document unchanged: the doc said no, the invocation was fine, which is
+/// `config-edit`'s own exit-0 convention. Only a process-level failure (no session,
+/// no binary, an unparseable reply) rejects. Callers must read `error` rather than
+/// treat a settled promise as a landed edit. The UI must not be able to produce a
+/// state the wizard refuses.
 export const configEditApply = (
   session: string,
   op: string,

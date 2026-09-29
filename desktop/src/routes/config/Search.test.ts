@@ -43,9 +43,12 @@ function mount(
       busy: false,
       changed: false,
       error: null,
-      onSearch: async () => {},
-      onAddSearch: async () => {},
-      onRemoveSearch: async () => {},
+      // The document-writing props answer `true` — "the edit landed" — because the
+      // panel keeps a draft only when it did. The plan ops answer `undefined`,
+      // which is all they ever have: a staged slot is not a document key.
+      onSearch: async () => true,
+      onAddSearch: async () => true,
+      onRemoveSearch: async () => true,
       onStageKey: async () => {},
       onUnstageKey: async () => {},
       ...over,

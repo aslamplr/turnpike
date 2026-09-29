@@ -41,11 +41,15 @@
     /// `api_key_env` *and* strips an inline key — so anything finer would be a
     /// claim the window cannot back. `Settings.svelte` owns the answer.
     changed: boolean;
-    onSearch: (args: Record<string, unknown>) => Promise<void>;
-    onAddSearch: () => Promise<void>;
-    onRemoveSearch: () => Promise<void>;
-    onStageKey: (slot: string, value: string) => Promise<void>;
-    onUnstageKey: (slot: string) => Promise<void>;
+    /// Each resolves to whether the document changed: `false` is a refusal, and
+    /// the key editor below keys its teardown on it.
+    onSearch: (args: Record<string, unknown>) => Promise<boolean>;
+    onAddSearch: () => Promise<boolean>;
+    onRemoveSearch: () => Promise<boolean>;
+    /// The plan-key ops; `stage-key` takes no document key and cannot refuse, so
+    /// it may resolve to nothing.
+    onStageKey: (slot: string, value: string) => Promise<unknown>;
+    onUnstageKey: (slot: string) => Promise<unknown>;
     error: string | null;
   } = $props();
 
@@ -78,11 +82,14 @@
 
   async function submitKey() {
     if (!keyDraft.trim() || !slot) return;
-    if (keyMode === "env") {
-      await onSearch({ api_key_env: keyDraft.trim() });
-    } else {
-      await onStageKey(slot, keyDraft);
-    }
+    // The env home writes a document key and can be refused; the paste home
+    // stages into the plan and cannot. Either way the draft is dropped only once
+    // the write landed.
+    const ok =
+      keyMode === "env"
+        ? await onSearch({ api_key_env: keyDraft.trim() })
+        : ((await onStageKey(slot, keyDraft)), true);
+    if (!ok) return;
     keyDraft = "";
     editingKey = false;
   }

@@ -39,12 +39,14 @@
     /// two (`display_name`, `context_tokens`), so a per-row marker would claim
     /// more than the window knows. `Settings.svelte` owns the answer.
     changed: boolean;
-    onAdd: (args: Record<string, unknown>) => Promise<void>;
-    onRemove: (id: string) => Promise<void>;
-    onSetScalar: (id: string, key: string, value: string | null) => Promise<void>;
-    onStrategy: (id: string, strategy: string) => Promise<void>;
-    onAddTarget: (id: string, args: Record<string, unknown>) => Promise<void>;
-    onRemoveTarget: (id: string, index: number) => Promise<void>;
+    /// Each resolves to whether the document changed: `false` is a refusal, and
+    /// the forms below key their teardown on it.
+    onAdd: (args: Record<string, unknown>) => Promise<boolean>;
+    onRemove: (id: string) => Promise<boolean>;
+    onSetScalar: (id: string, key: string, value: string | null) => Promise<boolean>;
+    onStrategy: (id: string, strategy: string) => Promise<boolean>;
+    onAddTarget: (id: string, args: Record<string, unknown>) => Promise<boolean>;
+    onRemoveTarget: (id: string, index: number) => Promise<boolean>;
     error: string | null;
   } = $props();
 
@@ -75,11 +77,14 @@
 
   async function submitAdd() {
     if (!newId.trim() || !newProvider || !newModel.trim()) return;
-    await onAdd({
+    // A duplicate route id or an unknown provider is a refusal, and the form
+    // stays open holding what was typed so the id can be corrected in place.
+    const ok = await onAdd({
       id: newId.trim(),
       provider: newProvider,
       model: newModel.trim(),
     });
+    if (!ok) return;
     newId = "";
     newModel = "";
     adding = false;
@@ -96,12 +101,19 @@
   async function submitEdit(id: string) {
     // An emptied optional is stored by *removing* the key (`value: null`), the
     // same thing an empty answer does in the wizard.
-    await onSetScalar(id, "display_name", draft.display_name.trim() || null);
-    await onSetScalar(
+    //
+    // This is the one submit here that sends two ops, so it is the one place a
+    // half-applied edit is possible: the first can land and the second be
+    // refused. The editor then stays open on the draft the user typed, which is
+    // the honest thing to show — the session really did move — and the bar's
+    // marker already says the panel is holding an edit.
+    const first = await onSetScalar(id, "display_name", draft.display_name.trim() || null);
+    const second = await onSetScalar(
       id,
       "context_tokens",
       draft.context_tokens.trim() || null,
     );
+    if (!first || !second) return;
     editing = null;
   }
 
@@ -113,7 +125,7 @@
 
   async function submitTarget(id: string) {
     if (!tProvider || !tModel.trim()) return;
-    await onAddTarget(id, { provider: tProvider, model: tModel.trim() });
+    if (!(await onAddTarget(id, { provider: tProvider, model: tModel.trim() }))) return;
     tModel = "";
     targetFor = null;
   }
