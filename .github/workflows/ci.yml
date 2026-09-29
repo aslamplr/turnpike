@@ -28,16 +28,30 @@ jobs:
           version_of_cargo() {
             sed -n 's/^version = "\(.*\)"/\1/p' "$1" | head -1
           }
+          # Our own crate's entry in a Cargo lockfile: the `version` line that
+          # follows its `name`, so a dependency carrying the same number
+          # (three crates in the desktop lock are 0.1.9) cannot answer for it.
+          version_in_cargo_lock() {
+            sed -n "/^name = \"$1\"\$/{n;s/^version = \"\(.*\)\"/\1/p;}" "$2"
+          }
           root=$(version_of_cargo Cargo.toml)
           tauri=$(version_of_cargo desktop/src-tauri/Cargo.toml)
           npm=$(sed -n 's/.*"version": "\(.*\)".*/\1/p' desktop/package.json | head -1)
+          root_lock=$(version_in_cargo_lock turnpike Cargo.lock)
+          tauri_lock=$(version_in_cargo_lock turnpike-desktop desktop/src-tauri/Cargo.lock)
+          npm_lock=$(sed -n 's/.*"version": "\(.*\)".*/\1/p' desktop/package-lock.json | head -1)
           echo "Cargo.toml=$root"
           echo "desktop/src-tauri/Cargo.toml=$tauri"
           echo "desktop/package.json=$npm"
-          if [ -z "$root" ] || [ "$root" != "$tauri" ] || [ "$root" != "$npm" ]; then
-            echo "::error::version drift — Cargo.toml=$root, desktop/src-tauri/Cargo.toml=$tauri, desktop/package.json=$npm"
-            exit 1
-          fi
+          echo "Cargo.lock=$root_lock"
+          echo "desktop/src-tauri/Cargo.lock=$tauri_lock"
+          echo "desktop/package-lock.json=$npm_lock"
+          for v in "$tauri" "$npm" "$root_lock" "$tauri_lock" "$npm_lock"; do
+            if [ -z "$root" ] || [ "$root" != "$v" ]; then
+              echo "::error::version drift — Cargo.toml=$root, desktop/src-tauri/Cargo.toml=$tauri, desktop/package.json=$npm, Cargo.lock=$root_lock, desktop/src-tauri/Cargo.lock=$tauri_lock, desktop/package-lock.json=$npm_lock"
+              exit 1
+            fi
+          done
           if grep -qE '^[[:space:]]*"version"[[:space:]]*:' desktop/src-tauri/tauri.conf.json; then
             echo "::error::desktop/src-tauri/tauri.conf.json pins a version — Tauri derives it from desktop/src-tauri/Cargo.toml, so delete it"
             exit 1

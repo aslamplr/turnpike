@@ -48,7 +48,7 @@ cargo test        # inline #[cfg(test)] modules per file
 ## Module map
 
 - `src/main.rs` — CLI surface (`serve`, `launch`, `routes`, `setup`, `doctor`); tracing setup (env-filter, `info` default, `warn` for `setup`/`doctor`; **logs go to stderr**).
-- `src/config.rs` — config load/validate; `Spec` (Anthropic/Openai), `Family` + `family_for_path()`, model `resolve()`; default config writer.
+- `src/config.rs` — config load/validate; `Spec` (Anthropic/Openai), `Family` + `family_for_path()`, model `resolve()`; the comments-only starter skeleton (`default_config_text()` — a `[server]` block plus instructions, deliberately not a usable config).
 - `src/proxy.rs` — the HTTP server. **The one place everything meets: `forward()`** builds the request pipeline; `bridge()` runs the agentic search middleware.
 - `src/translate/mod.rs` — Anthropic↔OpenAI request/response translation (edges only: system↔system, thinking↔reasoning_content, tool_use↔tool_calls, tool_result↔role:"tool", images↔image_url, `tool_choice` mapping).
 - `src/translate/stream.rs` — `StreamConverter`: stateful OpenAI SSE→Anthropic SSE (thinking_delta, fragmented tool-call args→`input_json_delta`, real usage from the final choices-less chunk, idempotent `finish()`).
@@ -57,6 +57,8 @@ cargo test        # inline #[cfg(test)] modules per file
 - `src/launch/claude_desktop.rs` — writes a third-party inference-gateway profile (`00000000-0000-5000-9000-000000000128.json`) into Claude Desktop's configLibrary, with backup/restore and a running-app safety check.
 - `src/secrets/` — encrypted key store (`~/.turnpike/`): `Secret`/`StoreCtx`, the pure `resolve_chain` precedence function, `open`/`hydrate`; `file.rs` is the AES-256-GCM `FileStore` (one master key, one `secrets.toml`, one namespace per config path); `memory.rs` is the test fake.
 - `src/setup/edit.rs` — comment-preserving `toml_edit` mutations. The whole reason `toml_edit` is a dependency: the document is mutated **in place** and never round-tripped through `Config`/`toml::Value`, or every comment dies on first use.
+- `src/setup/cli.rs` — `turnpike config-edit`, the **non-interactive** write surface: the wizard's twin (same `edit::Doc`, same `Plan`, same `commit_doc`), one op per invocation over a JSON session on stdin/stdout. Op refusals are **exit 0** with `"error"` in the reply — the document said no, the invocation was fine; exit 1 is a malformed invocation or unparseable JSON only.
+- `src/config_edit.rs` — the `config-edit` **process edge**: the four ways in (`--load`/`--view`/`--validate`/`--op`) and the one place the stdout-is-JSON / stderr-is-`tracing` split is stated. `--view` parses with bare `toml::from_str`, not `load_from_str`, so the invalid starter skeleton still renders.
 - `src/setup/mod.rs` — the wizard: menu, staged `Plan`, `commit()`.
 - `src/setup/prompt.rs` — **the only module that writes to stdout for input.** If you add a prompt anywhere else, you have broken the stdout/stderr split.
 - `src/doctor.rs` — the check list (`CHECK_IDS`) and its human + `--json` renderers. Read-only, non-fatal.
@@ -172,8 +174,10 @@ cargo test        # inline #[cfg(test)] modules per file
   cannot match them. `desktop-sums` also assembles `latest.json` — the manifest the updater polls —
   from the `.sig` files `createUpdaterArtifacts` emits, gated on **both** platforms' signatures being
   present: Tauri validates the whole manifest before it compares versions, so a one-platform manifest
-  would disable updates on both. One version spans the whole repo (four manifests), with a CI drift
-  check.
+  would disable updates on both. One version spans the whole repo, with a CI drift check over the
+  six places it is written: both `Cargo.toml`s and both `Cargo.lock`s (name-anchored, so a
+  dependency that happens to carry the same number cannot answer for ours), `package.json` and
+  `package-lock.json`. `tauri.conf.json` must **not** pin one — Tauri derives it from the crate.
 
 ## Documentation
 
