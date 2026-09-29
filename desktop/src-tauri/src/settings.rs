@@ -1,12 +1,14 @@
-//! The Tauri-side consumer of `turnpike config --json`.
+//! The Tauri-side mirror of turnpike's redacted config view.
 //!
 //! Named `settings`, not `view`, so it cannot be confused with the turnpike
-//! crate's `src/view.rs` — which is the redaction boundary this module reads
-//! *through*. Nothing here sees a credential: the view reports a key's tier and
-//! never its value, and `Secret::expose()` is not reachable from this side at all.
+//! crate's `src/view.rs` — which is the redaction boundary these types mirror.
+//! Nothing here sees a credential: the view reports a key's tier and never its
+//! value, and `Secret::expose()` is not reachable from this side at all.
+//!
+//! The *reading* lives in `config_edit`, which runs the CLI against a session's
+//! staged document; this module owns the shapes it deserializes.
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
 use crate::resolve;
 
@@ -73,76 +75,8 @@ pub struct KeyView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum SettingsPayload {
-    View {
-        view: Box<ConfigView>,
-    },
-    /// No config file on disk. Reached only by [`load`], which reads the file
-    /// directly. It is **not** an error state in the window: the Settings screen
-    /// bootstraps from `config-edit --load`/`--view` (see `config_edit`), which
-    /// seeds the starter document in memory, so a first run renders the editor
-    /// and offers to create the file rather than reporting a missing path.
-    ///
-    /// The app still must not write one on its own — see [`load`].
-    MissingConfig {
-        path: String,
-    },
-    Error {
-        message: String,
-    },
-}
-
-/// Load the config view by running `turnpike config --json`.
-pub async fn load() -> SettingsPayload {
-    let config = resolve::resolve_config_path();
-
-    // The pre-check comes first so a missing config is reported *as* missing,
-    // rather than as whatever error `turnpike config` would produce for it.
-    // `resolve_config` refuses a missing file now — it once wrote a starter
-    // before its mode match, which is what this check originally guarded
-    // against — so nothing here can leave a file behind either way.
-    if !config.exists() {
-        return SettingsPayload::MissingConfig {
-            path: config.display().to_string(),
-        };
-    }
-
-    let Some(bin) = resolve::resolve_binary() else {
-        return SettingsPayload::Error {
-            message: "could not find the `turnpike` binary — set TURNPIKE_BIN to its path"
-                .to_string(),
-        };
-    };
-
-    let out = match Command::new(&bin)
-        .arg("config")
-        .arg("--config")
-        .arg(&config)
-        .arg("--json")
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            return SettingsPayload::Error {
-                message: format!("running {}: {e}", bin.display()),
-            }
-        }
-    };
-
-    if !out.status.success() {
-        return SettingsPayload::Error {
-            message: message_from_stderr(&out.stderr),
-        };
-    }
-
-    match serde_json::from_slice::<ConfigView>(&out.stdout) {
-        Ok(view) => SettingsPayload::View {
-            view: Box::new(view),
-        },
-        Err(e) => SettingsPayload::Error {
-            message: format!("could not parse `turnpike config --json`: {e}"),
-        },
-    }
+    View { view: Box<ConfigView> },
+    Error { message: String },
 }
 
 /// `anyhow`'s bail out of `main` prints as `Error: <message>` on the last line,
@@ -166,9 +100,9 @@ pub(crate) fn message_from_stderr(stderr: &[u8]) -> String {
 
 /// The path this side resolved, so the window can show it beside turnpike's own.
 ///
-/// The `View` and `MissingConfig` outcomes carry their own path; this is for the
-/// `Error` outcome, which has none — there the path is the first thing worth
-/// showing, because it is the most common cause.
+/// The `View` outcome carries its own path; this is for the `Error` outcome,
+/// which has none — there the path is the first thing worth showing, because it
+/// is the most common cause.
 pub fn config_path() -> String {
     resolve::resolve_config_path().display().to_string()
 }
@@ -200,14 +134,11 @@ mod tests {
 
     #[test]
     fn payload_tags_are_camel_case_for_the_frontend() {
-        let json = serde_json::to_string(&SettingsPayload::MissingConfig {
-            path: "/tmp/x/config.toml".into(),
+        let json = serde_json::to_string(&SettingsPayload::View {
+            view: Box::new(serde_json::from_str(SAMPLE).unwrap()),
         })
         .unwrap();
-        assert_eq!(
-            json,
-            r#"{"kind":"missingConfig","path":"/tmp/x/config.toml"}"#
-        );
+        assert!(json.starts_with(r#"{"kind":"view","view":{"#), "{json}");
 
         let json = serde_json::to_string(&SettingsPayload::Error {
             message: "nope".into(),

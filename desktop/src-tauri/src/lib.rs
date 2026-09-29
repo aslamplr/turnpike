@@ -86,11 +86,6 @@ fn gateway_restart(sup: tauri::State<'_, SupervisorHandle>) {
     sup.restart();
 }
 
-#[tauri::command]
-async fn settings_view() -> settings::SettingsPayload {
-    settings::load().await
-}
-
 /// The path this side resolved, so the window can show it beside turnpike's own.
 #[tauri::command]
 fn settings_config_path() -> String {
@@ -182,7 +177,6 @@ pub fn run() {
             gateway_start,
             gateway_stop,
             gateway_restart,
-            settings_view,
             settings_config_path,
             autostart_enabled,
             autostart_set,

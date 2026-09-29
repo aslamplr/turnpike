@@ -67,7 +67,7 @@ desktop/
     src/lib.rs                  # app setup, the commands, quit
     src/supervisor.rs           # the process state machine
     src/resolve.rs              # where the binary and config.toml are
-    src/settings.rs             # consumes `turnpike config --json`
+    src/settings.rs             # the redacted view types — mirrors `src/view.rs`
     src/config_edit.rs          # the editable session: shells out to `turnpike config-edit`
     src/cli_install.rs          # puts the bundled CLI on the user's PATH
     src/update.rs               # checks for a newer release, installs on request
@@ -528,8 +528,9 @@ commands are therefore `async fn`s whose bodies run on
 The window must never see a credential. That is enforced on the turnpike side, in
 `src/view.rs` — see
 [setup-and-doctor.md](setup-and-doctor.md#turnpike-config). The Tauri side
-(`src/settings.rs`) only deserializes what that view emits, and `Secret::expose()`
-is not reachable from the desktop crate at all.
+(`src/settings.rs`) defines only the shapes that view emits — `config_edit.rs`
+deserializes the CLI's `--view` output into them — and `Secret::expose()` is not
+reachable from the desktop crate at all.
 
 The view reports a key's **tier** (`env OPENCODE_API_KEY`, `store`,
 `inline (plaintext)`, `missing`, `not required`) and never a value. Provider

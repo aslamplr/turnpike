@@ -5,7 +5,6 @@ import type {
   Installed,
   SaveOutcome,
   SessionPayload,
-  SettingsPayload,
   Status,
   UpdateStatus,
 } from "./types";
@@ -15,7 +14,6 @@ export const start = () => invoke<void>("gateway_start");
 export const stop = () => invoke<void>("gateway_stop");
 export const restart = () => invoke<void>("gateway_restart");
 
-export const settingsView = () => invoke<SettingsPayload>("settings_view");
 export const settingsConfigPath = () => invoke<string>("settings_config_path");
 
 export const autostartEnabled = () => invoke<boolean>("autostart_enabled");
@@ -33,9 +31,8 @@ export const cliInstall = () => invoke<Installed>("cli_install");
 /// Seed a config session: the file on disk when there is one, otherwise the
 /// starter the wizard would have written. Writes nothing.
 ///
-/// Takes no path: the Rust side resolves the config itself, the same way
-/// `settings_view` does, so the window cannot point a session at a file the
-/// gateway is not reading.
+/// Takes no path: the Rust side resolves the config itself, so the window cannot
+/// point a session at a file the gateway is not reading.
 export const configEditLoad = () => invoke<SessionPayload>("config_edit_load");
 
 /// Apply exactly one edit and return the whole new session.

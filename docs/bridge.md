@@ -35,6 +35,13 @@ after the assistant's `tool_calls`. `translate_message` therefore *prepends*
 the tool messages before the user text and emits **no empty user message** for
 a turn that contained nothing but tool results.
 
+**Tool-result content is flattened to text.** A `tool_result` whose `content`
+is an array contributes its `text` blocks joined by `\n`; any other block type
+— an `image`, most commonly, as Claude Code's Read returns — contributes a
+short `[<type>]` marker (`[image]`) rather than being dropped, so the upstream
+is never told a tool returned nothing when it returned something the text
+bridge cannot carry. A genuinely empty result (`""` or `[]`) stays empty.
+
 ### Tools and tool_choice
 
 Anthropic tool declarations become `type: "function"` tools with the

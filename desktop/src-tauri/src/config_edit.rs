@@ -264,7 +264,7 @@ fn run_cli(bin: &Path, args: &[&str], stdin: Option<&str>) -> Result<String, Str
 
     if !out.status.success() {
         // `anyhow`'s bail out of `main` puts the message worth showing on the
-        // last stderr line — the same reading `settings::load` does.
+        // last stderr line.
         return Err(settings::message_from_stderr(&out.stderr));
     }
     String::from_utf8(out.stdout).map_err(|e| format!("the CLI's output was not UTF-8: {e}"))
@@ -276,8 +276,7 @@ fn run_cli(bin: &Path, args: &[&str], stdin: Option<&str>) -> Result<String, Str
 /// reads a file, and on a first run there is none. `config-edit --view` renders
 /// the session's staged document through the same redaction boundary, so the
 /// window can show a config that has never been saved — the starter skeleton
-/// included — instead of collapsing to `MissingConfig` and dead-ending a user who
-/// has not run the CLI.
+/// included — instead of failing on a file that is not there yet.
 ///
 /// A session is always present here; its `path` may point at a file that does not
 /// exist. That is the normal first-run state, not a failure.
@@ -772,7 +771,9 @@ mod tests {
         let json = serde_json::to_string(&SaveOutcome::Saved {
             session: Box::new(SessionPayload {
                 id: "s1".into(),
-                view: SettingsPayload::MissingConfig { path: "/c".into() },
+                view: SettingsPayload::Error {
+                    message: "x".into(),
+                },
                 fresh: false,
                 staged_keys: vec!["provider.zen".into()],
                 error: None,
@@ -785,9 +786,18 @@ mod tests {
 
     #[test]
     fn session_payload_is_camel_case_and_omits_a_missing_error() {
+        // An empty `view`, not an `Error`: the assertion below is that the
+        // session's own `error` field is absent, so a filler that serializes an
+        // `"error"` key would defeat it.
+        let view: ConfigView = serde_json::from_str(
+            r#"{"config_path":"/c","listen":"l","providers":[],"routes":[],"search":null}"#,
+        )
+        .unwrap();
         let payload = SessionPayload {
             id: "s1".into(),
-            view: SettingsPayload::MissingConfig { path: "/c".into() },
+            view: SettingsPayload::View {
+                view: Box::new(view),
+            },
             fresh: false,
             staged_keys: vec!["provider.zen".into()],
             error: None,
@@ -809,7 +819,9 @@ mod tests {
         let stored = Session::new(session);
         let payload = SessionPayload {
             id: "s1".into(),
-            view: SettingsPayload::MissingConfig { path: "/c".into() },
+            view: SettingsPayload::Error {
+                message: "x".into(),
+            },
             fresh: false,
             staged_keys: stored.staged.clone(),
             error: None,

@@ -292,7 +292,8 @@ fn tool_result_text(content: Option<&Value>) -> String {
             .iter()
             .filter_map(|b| match b.get("type").and_then(Value::as_str) {
                 Some("text") => b.get("text").and_then(Value::as_str).map(String::from),
-                _ => None,
+                Some(other) => Some(format!("[{other}]")),
+                None => None,
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -498,6 +499,47 @@ mod tests {
         assert_eq!(out["tools"][0]["type"], "function");
         assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(out["tools"][0]["function"]["parameters"]["type"], "object");
+    }
+
+    /// A non-`text` block inside a `tool_result` is reported, not dropped:
+    /// Claude Code's Read-on-a-PNG sends `content: [{type:"image",…}]` with no
+    /// text block, and the old filter turned that into `""` — telling the model
+    /// the tool returned nothing. An empty result must still stay empty.
+    #[test]
+    fn tool_result_content_marks_non_text_blocks_and_keeps_empty_empty() {
+        fn tool_content(content: &str) -> String {
+            let req: Value = serde_json::from_str(&format!(
+                r#"{{"model":"m","max_tokens":1,"messages":[
+                     {{"role":"user","content":[
+                       {{"type":"tool_result","tool_use_id":"call_1","content":{content}}}]}}]}}"#
+            ))
+            .unwrap();
+            let out = request_to_openai(&req, "m").unwrap();
+            let msgs = out["messages"].as_array().unwrap();
+            assert_eq!(msgs[0]["role"], "tool");
+            msgs[0]["content"].as_str().unwrap().to_string()
+        }
+
+        // The captured Claude Code shape: an image and nothing else.
+        assert_eq!(
+            tool_content(
+                r#"[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]"#
+            ),
+            "[image]"
+        );
+        // Text survives; the image is marked in place.
+        assert_eq!(
+            tool_content(r#"[{"type":"text","text":"here it is"},{"type":"image","source":{}}]"#),
+            "here it is\n[image]"
+        );
+        // An unrecognized block type self-describes.
+        assert_eq!(
+            tool_content(r#"[{"type":"document","source":{}}]"#),
+            "[document]"
+        );
+        // A genuinely empty result stays empty — no false marker.
+        assert_eq!(tool_content("[]"), "");
+        assert_eq!(tool_content(r#""""#), "");
     }
 
     #[test]

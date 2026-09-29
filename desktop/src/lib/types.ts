@@ -59,7 +59,6 @@ export interface ConfigView {
 
 export type SettingsPayload =
   | { kind: "view"; view: ConfigView }
-  | { kind: "missingConfig"; path: string }
   | { kind: "error"; message: string };
 
 /// Mirrors `desktop/src-tauri/src/config_edit.rs::SessionPayload`.
@@ -71,9 +70,8 @@ export interface SessionPayload {
   id: string;
   /// `SettingsPayload`, not `ConfigView`: the view is rendered from the
   /// session's own *document*, which on a fresh setup has never been written —
-  /// so a first run is an ordinary `view` of the starter skeleton, not a
-  /// `missingConfig`. `missingConfig` is reached only when there is no session
-  /// at all (a bare `settings_view`).
+  /// so a first run is an ordinary `view` of the starter skeleton, never an
+  /// error about a config path that does not exist yet.
   view: SettingsPayload;
   /// Whether the session's file is absent — the first-run state. It is the Rust
   /// side's answer, read off the filesystem, because the window cannot tell
