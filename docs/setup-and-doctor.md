@@ -290,9 +290,11 @@ nothing, so the op answers with a refusal instead. Creating the block is a side
 effect of naming a field: the first `set_search_scalar` calls `ensure_table`. The
 caller therefore names the engine, and the desktop shell's Add button names
 `searxng`, the engine that needs no key. The schema default is `exa`, and an `exa`
-block with no key makes `SearchManager::from_config` return `None`, which through
-`view::search_view` reads back as "Off" — the same screen the user was already on,
-so the Add would look like it had done nothing.
+block with no key is a block that **exists and cannot run** — `SearchManager::from_config`
+returns `None` for it, so server tools are stripped even though the table is there.
+The view renders that state (as `running: false`, with the key tier explaining why)
+rather than reporting the block absent, but it is still not what a first Add should
+produce: naming the keyless engine is what makes the new block actually run.
 
 **`remove-search` takes no arguments.** It reads the provider off the *document*
 to stage `search.<provider>` for deletion — the key has no home without the block —
@@ -357,6 +359,12 @@ routes:    5
 search:    exa (max 5 loops)
 ```
 
+A block that is present but cannot run — an `exa` engine with no resolvable key —
+prints the same line with `— not running` appended, and its `--json` `key` carries
+the resolution error as `note`. The block is not missing, so it is not reported as
+`off`; it is present and idle, which is the state the window has to be able to show
+in order to offer the key editor.
+
 The human form is deliberately a **summary, not a tree** — `turnpike routes`
 already renders the route listing, and duplicating it here would give the two a
 chance to disagree. `--json` is the real interface:
@@ -390,6 +398,7 @@ chance to disagree. `--json` is the real interface:
     "provider": "exa",
     "max_loops": 5,
     "base_url": null,
+    "running": true,
     "key": { "tier": "env EXA_API_KEY", "missing": false }
   }
 }
@@ -429,9 +438,16 @@ Three things the view deliberately does *not* compute for itself:
   cannot show a chain the gateway would not walk.
 - **`effective_context_tokens(route)`** for the route-level window, so the
   displayed number is the one the gateway enforces.
-- **`SearchManager::from_config(cfg)`** to decide whether search is on, so the
-  view cannot claim a search provider that the gateway would refuse to build
-  (an `exa` entry with no resolvable key, say) and silently drop server tools.
+- **`SearchManager::from_config(cfg)`** for the search block's `running` flag, so
+  the view cannot claim search is on when the gateway would refuse to build the
+  provider (an `exa` entry with no resolvable key, say) and silently drop server
+  tools. Note this decides `running`, **not** whether the block is reported at
+  all: a present block that cannot run is still rendered, because reporting it
+  absent would collapse the panel to "Off" and hide the key editor that is the
+  only way to fix it. Whether a block exists is a fact about the *document*, which
+  the parsed config cannot carry — `Config::search` is a non-optional `SearchCfg`
+  with `#[serde(default)]` — so the caller reads it off the raw text
+  (`view::document_declares_search`) and hands it to `view::build`.
 
 ### It writes nothing when the config is missing
 

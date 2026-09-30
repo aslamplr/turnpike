@@ -436,12 +436,12 @@
 
   /// Adding `[search]` names an engine, and it names **searxng**.
   ///
-  /// The schema default is exa, but exa has no key yet on a config that never
-  /// had a `[search]` block, and `view::search_view` reuses
-  /// `SearchManager::from_config` — so an exa block with no key reads back as
-  /// `None` and the panel would still render "Off". Naming the keyless engine
-  /// is what makes the new block *work*, which is what turns the off state into
-  /// the editor: the select there can then move to exa and a key be named.
+  /// The schema default is exa, and exa has no key yet on a config that never had
+  /// a `[search]` block — so an exa block would be created that exists and cannot
+  /// run (`SearchManager::from_config` returns `None`, server tools stripped). The
+  /// view renders that state rather than collapsing the panel, so the select could
+  /// still move to exa and a key be named — but Add should hand the user a block
+  /// that works, and naming the keyless engine is what does that.
   ///
   /// A thunk, not the bare op: `Search.svelte`'s button calls it with no
   /// arguments, and `apply`'s second parameter is the args object — passing the

@@ -18,6 +18,8 @@ mod translate;
 mod view;
 
 use std::path::PathBuf;
+
+use anyhow::Context;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -368,9 +370,22 @@ fn routes(config_path: Option<PathBuf>) -> Result<()> {
 /// `ConfigMode::Required` so the view is hydrated and the store's status is
 /// real: a key that only the store could have supplied must not be reported as
 /// missing just because nothing opened it.
+///
+/// The document is re-read rather than carried on [`Loaded`], because the view
+/// needs to know whether a `[search]` table was *written* — `Config::search` is
+/// a non-optional `SearchCfg` with `#[serde(default)]`, so the parsed config
+/// reports the same value for "no table" and "a table that will not run". This
+/// is the only caller that needs the text, so reading it here keeps that fact
+/// out of every other `Loaded` consumer.
 fn show_config(args: ConfigArgs) -> Result<()> {
     let loaded = resolve_config(args.config, ConfigMode::Required)?;
-    let view = view::build(&loaded.path, &loaded.cfg);
+    let raw = std::fs::read_to_string(&loaded.path)
+        .with_context(|| format!("reading config {}", loaded.path.display()))?;
+    let view = view::build(
+        &loaded.path,
+        &loaded.cfg,
+        view::document_declares_search(&raw),
+    );
     if args.json {
         println!("{}", view::to_json(&view)?);
     } else {

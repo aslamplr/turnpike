@@ -115,10 +115,18 @@
     <div class="row">
       <div class="row-head">
         <span class="badge {keyTone(search.key)}">{search.key.tier}</span>
+        {#if !search.running}<span class="badge warn">not running</span>{/if}
         {#if isStaged}<span class="badge warn">staged</span>{/if}
         {#if search.base_url}<span class="mono grow">{search.base_url}</span>{/if}
       </div>
       {#if search.key.note}<div class="sub">{search.key.note}</div>{/if}
+      {#if !search.running}
+        <div class="sub">
+          This block is saved, so the panel stays editable — but with this engine and no key
+          there is nothing to run, so server tools are stripped from bridged requests.
+          Point at a key or switch engine.
+        </div>
+      {/if}
 
       <div class="edit-fields">
         <label for="s-prov">provider</label>

@@ -36,7 +36,7 @@ pub struct ConfigView {
     pub listen: String,
     pub providers: Vec<ProviderView>,
     pub routes: Vec<RouteView>,
-    /// `None` when the search middleware would not run at all — see
+    /// `None` when there is no `[search]` block the panel can render — see
     /// [`search_view`].
     pub search: Option<SearchView>,
 }
@@ -80,6 +80,12 @@ pub struct SearchView {
     pub provider: String,
     pub max_loops: usize,
     pub base_url: Option<String>,
+    /// Whether [`SearchManager::from_config`] would build a manager — the
+    /// gateway's own availability rule, not a restatement of it. `false` on a
+    /// block that exists but cannot run (an `exa` engine with no resolvable
+    /// key), which is the state a renderer has to be able to name rather than
+    /// showing as absent.
+    pub running: bool,
     pub key: KeyView,
 }
 
@@ -114,7 +120,15 @@ impl KeyView {
 }
 
 /// Build the view. Pure: no I/O, no environment writes.
-pub fn build(config_path: &Path, cfg: &Config) -> ConfigView {
+///
+/// `search_present` is whether the *document* carries a `[search]` table. The
+/// parsed config cannot answer that: [`crate::config::Config::search`] is a
+/// non-optional `SearchCfg` with `#[serde(default)]`, so "no `[search]` table"
+/// and "a `[search]` table naming a provider that will not run" parse to the
+/// same value. The caller has the raw document ([`crate::setup::cli::view`]
+/// holds the session text; `main`'s `show_config` re-reads the file), so it
+/// answers the question here rather than this module guessing.
+pub fn build(config_path: &Path, cfg: &Config, search_present: bool) -> ConfigView {
     ConfigView {
         config_path: config_path.display().to_string(),
         listen: cfg.server.listen.clone(),
@@ -124,7 +138,7 @@ pub fn build(config_path: &Path, cfg: &Config) -> ConfigView {
             .iter()
             .map(|(id, r)| route_view(id, r, &cfg.providers))
             .collect(),
-        search: search_view(&cfg.search),
+        search: search_view(&cfg.search, search_present),
     }
 }
 
@@ -167,18 +181,63 @@ fn route_view(id: &str, r: &RouteCfg, providers: &BTreeMap<String, ProviderCfg>)
     }
 }
 
-/// `None` when the middleware would not run.
+/// Whether a config *document* declares a `[search]` table.
 ///
-/// Reuses [`SearchManager::from_config`] — the gateway's own availability rule
-/// (`src/main.rs` reports it from the same call) — rather than restating it, so
-/// the settings window cannot claim search is on while the gateway drops server
-/// tools.
-fn search_view(cfg: &SearchCfg) -> Option<SearchView> {
-    SearchManager::from_config(cfg)?;
+/// [`Config::search`] cannot answer this: it is a non-optional `SearchCfg` with
+/// `#[serde(default)]`, so a document with no `[search]` at all and one naming
+/// an engine that will not run parse to the same value, and the view would have
+/// to guess between them. A caller holding the raw text asks here and hands the
+/// answer to [`build`].
+///
+/// TOML that does not parse answers `false` — there is no table in text that
+/// cannot be read, and a caller whose document is malformed has already failed
+/// loudly on its own (the `--view` path errors on the parse, never reaching
+/// this).
+pub fn document_declares_search(raw: &str) -> bool {
+    match toml::from_str::<toml::Value>(raw) {
+        Ok(toml::Value::Table(t)) => t
+            .get("search")
+            .is_some_and(|s| matches!(s, toml::Value::Table(_))),
+        _ => false,
+    }
+}
+
+/// `None` when there is no `[search]` block the panel can render — see the two
+/// arms below.
+///
+/// The window has to be able to *fix* a `[search]` block, and the engine field
+/// is the one control that can break it: `exa` carries no key until the user
+/// names one, and a block in that state is exactly what a user who picked exa
+/// from the select — or saved `provider = "exa"` — is left holding. Reporting
+/// `None` there collapses the panel to "Off", which hides the `<select>` and the
+/// key editor and leaves no path back. So presence is what decides, and the key
+/// tier does the reporting.
+///
+/// Two cases still report `None`, both because the panel could not offer a way
+/// out of them:
+///
+/// - **No `[search]` table.** `Config::search` is a non-optional `SearchCfg`
+///   with `#[serde(default)]`, so the parsed config cannot tell this case from a
+///   present-but-unarmable exa block; `present` carries the answer the caller
+///   read off the document (`document_declares_search`).
+/// - **An engine the `<select>` does not offer.** Its options are the two
+///   [`SearchManager::from_config`] accepts (`exa`, `searxng`), so a third value
+///   would render a provider the dropdown silently rewrites on first touch.
+///   Reporting it as absent leaves the Add path — which names searxng — as what
+///   replaces it; `doctor`'s `search-config` is where an unsupported engine is
+///   diagnosed.
+fn search_view(cfg: &SearchCfg, present: bool) -> Option<SearchView> {
+    if !present || !matches!(cfg.provider.as_str(), "exa" | "searxng") {
+        return None;
+    }
     Some(SearchView {
         provider: cfg.provider.clone(),
         max_loops: cfg.max_loops,
         base_url: cfg.base_url.clone(),
+        // The gateway's own answer, not a second copy of the rule: an `exa`
+        // block with no resolvable key is a block that exists and does not run,
+        // and every renderer here has to be able to say so.
+        running: SearchManager::from_config(cfg).is_some(),
         key: search_key_view(cfg),
     })
 }
@@ -211,9 +270,14 @@ pub fn to_human(view: &ConfigView) -> String {
     out.push_str(&format!("providers: {}\n", view.providers.len()));
     out.push_str(&format!("routes:    {}\n", view.routes.len()));
     match &view.search {
+        // A block that exists and cannot run must not print as if it runs. The
+        // engine and loop count are already here; the idle state is appended,
+        // and the JSON view's `key` carries the reason.
         Some(s) => out.push_str(&format!(
-            "search:    {} (max {} loops)\n",
-            s.provider, s.max_loops
+            "search:    {} (max {} loops){}\n",
+            s.provider,
+            s.max_loops,
+            if s.running { "" } else { " — not running" },
         )),
         None => out.push_str("search:    off\n"),
     }
@@ -231,12 +295,20 @@ mod tests {
         toml::from_str(doc).unwrap()
     }
 
+    /// `build` with the presence flag read off the same text, which is what every
+    /// caller does — `main` re-reads the file, `cli::view` holds the session text.
+    fn build_from(doc: &str) -> ConfigView {
+        let cfg = parse(doc);
+        build(&path(), &cfg, document_declares_search(doc))
+    }
+
     fn path() -> std::path::PathBuf {
         std::path::PathBuf::from("/tmp/turnpike-view-test/config.toml")
     }
 
-    fn inline_key_config() -> Config {
-        parse(&format!(
+    /// An inline-keyed config with **no** `[search]` table.
+    fn inline_key_doc() -> String {
+        format!(
             r#"
 [server]
 listen = "127.0.0.1:8710"
@@ -250,15 +322,14 @@ api_key = "{SENTINEL}"
 provider = "zen"
 model = "claude-sonnet-4-5"
 "#
-        ))
+        )
     }
 
     #[test]
     fn key_view_never_carries_the_value() {
         // The test that keeps `Secret::expose()` — and every plaintext
         // `api_key` on the loaded config — out of the frontend.
-        let cfg = inline_key_config();
-        let view = build(&path(), &cfg);
+        let view = build_from(&inline_key_doc());
         let json = to_json(&view).unwrap();
 
         assert!(
@@ -279,7 +350,7 @@ model = "claude-sonnet-4-5"
     fn view_omits_extra_header_values() {
         // `zen-go`'s x-opencode-session is a session token, so the view carries
         // the header's name and never its value.
-        let cfg = parse(&format!(
+        let doc = format!(
             r#"
 [providers.zen-go]
 spec = "openai"
@@ -289,8 +360,8 @@ api_key = "k"
 [providers.zen-go.extra_headers]
 "x-opencode-session" = "{SENTINEL}"
 "#
-        ));
-        let view = build(&path(), &cfg);
+        );
+        let view = build_from(&doc);
         let json = to_json(&view).unwrap();
 
         assert_eq!(
@@ -306,7 +377,7 @@ api_key = "k"
         // The chain the view shows is the chain resolution walks: target 0 is
         // synthesized from the route's flat pair, so two declared blocks mean
         // three targets, in declaration order.
-        let cfg = parse(
+        let view = build_from(
             r#"
 [providers.zen]
 spec = "anthropic"
@@ -334,7 +405,6 @@ provider = "lms"
 model = "gemma3:27b"
 "#,
         );
-        let view = build(&path(), &cfg);
         assert_eq!(view.routes.len(), 1);
 
         let route = &view.routes[0];
@@ -358,7 +428,7 @@ model = "gemma3:27b"
     fn view_reports_the_effective_context_window() {
         // The route-level override wins outright; a static route with no field
         // advertises nothing.
-        let cfg = parse(
+        let view = build_from(
             r#"
 [providers.zen]
 spec = "anthropic"
@@ -374,7 +444,6 @@ provider = "zen"
 model = "b"
 "#,
         );
-        let view = build(&path(), &cfg);
         let by_id = |id: &str| {
             view.routes
                 .iter()
@@ -387,14 +456,47 @@ model = "b"
     }
 
     #[test]
-    fn view_with_no_search_is_none() {
-        // No `[search]` table at all: the default is exa with no key, which the
-        // gateway's own rule treats as "middleware off".
-        let view = build(&path(), &inline_key_config());
+    fn no_search_table_is_none() {
+        // No `[search]` table at all: the parsed config still holds the exa
+        // default, so only the *document* can say the table is absent — and
+        // absent is what the panel renders as "Off".
+        let view = build_from(&inline_key_doc());
         assert!(view.search.is_none());
+    }
 
-        // An unknown provider is likewise off, not a silent success.
-        let cfg = parse(
+    #[test]
+    fn a_present_exa_block_with_no_key_is_reported_not_running() {
+        // THE defect. An exa block with no resolvable key is a block that exists
+        // and cannot run. Reporting `None` there collapsed the panel to "Off",
+        // hiding the `<select>` and the key editor — the only path back — so a
+        // user who picked exa, or saved `provider = "exa"`, was left with no way
+        // out. Presence decides; `running` names the state.
+        let view = build_from(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[search]
+provider = "exa"
+"#,
+        );
+        let search = view.search.as_ref().expect("a present block must render");
+        assert_eq!(search.provider, "exa");
+        assert!(!search.running, "no key, so the middleware cannot run");
+        assert!(search.key.missing, "and the key tier is what says so");
+        // The human summary must not read as if it runs either.
+        let human = to_human(&view);
+        assert!(human.contains("not running"), "{human}");
+    }
+
+    #[test]
+    fn an_engine_the_select_cannot_render_is_none() {
+        // The one present case that stays `None`: the panel's <select> offers
+        // exactly the two engines `SearchManager::from_config` accepts, so it
+        // could neither render this value nor offer a way off it. Add — which
+        // names searxng — is what replaces it; `doctor` diagnoses it.
+        let view = build_from(
             r#"
 [providers.zen]
 spec = "anthropic"
@@ -404,14 +506,30 @@ base_url = "https://opencode.ai/zen"
 provider = "nope"
 "#,
         );
-        assert!(build(&path(), &cfg).search.is_none());
+        assert!(view.search.is_none());
+    }
+
+    #[test]
+    fn presence_is_read_off_the_document() {
+        // The one signal the parsed config cannot carry: `Config::search` is a
+        // non-optional `SearchCfg`, so "no table" and "an unarmable table" parse
+        // to the same value.
+        assert!(document_declares_search("[search]\nprovider = \"exa\"\n"));
+        assert!(!document_declares_search(
+            "[server]\nlisten = \"127.0.0.1:8710\"\n"
+        ));
+        // A `search` key that is not a table is not a `[search]` table.
+        assert!(!document_declares_search("search = \"exa\"\n"));
+        // Text that does not parse declares nothing rather than panicking; the
+        // caller whose document is malformed has already failed on its own.
+        assert!(!document_declares_search("[search\n"));
     }
 
     #[test]
     fn keyless_search_reports_no_key_required() {
         // searxng needs no key, so "missing" would be noise. It is available
         // with no key at all, which is the whole point of supporting it.
-        let cfg = parse(
+        let search = build_from(
             r#"
 [providers.zen]
 spec = "anthropic"
@@ -422,10 +540,12 @@ provider = "searxng"
 base_url = "http://127.0.0.1:8080"
 max_loops = 3
 "#,
-        );
-        let search = build(&path(), &cfg).search.expect("searxng is keyless");
+        )
+        .search
+        .expect("searxng is keyless");
         assert_eq!(search.provider, "searxng");
         assert_eq!(search.max_loops, 3);
+        assert!(search.running, "searxng is always available");
         assert_eq!(search.key.tier, "not required");
         assert!(!search.key.missing);
         assert!(search.key.note.is_none());
@@ -433,7 +553,7 @@ max_loops = 3
 
     #[test]
     fn missing_key_reports_a_note_and_no_value() {
-        let cfg = parse(
+        let view = build_from(
             r#"
 [providers.zen]
 spec = "anthropic"
@@ -445,7 +565,6 @@ provider = "zen"
 model = "claude-sonnet-4-5"
 "#,
         );
-        let view = build(&path(), &cfg);
         let key = &view.providers[0].key;
         assert!(key.missing);
         assert_eq!(key.tier, "missing");
@@ -462,7 +581,7 @@ model = "claude-sonnet-4-5"
 
     #[test]
     fn human_summary_names_the_basics() {
-        let view = build(&path(), &inline_key_config());
+        let view = build_from(&inline_key_doc());
         let human = to_human(&view);
         assert!(
             human.contains("/tmp/turnpike-view-test/config.toml"),

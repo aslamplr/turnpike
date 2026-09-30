@@ -46,6 +46,11 @@ export interface SearchView {
   provider: string;
   max_loops: number;
   base_url: string | null;
+  /// Whether the gateway would build a search manager from this block. `false`
+  /// on a block that exists and cannot run — an `exa` engine with no resolvable
+  /// key — which renders as "not running", never as absent: the key editor is
+  /// the only way out of that state.
+  running: boolean;
   key: KeyView;
 }
 

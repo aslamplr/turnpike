@@ -496,7 +496,12 @@ rules of equal specificity over one class is a coin toss on which stylesheet lan
   `search.<provider>`, never the literal `search.exa` — so switching exa → searxng
   re-points the slot the badge and the Unstage button look for, and searxng renders
   its `not required` key face. `Remove [search]` removes the block and stages the
-  slot's delete, since the key has no home without it.
+  slot's delete, since the key has no home without it. A block that **exists but
+  cannot run** — an `exa` engine with no resolvable key — renders as the editor with
+  a `not running` badge rather than as "Off": the view reports it (`running: false`)
+  and the panel must keep the `<select>` and the key editor reachable, because those
+  are the only way out of that state. Only a genuinely absent `[search]` table, or a
+  provider the `<select>` cannot render, reads as "Off".
 - **Routes** — all three strategies. The target chain renders target 0 as the
   route's own flat `provider`/`model` with **no remove button** (removing it is
   "edit the route," and `targets()` synthesizes it); chain index `i` removes

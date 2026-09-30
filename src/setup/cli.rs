@@ -664,10 +664,12 @@ fn reset_stranded_strategy(doc: &mut Doc, id: &str) {
 /// Creating the block is a side effect of naming a field: the first
 /// `set_search_scalar` is what calls `ensure_table`, so this op is also *how* a
 /// config with no `[search]` block gets one. The caller therefore names the
-/// engine it wants — the window's Add button sends `searxng` — because the
-/// schema default is `exa`, and an `exa` block with no key makes
-/// `SearchManager::from_config` return `None`. Through `view::search_view` that
-/// reads back to the user as "Off", i.e. as though nothing had been added.
+/// engine it wants — the window's Add button sends `searxng` — because the schema
+/// default is `exa`, and an `exa` block with no key is a block that exists and
+/// cannot run: `SearchManager::from_config` returns `None` for it, so server
+/// tools are stripped. The view renders that state rather than reporting the block
+/// absent, so the panel stays editable — but naming the keyless engine is still
+/// what makes a first Add produce a block that actually runs.
 ///
 /// Refuses an argument object with nothing in it. Every arm below is `if let
 /// Some`, so an empty object would fall through all of them, change nothing and
@@ -805,7 +807,13 @@ pub fn view(session: &Session) -> Result<crate::view::ConfigView> {
         toml::from_str(&session.doc).context("parsing the session's document")?;
     let store = secrets::open(path);
     secrets::hydrate(&mut cfg, &store);
-    Ok(crate::view::build(path, &cfg))
+    // Presence is read off the *document*, which the session holds verbatim: the
+    // parsed config cannot say whether a `[search]` table was there at all.
+    Ok(crate::view::build(
+        path,
+        &cfg,
+        crate::view::document_declares_search(&session.doc),
+    ))
 }
 
 #[cfg(test)]
@@ -1409,10 +1417,11 @@ mod tests {
 
     /// The other half: naming an engine *does* create the block, which is what
     /// the window's Add sends. `searxng`, because it is the keyless one — the
-    /// schema default `exa` with no key makes `from_config` return `None`, which
-    /// `view::search_view` renders as "Off", i.e. as though nothing had been
-    /// added. Asserted on `from_config`, not on the text: a block that exists but
-    /// does not run is exactly the failure being fixed.
+    /// schema default `exa` with no key is a block that exists and cannot run, so
+    /// `from_config` returns `None` and server tools are stripped. Asserted on
+    /// `from_config`, not on the text: a block that exists but does not run is
+    /// exactly the failure the view now reports (`running: false`) rather than
+    /// hiding, and Add should still produce a block that does run.
     #[test]
     fn set_search_naming_an_engine_creates_a_working_table() {
         let mut session = skeleton_session("search-create");

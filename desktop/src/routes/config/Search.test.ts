@@ -22,6 +22,7 @@ const search = (over: Partial<SearchView> = {}): SearchView => ({
   provider: "exa",
   base_url: "https://api.exa.ai",
   max_loops: 5,
+  running: true,
   key: { tier: "env EXA_API_KEY", missing: false },
   ...over,
 });
@@ -64,6 +65,44 @@ async function openKey(mode: "env" | "paste") {
     await userEvent.selectOptions(screen.getByLabelText("key home"), "paste");
   }
 }
+
+describe("Search — a block that exists but cannot run", () => {
+  it("keeps the panel editable instead of collapsing to Off", () => {
+    // THE live bug. A saved `[search]` block with exa and no key is a block that
+    // exists and cannot run. It used to arrive as `search: null` — the same shape
+    // as "no block at all" — so the whole panel vanished, taking the `<select>`
+    // and the key editor (the only way out) with it. The engine select and the
+    // key editor must both still be reachable.
+    mount({
+      search: search({
+        provider: "exa",
+        base_url: null,
+        running: false,
+        key: { tier: "missing", missing: true, note: "no API key for search provider \"exa\"" },
+      }),
+    });
+
+    expect(screen.getByText("not running")).toBeInTheDocument();
+    expect(screen.getByLabelText("provider")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Change key" })).toBeInTheDocument();
+    // The Add control is for the *absent* state; this block is not absent.
+    expect(screen.queryByRole("button", { name: "Add [search]" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove [search]" })).toBeInTheDocument();
+  });
+
+  it("says why nothing runs without claiming the block is missing", () => {
+    mount({ search: search({ running: false, key: { tier: "missing", missing: true } }) });
+    // The consequence copy is still on screen — server tools are stripped — but
+    // it now sits beside a block that is rendered, not in place of it.
+    expect(screen.getByText(/server tools are stripped/)).toBeInTheDocument();
+    expect(screen.queryByText(/^Off —/)).not.toBeInTheDocument();
+  });
+
+  it("shows no not-running badge once the block can run", () => {
+    mount({ search: search({ running: true }) });
+    expect(screen.queryByText("not running")).not.toBeInTheDocument();
+  });
+});
 
 describe("Search — the off state", () => {
   it("offers to add [search] and names the consequence", () => {
@@ -116,8 +155,8 @@ describe("Search — the provider select", () => {
     const select = screen.getByLabelText("provider") as HTMLSelectElement;
     // `SearchManager::from_config` knows exactly these two, so there is no third
     // value the document could hold that this select could not render — and a
-    // provider it does not know makes `view.rs` return `None`, which loads as
-    // "Off" and the UI cannot ask for.
+    // provider it does not know keeps `view.rs` reporting the panel as absent,
+    // because neither the select nor any control here could offer a way off it.
     expect([...select.options].map((o) => o.value)).toEqual(["exa", "searxng"]);
   });
 

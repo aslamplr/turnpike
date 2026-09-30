@@ -57,6 +57,11 @@ pub struct SearchView {
     pub provider: String,
     pub max_loops: usize,
     pub base_url: Option<String>,
+    /// Whether the gateway would actually build a search manager from this block.
+    /// `false` on a block that exists and cannot run — an `exa` engine with no
+    /// resolvable key — which the panel must render as "not running" rather than
+    /// showing as absent: the key editor is the only way out of that state.
+    pub running: bool,
     pub key: KeyView,
 }
 
@@ -175,7 +180,7 @@ mod tests {
       ]
     }
   ],
-  "search": { "provider": "searxng", "max_loops": 5, "base_url": "http://127.0.0.1:8080", "key": { "tier": "not required", "missing": false } }
+  "search": { "provider": "searxng", "max_loops": 5, "base_url": "http://127.0.0.1:8080", "running": true, "key": { "tier": "not required", "missing": false } }
 }
 "#;
 
@@ -189,6 +194,22 @@ mod tests {
         assert_eq!(view.routes[0].targets[1].spec.as_deref(), Some("openai"));
         assert_eq!(view.routes[0].context_tokens, Some(200_000));
         assert_eq!(view.search.as_ref().unwrap().max_loops, 5);
+        assert!(view.search.as_ref().unwrap().running);
+    }
+
+    #[test]
+    fn an_exa_block_with_no_key_is_present_and_not_running() {
+        // The live defect: a `[search]` block the user saved with exa and no key
+        // is a block that exists and cannot run. It must arrive as a `View` with
+        // `running: false` — never as `search: null`, which the window reads as
+        // "Off" and which hides the key editor that is the only fix.
+        let raw = r#"{"config_path":"/c","listen":"l","providers":[],"routes":[],
+            "search":{"provider":"exa","max_loops":5,"base_url":null,"running":false,
+            "key":{"tier":"missing","missing":true,"note":"no API key for search provider \"exa\": run `turnpike setup`"}}}"#;
+        let view: ConfigView = serde_json::from_str(raw).unwrap();
+        let search = view.search.expect("a present block is not null");
+        assert!(!search.running);
+        assert!(search.key.missing);
     }
 
     #[test]

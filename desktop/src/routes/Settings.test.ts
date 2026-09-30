@@ -68,6 +68,7 @@ const searchView = (over: Partial<SearchView> = {}): SearchView => ({
   provider: "exa",
   base_url: "https://api.exa.ai",
   max_loops: 5,
+  running: true,
   key: { tier: "env EXA_API_KEY", missing: false },
   ...over,
 });
@@ -268,8 +269,8 @@ describe("Settings — adding [search]", () => {
   it("names the keyless engine, so the new block turns search on", async () => {
     await mount();
     // What the CLI answers for `{provider:"searxng"}`: a `[search]` block
-    // `SearchManager::from_config` accepts, so `view::search_view` reports it.
-    // `not required` is the tier searxng's key slot really reads.
+    // `SearchManager::from_config` accepts, so `view::search_view` reports it
+    // with `running: true`. `not required` is the tier searxng's key slot reads.
     fake("config_edit_apply", () =>
       session({
         view: {
@@ -291,8 +292,8 @@ describe("Settings — adding [search]", () => {
     // `set_search` is `if let Some` — so nothing was written, nothing was
     // reported, and the panel stayed "Off" with the Add button still under it.
     // `searxng` is what makes the block *work*: the schema default `exa` with no
-    // key is refused by `SearchManager::from_config`, so `view::search_view`
-    // would return `None` and render "Off" exactly as before.
+    // key is refused by `SearchManager::from_config`, so server tools would be
+    // stripped from every bridged request — a block that exists and cannot run.
     expect(lastCall("config_edit_apply")).toMatchObject({
       op: "set-search",
       args: { provider: "searxng" },
