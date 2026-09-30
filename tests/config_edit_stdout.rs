@@ -191,6 +191,123 @@ fn save_writes_a_reply_the_shell_can_parse() {
     std::fs::remove_dir_all(config.parent().expect("config parent")).ok();
 }
 
+/// The first run of all: **the config's directory does not exist yet**.
+///
+/// `setup` and the window both write `~/.config/turnpike/config.toml`, and
+/// creating that directory is part of the same save. Canonicalizing the config
+/// path fell back to canonicalizing its immediate parent — which on a machine
+/// where turnpike has never run is *also* absent — so the store opened as
+/// unusable and the wizard could not take a single key:
+///
+/// ```text
+/// the secret store at ~/.turnpike cannot be used (canonicalizing
+/// ~/.config/turnpike: No such file or directory (os error 2))
+/// ```
+///
+/// This drives the real binary down the real save path with the config nested
+/// two directories below the scratch root, neither of which exists, and then
+/// reads the store back through `--view` to prove the namespace resolved before
+/// the write is the same one resolved after it.
+#[test]
+fn save_succeeds_when_the_config_directory_does_not_exist_yet() {
+    let (scratch_config, home) = scratch("fresh-install");
+    let config = scratch_config
+        .parent()
+        .expect("scratch config parent")
+        .join(".config")
+        .join("turnpike")
+        .join("config.toml");
+    assert!(
+        !config.parent().expect("config parent").exists(),
+        "the fixture must not pre-create the config's directory"
+    );
+
+    // `--load` seeds the starter in memory; the missing directory is irrelevant.
+    let (loaded, stderr, ok) = run(&config, &home, &["--load"], "");
+    assert!(ok, "--load failed on a fresh install: {stderr}");
+    let session = one_json_object(&loaded, "--load", &stderr)
+        .get("session")
+        .expect("--load's reply carries a session")
+        .clone();
+
+    // Fill the skeleton the way the window does, then save. This is the op the
+    // bug report could not get past.
+    let session = edit(
+        &config,
+        &home,
+        &session,
+        "add-provider",
+        r#"{"id":"zen","spec":"anthropic","base_url":"https://opencode.ai/zen"}"#,
+        &stderr,
+    );
+    let session = edit(
+        &config,
+        &home,
+        &session,
+        "add-route",
+        r#"{"id":"zen-route","provider":"zen","model":"claude-sonnet-5"}"#,
+        &stderr,
+    );
+    let session = edit(
+        &config,
+        &home,
+        &session,
+        "stage-key",
+        r#"{"slot":"provider.zen","value":"sk-fresh-install"}"#,
+        &stderr,
+    );
+
+    let (saved, stderr, ok) = run(
+        &config,
+        &home,
+        &["--op", "save"],
+        &serde_json::to_string(&session).expect("re-serializing the session"),
+    );
+    assert!(ok, "save failed on a fresh install: {stderr}");
+    let saved = one_json_object(&saved, "save", &stderr);
+    assert!(
+        saved.get("error").is_none(),
+        "save refused on a fresh install: {saved}"
+    );
+    assert!(
+        !stderr.contains("cannot be used"),
+        "the store was reported unusable on a fresh install:\n{stderr}"
+    );
+
+    // The save both created the config's missing directories and wrote the file,
+    // and made the store under a root that did not exist either.
+    assert!(config.exists(), "save did not write {}", config.display());
+    assert!(
+        home.join("master.key").exists(),
+        "save did not create the store at {}",
+        home.display()
+    );
+
+    // The namespace resolved *before* the directory existed must be the one
+    // resolved after — otherwise the key was written somewhere unreadable.
+    let (viewed, stderr, ok) = run(
+        &config,
+        &home,
+        &["--view"],
+        &serde_json::to_string(saved.get("session").expect("save carries a session"))
+            .expect("re-serializing the session"),
+    );
+    assert!(ok, "--view failed after a fresh-install save: {stderr}");
+    let view = one_json_object(&viewed, "--view", &stderr);
+    let zen = view["view"]["providers"]
+        .as_array()
+        .expect("the view carries a provider list")
+        .iter()
+        .find(|p| p["id"] == "zen")
+        .unwrap_or_else(|| panic!("zen is missing from the view: {viewed}"));
+    assert_eq!(
+        zen["key"]["tier"], "store",
+        "the key written on the first run did not read back from the store: {viewed}"
+    );
+
+    std::fs::remove_dir_all(scratch_config.parent().expect("config parent")).ok();
+}
+
 /// The store tier of the view, end to end.
 ///
 /// It cannot be asserted from `setup::cli`'s inline tests: `cli::view` opens the

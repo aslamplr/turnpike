@@ -48,8 +48,19 @@ how a user moves the store off a synced directory.
 
 One `~/.turnpike/` can serve several config files, so each config gets its own
 **namespace**: the low 64 bits of FNV-1a over the canonicalized absolute config
-path, formatted as 16 lowercase hex chars. Five lines of code, no dependency,
-stable forever, and legible enough to grep for in `secrets.toml`.
+path, formatted as 16 lowercase hex chars. No dependency, stable forever, and
+legible enough to grep for in `secrets.toml`.
+
+Canonicalizing a path that does not exist yet needs its own rule, because the
+first save has to hash the namespace **before** it creates the file — on a fresh
+install, before it creates any of the directories above it either. So a missing
+tail is resolved against the **deepest ancestor that does exist**: that ancestor
+is canonicalized (resolving symlinks in the part of the path that is real) and
+the missing names are appended verbatim. The namespace is therefore identical
+before and after the wizard writes the config, and independent of how many
+directories are missing. Falling back to the file's immediate parent cannot do
+this — on a first run that parent is itself absent, which is what made
+`~/.config/turnpike/config.toml` report an unusable store.
 
 ```toml
 version = 1

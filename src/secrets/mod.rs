@@ -270,23 +270,51 @@ pub fn namespace(config_path: &Path) -> Result<String, StoreError> {
     Ok(format!("{hash:016x}"))
 }
 
-/// Canonicalize a config path that may not exist yet (the wizard writes the
-/// first config). Falls back to canonicalizing the parent and joining the file
-/// name, so the namespace is the same before and after the file appears.
+/// Canonicalize a config path that may not exist yet.
+///
+/// The wizard writes the first config, and on a fresh install **not even its
+/// directory exists** — `~/.config/turnpike/` is created by the very save that
+/// needs this namespace. So the deepest existing ancestor is canonicalized
+/// (resolving symlinks in the part of the path that is real) and the missing
+/// tail is appended verbatim. That makes the namespace the same before and
+/// after the file appears, and independent of how many directories are missing
+/// — which a fallback to the immediate parent could not manage, because that
+/// parent is itself absent on the first run.
 fn canonical_config_path(path: &Path) -> Result<PathBuf, StoreError> {
     if let Ok(c) = std::fs::canonicalize(path) {
         return Ok(c);
     }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| StoreError::Path(format!("{} has no parent directory", path.display())))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| StoreError::Path(format!("{} has no file name", path.display())))?;
-    let parent = std::fs::canonicalize(parent)
-        .map_err(|e| StoreError::Path(format!("canonicalizing {}: {e}", parent.display())))?;
-    Ok(parent.join(name))
+
+    // Walk up until an ancestor resolves, collecting the names that did not —
+    // in reverse, then flipped, so the tail keeps its own order.
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    let base = loop {
+        if let Ok(c) = std::fs::canonicalize(cursor) {
+            break c;
+        }
+        let name = cursor
+            .file_name()
+            .ok_or_else(|| StoreError::Path(format!("{} has no file name", path.display())))?;
+        missing.push(name.to_os_string());
+        // A bare relative name (`config.toml`) has an empty parent; its base is
+        // the current directory, which is what canonicalizing `.` resolves.
+        cursor = match cursor.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            Some(_) => Path::new("."),
+            None => {
+                return Err(StoreError::Path(format!(
+                    "cannot find an existing directory above {}",
+                    path.display()
+                )))
+            }
+        };
+    };
+    let mut tail = PathBuf::new();
+    for name in missing.iter().rev() {
+        tail.push(name);
+    }
+    Ok(base.join(tail))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -593,6 +621,48 @@ pub(crate) mod tests {
         let other = root.join("other.toml");
         std::fs::write(&other, "").unwrap();
         assert_ne!(a, namespace(&other).unwrap());
+    }
+
+    /// The first run of all: **no directory above the config exists yet**.
+    ///
+    /// `setup` writes `~/.config/turnpike/config.toml`, and creating that
+    /// directory is part of the same save. Canonicalizing only the immediate
+    /// parent therefore failed with ENOENT on a machine where turnpike had
+    /// never run, which `open` reported as an unusable store — the wizard
+    /// bailing out before it could take a single key.
+    #[test]
+    fn namespace_survives_a_fresh_install_where_no_parent_exists() {
+        let root = temp_root("freshnest");
+        let cfg = root.join(".config").join("turnpike").join("config.toml");
+        assert!(
+            !cfg.parent().unwrap().exists(),
+            "the fixture must not have the config's directory"
+        );
+
+        let before = namespace(&cfg).expect("a fresh install must have a namespace");
+        assert_eq!(before.len(), 16);
+
+        // And the same namespace once the wizard's save has created the path —
+        // the store the keys were written into must be the one read back.
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "").unwrap();
+        assert_eq!(before, namespace(&cfg).unwrap());
+    }
+
+    /// A missing directory chain deeper than one level, and a symlinked
+    /// ancestor, both resolve to the same namespace as the real path.
+    #[test]
+    fn namespace_resolves_missing_dirs_through_the_deepest_real_ancestor() {
+        let root = temp_root("deepnest");
+        let deep = root.join("a").join("b").join("c").join("config.toml");
+        let ns = namespace(&deep).expect("a three-deep missing tail must resolve");
+        std::fs::create_dir_all(deep.parent().unwrap()).unwrap();
+        std::fs::write(&deep, "").unwrap();
+        assert_eq!(ns, namespace(&deep).unwrap());
+
+        // Distinct missing tails must not collapse to one namespace.
+        let sibling = root.join("a").join("b").join("d").join("config.toml");
+        assert_ne!(ns, namespace(&sibling).unwrap());
     }
 
     fn status_ok() -> StoreStatus {
