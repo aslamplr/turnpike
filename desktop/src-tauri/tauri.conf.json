@@ -3,9 +3,9 @@
   "productName": "turnpike",
   "identifier": "dev.turnpike.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run stage-cli && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run stage-cli && npm run build",
     "frontendDist": "../dist"
   },
   "app": {

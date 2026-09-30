@@ -622,15 +622,24 @@ caught locally.
 ```bash
 cd desktop
 npm install
-npm run stage-cli      # builds the CLI and stages it as the bundle's payload
-npm run tauri dev      # dev window + tray, watching src/ and src-tauri/
+npm run tauri dev      # stages the CLI payload, then opens the dev window + tray
 ```
 
-`npm run stage-cli` is **required, not optional**: `tauri-build` hard-errors on a bundle
-resource that is not there, so `cargo check`, `cargo test`, `cargo clippy` and `tauri
-build` all fail inside `src-tauri/` until `src-tauri/binaries/turnpike-cli` exists. The
-release workflow gets that same file from its `download-artifact` step, so a CI build
-never needs a local one.
+`tauri-build` hard-errors on a bundle resource that is not there, and the bundle's CLI
+payload (`src-tauri/binaries/turnpike-cli`, `.exe` on Windows) is **gitignored** — a
+build input the release workflow gets from `download-artifact`. So the first build on a
+fresh clone needs it staged, and `tauri dev` / `tauri build` now do that themselves:
+`beforeDevCommand` and `beforeBuildCommand` run `npm run stage-cli` first, which builds
+the CLI release binary and copies it into place. `npm run stage-cli` alone does the same
+thing when you want it without a build, and it skips both steps when the staged payload
+is already current, so a repeat dev start costs nothing. It also leaves the payload
+alone when one is already staged from elsewhere and no local release binary exists to
+compare against — which is the CI case, where the payload arrives from
+`download-artifact` and only the desktop crate is built.
+
+Direct `cargo check`, `cargo test` and `cargo clippy` inside `src-tauri/` do **not** run
+those hooks, so they still fail until the payload is staged — run `npm run stage-cli` by
+hand for those.
 
 `@tauri-apps/cli` is a devDependency, so there is no global `cargo install
 tauri-cli`. A **`turnpike` binary must exist** — the supervisor resolves it from

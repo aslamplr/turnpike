@@ -69,8 +69,9 @@ cargo test        # inline #[cfg(test)] modules per file
   It supervises the same `turnpike` binary **and bundles a copy of it** as a `bundle.resources`
   payload (`src/cli_install.rs` installs a CLI to `PATH` — from that payload on Windows, from a
   release download on macOS; `src/update.rs` is the auto-updater) —
-  so the crate cannot be built until that payload is staged (`npm run stage-cli`), because
-  `tauri-build` hard-errors on the missing resource. Ships **ad-hoc signed** — no Apple account,
+  so the crate cannot be built until that payload is staged (`npm run stage-cli` —
+  `tauri dev`/`tauri build` now run it for you through `beforeDevCommand`/`beforeBuildCommand`),
+  because `tauri-build` hard-errors on the missing resource. Ships **ad-hoc signed** — no Apple account,
   no notarization — from `release.yml`'s desktop jobs, which build after the CLI jobs and consume
   their binaries, so a slow Tauri build cannot cost the CLI its assets. Design in `docs/desktop.md`.
 
