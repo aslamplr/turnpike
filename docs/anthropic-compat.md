@@ -148,9 +148,11 @@ logs usage at `message_start` will under-count. This is documented behavior in
 ## Resolved divergences
 
 Nine divergences and one doc correction were recorded here on 2026-10-07. All
-ten are closed as of 0.1.11; each is asserted as a plain `PASS` in the probe now,
-and the list is kept as the record of what moved, because a reader who remembers
-the old behavior needs to know which way the code went.
+ten are fixed in 0.1.12: each ships with its assertion flipped to a plain
+`check()`, a full probe run against the build that carries them reports
+`PASS 76` with `KNOWN 0` and `CHANGED 0`, and the list is kept as the record
+of what moved, because a reader who remembers the old behavior needs to know
+which way the code went.
 
 The old shape/value split is still the useful distinction when asking whether a
 client would have *rendered* one. A **shape** divergence changed what the
