@@ -687,7 +687,8 @@ mod tests {
 
     #[test]
     fn reasoning_content_maps_to_thinking_then_text() {
-        let mut c = StreamConverter::new("msg_1".into(), "m".into(), 0).with_options(&wants_thinking());
+        let mut c =
+            StreamConverter::new("msg_1".into(), "m".into(), 0).with_options(&wants_thinking());
         let mut all = Vec::new();
         all.extend(c.process(&chunk(json!({"reasoning_content": "hmm"}), None)));
         all.extend(c.process(&chunk(json!({"content": "answer"}), None)));
