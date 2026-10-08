@@ -19,8 +19,8 @@ module provides the providers and `src/proxy.rs` runs the loop.
    takes the request straight through (with server tools **dropped** when
    there is no search provider — an unexecutable tool must not reach the
    model).
-3. **Loop.** Every iteration sends the full conversation **non-streaming**
-   upstream. A **forced** client `tool_choice` is relaxed to `"auto"` before
+3. **Loop.** Every iteration sends the full conversation upstream. A
+   **forced** client `tool_choice` is relaxed to `"auto"` before
    the first iteration, because the middleware executes the search itself:
    reasoning-mode upstreams reject a forced choice outright —
    `400 invalid_request_error: Thinking mode does not support this
@@ -34,23 +34,32 @@ module provides the providers and `src/proxy.rs` runs the loop.
    - If the model answers with **no tool calls**, or with any tool call that
      isn't `web_search`, the loop ends with that response. Only when *every*
      call is turnpike's `web_search` does the loop continue — mixed client-tool
-     calls pass through to the client.
+     calls are handed back to the client *and* their searches still run, since
+     their `server_tool_use` blocks are already on the wire.
    - Otherwise the assistant tool-call turn is appended to the conversation,
      each search executes against the provider, and the results are appended
      as `role: "tool"` messages (`tool_call_id` matching the call).
    - Iterations run `0..=max_loops`; exhausting the budget logs a warning and
-     terminates with whatever the last response was (its unexecuted
-     `web_search` tool_use is dropped from the final answer).
+     terminates with whatever the last response was. The last iteration's
+     searches still execute on the streaming path — a `server_tool_use` block
+     without its result is invalid grammar.
 4. **Assemble.** The final response is translated back to Anthropic shape,
-   usage **summed across all iterations**, and every executed search is
-   prepended as a `server_tool_use` + `web_search_tool_result` trace pair —
-   the block types Anthropic itself emits for server tools, which Claude
-   clients render natively ("Searched the web…", citation chips, source list).
-5. **Frame.** If the client asked to stream, the final JSON is rendered as a
-   complete Anthropic SSE sequence (`anthropic_json_to_sse`, with
-   `server_tool_use` blocks emitted verbatim) rather than streaming
-   mid-loop tokens — the client sees a valid SSE stream, it just starts after
-   the searches finish (mirroring Ollama's buffered writer).
+   usage **summed across all iterations**, and every executed search appears
+   as a `server_tool_use` + `web_search_tool_result` trace pair — the block
+   types Anthropic itself emits for server tools, which Claude clients render
+   natively ("Searched the web…", citation chips, source list).
+5. **Frame.** The two client shapes take different paths, and the difference
+   is *when* bytes reach the client, not what is searched:
+   - **Non-streaming** (`stream: false`) — the loop above runs buffered and
+     the assembled JSON is the response.
+   - **Streaming** — every iteration is streamed from the upstream and
+     forwarded as it arrives. `web_search` calls open `server_tool_use`
+     blocks as the model produces them, the searches run at that iteration's
+     `finish_reason`, the `web_search_tool_result` blocks are emitted, and the
+     loop re-invokes on the same SSE stream. This is Anthropic's own
+     server-tool streaming grammar, and it means the client paints tokens
+     while the model is still generating rather than after every search has
+     finished.
 
 Search failures don't kill the request: the tool result becomes a
 `search error: …` string and the trace pair is emitted in error form (see

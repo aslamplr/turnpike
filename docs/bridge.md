@@ -160,15 +160,42 @@ paths diverge (see [proxy.rs](gateway.md)'s `bridge()` and
    non-streaming or streaming call, translated both ways — the pass-through
    behavior with server tools stripped from the request.
 2. **Search middleware configured and a `web_search` tool declared:** the
-   request goes **non-streaming** for all loop iterations, and the client's
-   `stream` flag is honored only at the end, by rendering the final JSON as
-   a complete SSE sequence (`anthropic_json_to_sse`). Interleaving a tool
-   loop with a live token stream is not worth the complexity. The rendition
-   is therefore valid SSE but not *incremental*: each block is emitted as
-   `content_block_start` → one whole-block `content_block_delta` → `stop`,
-   so a client can paint whole blocks and never tokens. The client-visible
-   consequence is recorded as divergence 1 in
-   [anthropic-compat.md](anthropic-compat.md).
+   agentic loop runs (see [search.md](search.md)). A **non-streaming** client
+   gets the buffered loop: all iterations go upstream non-streaming and the
+   assembled JSON is the response. A **streaming** client gets the live loop:
+   every iteration is streamed from the upstream and forwarded as it arrives,
+   `web_search` calls open `server_tool_use` blocks as the model produces
+   them, the searches run at that iteration's `finish_reason`, and the
+   `web_search_tool_result` blocks are emitted before the loop re-invokes on
+   the same SSE stream. Both paths produce the same event grammar; the
+   difference is *when* the bytes arrive, and only the streaming path is
+   incremental.
+
+Three request-driven response behaviors sit on top of both paths, because the
+Anthropic contract makes the response depend on what the request asked for:
+
+- **Thinking is gated on the request.** The upstream returns
+  `reasoning_content` on nearly every call, so a thinking block is only
+  emitted when the client sent `thinking: {type: "enabled" | "adaptive"}`. An
+  absent parameter and `{"type": "disabled"}` both suppress it.
+- **`stop_sequences` are matched locally, not forwarded.** OpenAI documents
+  that "the returned text will not contain the stop sequence", so once a hit
+  fires the evidence is gone — `finish_reason` is `"stop"` for a natural end
+  and a stop-sequence hit alike. `request_to_openai` therefore does **not**
+  emit `stop`; the bridge keeps the list and truncates, which is what
+  Anthropic does server-side. Non-streaming truncates in
+  `apply_stop_sequences`; the stream converter holds back
+  `max(len(stops)) - 1` characters per delta so a sequence straddling two
+  deltas is still detected. The cost is that the model generates a few tokens
+  past the sequence, bounded by `max_tokens`. A sequence spanning two adjacent
+  *text blocks* is not detected — the search is per block, and a bridged
+  answer is one block in practice.
+- **Thinking blocks carry a synthetic `signature`.** The bridge synthesizes
+  thinking from `reasoning_content`, so there is no real signature to carry;
+  `synthetic_signature()` emits base64 of a SHA-256 over the block's own text,
+  prefixed in the hash input with `turnpike-synthetic:` so the value can never
+  be mistaken for real provenance. The stream emits it as a `signature_delta`
+  before `content_block_stop`, as Anthropic's grammar requires.
 
 Both paths converge on the same translation functions above; only the framing
 differs. See [search.md](search.md) for the loop itself.

@@ -68,11 +68,17 @@ Probed against turnpike 0.1.10, gateway at `127.0.0.1:8710`, on 2026-10-07:
 `claude -p "Reply with exactly: COMPAT-OK"` through the gateway, which returned
 `COMPAT-OK`.
 
-The nine divergences below account for the remaining lines, and each reports
-`KNOWN` when the probe can reproduce it and `SKIP` when the *upstream* doesn't
-exercise it — this model sometimes emits no reasoning block, and sometimes
-ignores a stop sequence. So the `KNOWN`/`SKIP` split moves between runs
-(observed 9/2 and 6/3) while `PASS` and `FAIL` do not.
+The nine divergences recorded here accounted for the remaining lines, each
+reporting `KNOWN` when the probe could reproduce it and `SKIP` when the
+*upstream* didn't exercise it — this model sometimes emits no reasoning block,
+and sometimes ignores a stop sequence, so the `KNOWN`/`SKIP` split moved
+between runs (observed 9/2 and 6/3) while `PASS` and `FAIL` did not.
+
+All ten are now fixed (see [Resolved divergences](#resolved-divergences)), so a
+run should report `KNOWN 0` and `CHANGED 0`. A `CHANGED` would mean a fix
+landed without this doc being updated, and a `FAIL` still always means
+something new. A `SKIP` remains expected wherever the upstream, not the
+gateway, decides whether a check can run at all.
 
 The configuration under test matters for what could be exercised: all three
 routes bridged Anthropic → OpenAI (`zen-go`/`deepseek-v4.1-flash`) with an
@@ -88,10 +94,10 @@ reachable (see [What this does not cover](#what-this-does-not-cover)).
 | Security | `Origin` header → `403 permission_error`; non-loopback `Host` → `403 permission_error` |
 | Non-streaming | full envelope; `usage`; `system` as string **and** as text blocks; multi-turn history; `temperature`/`top_p`/`stop_sequences`/`metadata`; `max_tokens` honored (`stop_reason: max_tokens`) |
 | Tools | `tool_choice` `auto`/`any`/`tool`/`none`; `tool_use` blocks with parsed `input`; `stop_reason: tool_use`; `tool_result` round-trip including `is_error` and parallel results matched by `tool_use_id` |
-| Blocks | base64 image; `thinking` block replayed in history (with and without a signature); `thinking` parameter accepted and dropped |
+| Blocks | base64 image; `thinking` block replayed in history (with and without a signature); `thinking` blocks emitted with a `signature` only when the request asked for thinking |
 | Resolution | route id, upstream-model match, `provider/model`, `provider:model` — with the requested id echoed in `model` and the upstream id never leaking |
-| Streaming | `content-type`; framing; balanced 0-based `content_block_start`/`stop`; delta types; `message_delta` carrying `stop_reason` + `output_tokens`; `input_json_delta` fragments concatenating to valid JSON; truncated streams closing cleanly; multi-delta text assembly; plain-path incrementality (the control for divergence 1) |
-| Search | the full agentic loop (`server_tool_use` + `web_search_tool_result` with real results + thinking + text), its SSE rendition, graceful degradation on a non-search turn, and both `web_search_20250305` and the current `web_search_20260209` |
+| Streaming | `content-type`; framing; balanced 0-based `content_block_start`/`stop`; delta types; `message_delta` carrying `stop_reason` + `output_tokens`; `input_json_delta` fragments concatenating to valid JSON; truncated streams closing cleanly; multi-delta text assembly; incrementality on both the plain and search paths |
+| Search | the full agentic loop (`server_tool_use` + `web_search_tool_result` with real results + thinking + text), its live SSE rendition and its timing spread, graceful degradation on a non-search turn, and both `web_search_20250305` and the current `web_search_20260209` |
 | Error shaping | a **non-JSON** upstream error body still comes back as a valid Anthropic error envelope |
 
 ### The message envelope
@@ -123,10 +129,13 @@ indices always refer to an open block and carry a known `delta.type`;
 concatenate to valid JSON (`{"city": "Paris"}` observed); a `max_tokens`
 truncation still closes with `message_delta`/`message_stop` rather than hanging.
 
-On the plain path the stream is genuinely *incremental* — a block's deltas arrive
-in many pieces (57 across two blocks in the observed run, spread over 3.3s),
-which the probe asserts as a positive control. The search path is the exception:
-[divergence 1](#1-the-search-paths-sse-rendition-is-not-incremental).
+The stream is genuinely *incremental* — a block's deltas arrive in many pieces
+(57 across two blocks in the observed run, spread over 3.3s), which the probe
+asserts. This holds on the **search** path too, now that the middleware loop
+streams every iteration instead of synthesizing the message and re-emitting it:
+[divergence 1](#1-the-search-path-sse-rendition-was-not-incremental) is closed,
+and the probe asserts the same property there plus the timing split that the
+old buffered rendition produced.
 
 One divergence in *values* rather than shape: `message_start` reports an
 **estimated** `input_tokens` (the local `estimate_tokens()` figure — 6 in the
@@ -136,149 +145,149 @@ Anthropic puts the true count in `message_start`. The SDKs merge deltas via
 logs usage at `message_start` will under-count. This is documented behavior in
 [bridge.md](bridge.md), not a bug.
 
-## Known divergences
+## Resolved divergences
 
-Each of these is asserted by a `KNOWN` check in the probe. Ordered by how
-likely a real client is to hit it, and — where that ties — by how visible it is.
+Nine divergences and one doc correction were recorded here on 2026-10-07. All
+ten are closed as of 0.1.11; each is asserted as a plain `PASS` in the probe now,
+and the list is kept as the record of what moved, because a reader who remembers
+the old behavior needs to know which way the code went.
 
-They split into two kinds, which matters when asking whether a client will
-*render* them. A **shape** divergence changes what the response contains or how
-it is framed, so a renderer can see it: 1 (delivery), 6 and 7 (thinking blocks),
-8 and 9 (the model catalog). The rest change a value, a status, or a call count
-inside an otherwise well-formed response (2–5), so they surface only if the
-client displays that field. Claude Desktop is a first-party client with dedicated
-UI for thinking and for the model picker, so the shape divergences are where a
-rendering problem would show up — and Desktop is not exercised by this probe (see
-[What this does not cover](#what-this-does-not-cover)).
+The old shape/value split is still the useful distinction when asking whether a
+client would have *rendered* one. A **shape** divergence changed what the
+response contained or how it was framed — 1, 6, 7, 8, 9. The rest changed a
+value, a status, or a call count inside an otherwise well-formed response — 2–5.
 
-### 1. The search path's SSE rendition is not incremental
+### 1. The search path's SSE rendition was not incremental — **fixed**
 
-`anthropic_json_to_sse()` ([src/proxy.rs:1151](src/proxy.rs:1151)) synthesizes
-the whole message first and then re-emits it as events: each block becomes
-`content_block_start` (empty) → **one** `content_block_delta` carrying the entire
-block → `content_block_stop`, and a `web_search_tool_result` carries its whole
-payload in the `content_block_start` with no delta at all. Observed: three
-deltas across four blocks.
+`anthropic_json_to_sse()` synthesized the whole message and then re-emitted it,
+so each block arrived as one whole-block delta; and the loop ran every iteration
+non-streaming upstream. Measured: a search-enabled turn stalled 38.8s and then
+delivered every event inside 4ms, against a plain path that streamed 57 deltas
+over 3.3s.
 
-The bytes are valid Anthropic SSE — the probe asserts the grammar holds — but it
-is not a *stream*: a client can paint whole blocks and never tokens. That is a
-property of the response's shape, not of when the bytes arrive, which is why a
-search-enabled turn renders as one lump even once delivery starts. It reproduces
-on Ollama's gateway too, because that gateway's buffering writer is what this one
-mirrors.
+Both halves are gone. The loop streams every iteration from the upstream and
+forwards it as it arrives: `web_search` calls open `server_tool_use` blocks as
+the model produces them, the searches run at that iteration's `finish_reason`,
+`web_search_tool_result` is emitted, and the loop re-invokes on the same SSE
+stream. That is Anthropic's own server-tool streaming grammar, and
+`anthropic_json_to_sse` is deleted. The non-streaming path is unchanged and still
+buffered — there is no stream to interleave with, and it stays the reference
+implementation.
 
-Worth separating from the stall that precedes it, because the two are easy to
-conflate — the first is timing, the second is this divergence:
+The probe asserts the same property it uses as the plain path's positive control
+(a block's delta index repeats) and measures the timing split, which is the part
+that cannot be read off the event list.
 
-| | first byte | deltas | spread |
-| --- | --- | --- | --- |
-| plain streaming, no tools | 0.98s | 57 | 3.29s |
-| **with a `web_search` tool** | **38.8s** | 3 | **4ms** |
-| trivial prompt | 0.86s | 8 | 0.14s |
+### 2. A stop-sequence hit was reported as `end_turn` — **fixed**
 
-The 38.8s is the middleware running every loop iteration non-streaming upstream
-([proxy.rs:648](src/proxy.rs:648)) — a deliberate choice, documented in
-[bridge.md](bridge.md) and [search.md](search.md), so no token *can* arrive
-before the searches finish. The 4ms spread after it is this divergence. The plain
-path is genuinely incremental, and the probe asserts that as a positive control
-(a block's deltas repeat there; here they cannot).
+`map_finish()` mapped the upstream's `finish_reason: "stop"` to `end_turn`, and
+`stop_sequence` was hardcoded `null` on both paths, so a hit was
+indistinguishable from a natural end.
 
-### 2. A stop-sequence hit is reported as `end_turn`
+The fix is **not** the one this doc originally proposed. It said the bridge
+"knows the stop list it forwarded and can check whether the content tail matches
+one" — but OpenAI documents the opposite: *"The returned text will not contain
+the stop sequence."* The observed upstream stripped it too (the reply ended at
+exactly `'one two '`, with `BANANA` absent), so a tail match could never fire.
 
-`map_finish()` ([src/translate/mod.rs:395](src/translate/mod.rs:395)) maps the
-upstream's `finish_reason: "stop"` to `end_turn`, and `stop_sequence` is
-hardcoded `null` on both paths — [mod.rs:386](src/translate/mod.rs:386),
-[proxy.rs:1176](src/proxy.rs:1176), [proxy.rs:1259](src/proxy.rs:1259).
+The bridge now does what Anthropic does server-side: it does **not** forward
+`stop` upstream, and truncates locally — `apply_stop_sequences` for the
+non-streaming response, and a hold-back buffer in the stream converter
+(`max(len(stops)) - 1` characters, so a sequence straddling two deltas is still
+detected). `stop_reason: "stop_sequence"` and `stop_sequence: <matched>` are
+reported. Two consequences are worth stating plainly: the model generates a few
+tokens past the sequence, bounded by `max_tokens`; and a sequence spanning two
+adjacent *text blocks* is not detected, because the search is per block (a
+bridged answer is one block in practice).
 
-Observed: sending `stop_sequences: ["BANANA"]` truncated the reply at exactly
-`'one two '` — the sequence fired — yet the envelope reported
-`stop_reason: "end_turn", stop_sequence: null`.
+### 3. `disable_parallel_tool_use` was dropped — **fixed**
 
-OpenAI's `stop` is genuinely ambiguous between a natural end and a stop-sequence
-hit, so the bridge cannot recover it from `finish_reason` alone. It does not
-have to: it knows the stop list it forwarded ([mod.rs:61](src/translate/mod.rs:61))
-and can check whether the content tail matches one. A client that branches on
-`stop_reason == "stop_sequence"` never fires today.
+`map_tool_choice()` read only `type` and `name`, so the flag never reached the
+upstream. It now translates to OpenAI's `parallel_tool_calls: false`, which is a
+sibling of `tools` in chat-completions rather than a field of `tool_choice`.
 
-### 3. `disable_parallel_tool_use` is dropped
+The probe's check here is deliberately weaker than the others. Whether a provider
+*honours* the cap is the provider's business, so the check asserts only that the
+request is accepted; the real assertion — that the field reaches the upstream
+payload — is a unit test on `request_to_openai`, because it cannot be observed
+from outside the gateway.
 
-`map_tool_choice()` ([src/translate/mod.rs:142](src/translate/mod.rs:142)) reads
-only `type` and `name`, so the flag never reaches the upstream.
+### 4. `count_tokens` ignored `tools` — **fixed**
 
-Observed: `{type: "any", disable_parallel_tool_use: true}` still returned **2**
-`tool_use` blocks. On current Anthropic models the flag is live — it still works
-with `auto` to cap the turn at one call — so a client relying on it for
-exactly-one-call gets parallel calls instead.
+`estimate_tokens()` walked only `system` and `messages`. It now walks `tools`
+too, through the same `collect_strings` helper. Anthropic's `count_tokens` counts
+tool definitions and a Claude Code request is dominated by its tool list, so the
+estimate was worst exactly where it mattered most.
 
-### 4. `count_tokens` ignores `tools`
+The base64 nit is fixed in the same direction: a `base64` image source's `data`
+payload is no longer walked, because base64 length is unrelated to token count
+and walking it inflated the estimate by roughly four characters per token of
+base64. Image tokens are consequently *under*-counted rather than over-counted;
+no per-image constant was invented to replace the walk.
 
-`estimate_tokens()` ([src/proxy.rs:1536](src/proxy.rs:1536)) walks only `system`
-and `messages`; `tools` is never visited.
+### 5. `count_tokens` and `/v1/messages` disagreed on unknown models — **fixed**
 
-Observed, with the two payloads differing only by the `tools` block: `base=1`,
-and `1` again with twenty tools carrying large descriptions. Anthropic's
-`count_tokens` counts tools, so the estimate is worst exactly where it matters
-most — Claude Code's requests are dominated by their tool list. In the other
-direction, base64 image `data` and `media_type` *are* walked (only
-`type`/`id`/`name` keys are skipped, [proxy.rs:1549](src/proxy.rs:1549)), so an
-image inflates the estimate by roughly four characters per token of base64.
+`count_tokens` returned `400 invalid_request_error` where `forward()` returns
+`404 not_found_error`. The same unknown id now gives the same error type on both
+paths.
 
-### 5. `count_tokens` and `/v1/messages` disagree on unknown models
+### 6. `thinking` blocks carried no `signature` — **fixed, synthetically**
 
-[src/proxy.rs:291](src/proxy.rs:291) passes `StatusCode::BAD_REQUEST` to
-`resolve_error`; `forward()` returns `404`. Observed, same condition:
+Thinking is synthesized from the upstream's `reasoning_content`, so there is no
+real signature to carry — Anthropic's is a cryptographic attestation only it can
+produce. The bridge now emits a **clearly synthetic** one: base64 of a SHA-256
+over the block's own text, with `turnpike-synthetic:` prefixed in the hash input
+so the value can never be mistaken for real provenance. The stream emits it as a
+`signature_delta` before `content_block_stop`, as Anthropic's grammar requires.
 
-```
-POST /v1/messages                -> 404 not_found_error
-POST /v1/messages/count_tokens   -> 400 invalid_request_error
-```
+That makes the block's *shape* valid for typed consumers, which was the actual
+divergence. It does not make replay to a real Anthropic endpoint work — a
+synthetic signature fails there exactly as a missing one did — and the bridge
+never forwards a signature upstream anyway (`translate_message` reads only
+`thinking`).
 
-### 6. `thinking` blocks carry no `signature`
+### 7. Thinking appeared when it was not requested — **fixed**
 
-[src/translate/mod.rs:335](src/translate/mod.rs:335) and
-[src/translate/stream.rs:124](src/translate/stream.rs:124) emit
-`{type, thinking}` only — no `signature`, and no `signature_delta` in the
-stream. The bridge synthesizes thinking from the upstream's
-`reasoning_content`, so there is no real signature to carry. Claude Code
-tolerates it (verified end-to-end), but a typed consumer that validates or
-re-serializes thinking blocks — and anything that later replays them to a real
-Anthropic endpoint — breaks.
+The upstream returns `reasoning_content` on essentially every call, and
+`thinking: {type: "disabled"}` was dropped by design, so thinking blocks appeared
+with no `thinking` parameter and even when the client explicitly disabled them.
 
-### 7. Thinking appears when it was not requested
+Thinking is now gated on the request: a block is emitted only for
+`{"type": "enabled"}` or `{"type": "adaptive"}`, and an absent parameter or
+`{"type": "disabled"}` suppresses it. This is the one fix that changes what
+Claude Code sees — thinking disappears unless it asked — which is why the
+verification section re-runs `claude -p` end to end.
 
-The upstream returns `reasoning_content` on essentially every call, so
-`thinking` blocks appear with no `thinking` parameter in the request — and even
-when the client sends `thinking: {type: "disabled"}`, which is dropped by design
-([mod.rs:135](src/translate/mod.rs:135)). Real Claude returns thinking only when
-asked. This is a property of the upstream model as much as of the bridge, but
-the client-visible behavior is the divergence.
+### 8. `GET /v1/models/{id}` was not routed — **fixed**
 
-### 8. `GET /v1/models/{id}` is not routed
+The router mounted `/v1/models` only, so retrieve-by-id was a plain `404` and
+`client.models.retrieve()` failed. The path is now served by `model_by_id`,
+returning the bare `ModelInfo` object — Anthropic does not wrap it in the list
+envelope — and a `404 not_found_error` for an unknown id.
 
-The router ([src/proxy.rs:107](src/proxy.rs:107)) mounts `/v1/models` only, so
-retrieve-by-id is a plain `404`. Anthropic exposes it for live
-capability/context-window discovery, so `client.models.retrieve()` fails.
+### 9. Model entries lacked `max_input_tokens` and `capabilities` — **fixed**
 
-### 9. Model entries lack `max_input_tokens` and `capabilities`
+`models()` now emits both. `max_input_tokens` is the route's context window from
+config (`effective_context_tokens`), `null` when the route declares none — never
+`max_tokens`, which Anthropic's shape defines as the *output* cap.
 
-`models()` ([src/proxy.rs:135](src/proxy.rs:135)) emits `type`, `id`,
-`display_name`, `created_at`, `max_tokens`, plus three turnpike-specific extras
-(`anthropic_family_tier`, `is_family_default`, `detail` — additive, and the
-desktop picker reads them). Anthropic has returned `max_input_tokens` (the
-context window) and `capabilities` since Mar 2026; there is no `context_window`
-field. A client doing capability discovery gets nothing. Note also that
-`max_tokens` here is the route's configured cap (1 000 000 in the probed
-config), which Anthropic's shape defines as the *output* cap.
+`capabilities` carries the documented key set — "keys are always present for all
+known capabilities" — with values describing what *turnpike* does, not what the
+upstream model could do. `server_tools.web_search` is computed from whether
+`[search]` is configured; `image_input` is true because `image_to_url()` bridges
+both base64 and url blocks; the rest are false because they are not implemented.
+`line` is the route's declared `family` when it names one of Anthropic's lines,
+and `null` otherwise.
 
-### Bonus: `/v1/messages/batches` is not a batch API
+### Bonus: `/v1/messages/batches` is not a batch API — **fixed**
 
-The router maps the path to the Messages handler
-([src/proxy.rs:111](src/proxy.rs:111)), so a well-formed batch envelope
-(`{"requests": [{custom_id, params}]}`) is decoded as a Messages body and
-rejected with `400 "model is required"`. The Message Batches API is
-unimplemented. [gateway.md](gateway.md) previously described this as "same
-handler: messages and batches share a family", which read as though batches
-worked; that row is now explicit about the refusal.
+The path mapped to the Messages handler, so a well-formed batch envelope
+(`{"requests": [{custom_id, params}]}`) was decoded as a Messages body and
+rejected with `400 "model is required"`. It now has its own handler returning a
+shaped `404 not_found_error` naming the Message Batches API as unimplemented.
+
+The API is still unimplemented. What changed is that the error says so, instead
+of looking like a malformed request.
 
 ## Operational notes
 
@@ -316,9 +325,11 @@ provider, not the gateway.
   design and needs an Anthropic-spec provider to exercise.
 - **Failover** — covering it would need a broken primary; the probed config's
   failover target was healthy throughout.
-- **`stream: true` against the search middleware's non-streaming loop** is
-  covered (the SSE rendition is asserted), but the upstream is contacted
-  non-streaming there by design.
+- **`stream: true` against the search middleware** is covered — the SSE
+  rendition and its timing spread are both asserted — and the loop streams each
+  iteration from the upstream, so the check exercises the live path.
+- **Claude Desktop's own rendering** of the search trace and the model picker is
+  not exercised; this probe is HTTP-level only.
 
 ## See also
 
