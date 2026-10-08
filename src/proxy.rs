@@ -877,8 +877,7 @@ async fn bridge(
         // Append the assistant tool-call turn, then execute each search and
         // append the results as tool messages.
         history.push(assistant_tool_call_turn(&calls));
-        let (trace_blocks, tool_messages) =
-            execute_search_calls(&search, &calls, iteration).await;
+        let (trace_blocks, tool_messages) = execute_search_calls(&search, &calls, iteration).await;
         trace.extend(trace_blocks);
         history.extend(tool_messages);
     }
@@ -2230,10 +2229,7 @@ display_name = "Sonnet 5"
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "not_found_error");
         assert!(
-            v["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("Batches"),
+            v["error"]["message"].as_str().unwrap().contains("Batches"),
             "message should name the API: {}",
             v["error"]["message"]
         );
@@ -2845,7 +2841,9 @@ api_key = "test-key"
             .filter_map(|v| v["index"].as_u64())
             .collect();
         assert!(
-            indices.iter().any(|i| indices.iter().filter(|j| *j == i).count() > 1),
+            indices
+                .iter()
+                .any(|i| indices.iter().filter(|j| *j == i).count() > 1),
             "a block's deltas must repeat on the search path too: {indices:?}"
         );
         // Every delta of the answer reaches the client, in order.
