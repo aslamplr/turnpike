@@ -11,6 +11,47 @@ pub mod stream;
 
 use serde_json::{json, Map, Value};
 
+/// Request intent that has to shape the *response*, carried into the
+/// translation layer.
+///
+/// Both fields exist for the same reason: the Anthropic contract makes the
+/// response depend on what the request asked for, and the OpenAI upstream
+/// destroys the evidence on the way through. A thinking block is only part of
+/// the contract when the client asked for thinking, and a stop-sequence hit is
+/// only recoverable if the bridge kept the list instead of forwarding it —
+/// OpenAI strips the sequence from the text it returns.
+#[derive(Debug, Clone, Default)]
+pub struct ResponseOptions {
+    /// The client sent `thinking: {type: "enabled" | "adaptive"}`. An absent
+    /// parameter and `{"type": "disabled"}` both mean no.
+    pub thinking_requested: bool,
+    /// The client's `stop_sequences`, which are **not** forwarded upstream.
+    /// See `request_to_openai` for why, and `apply_stop_sequences` for what
+    /// replaces them.
+    pub stop_sequences: Vec<String>,
+}
+
+impl ResponseOptions {
+    /// Read the options out of an Anthropic request body.
+    pub fn from_request(payload: &Value) -> Self {
+        Self {
+            thinking_requested: matches!(
+                payload.pointer("/thinking/type").and_then(Value::as_str),
+                Some("enabled") | Some("adaptive")
+            ),
+            stop_sequences: payload
+                .get("stop_sequences")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// Translate an Anthropic Messages request body into an OpenAI
 /// chat-completions request. `model` is the upstream (already remapped) id.
 pub fn request_to_openai(anthropic: &Value, model: &str) -> Result<Value, String> {
@@ -58,11 +99,17 @@ pub fn request_to_openai(anthropic: &Value, model: &str) -> Result<Value, String
     if let Some(t) = anthropic.get("top_p") {
         out.insert("top_p".into(), t.clone());
     }
-    if let Some(stops) = anthropic.get("stop_sequences").and_then(Value::as_array) {
-        if !stops.is_empty() {
-            out.insert("stop".into(), Value::Array(stops.clone()));
-        }
-    }
+    // `stop_sequences` is deliberately **not** forwarded as OpenAI's `stop`.
+    //
+    // OpenAI documents that "the returned text will not contain the stop
+    // sequence", so once it fires the evidence is gone: `finish_reason` is
+    // `"stop"` for a natural end and for a stop-sequence hit alike, and the
+    // text no longer carries the sequence to match against. The bridge
+    // therefore keeps the list and truncates locally (`apply_stop_sequences`,
+    // and the stream converter's hold-back buffer), which is what Anthropic
+    // does server-side and the only way `stop_reason: "stop_sequence"` can be
+    // reported at all. The cost is that the model generates a few tokens past
+    // the sequence, bounded by `max_tokens`.
 
     let mut tools: Vec<Value> = Vec::new();
     if let Some(list) = anthropic.get("tools").and_then(Value::as_array) {
@@ -118,6 +165,20 @@ pub fn request_to_openai(anthropic: &Value, model: &str) -> Result<Value, String
 
     if !tools.is_empty() {
         out.insert("tools".into(), Value::Array(tools));
+    }
+
+    // Anthropic's `disable_parallel_tool_use` has a direct OpenAI equivalent,
+    // but it is a *sibling* of `tools` in chat-completions, not a field of
+    // `tool_choice` — so it is read here rather than in `map_tool_choice`.
+    // Emitted whenever the client set it, even if `tool_choice` itself was
+    // dropped for referencing a tool that did not survive translation: the cap
+    // is about how many calls may come back, not about which tool.
+    if anthropic
+        .pointer("/tool_choice/disable_parallel_tool_use")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        out.insert("parallel_tool_calls".into(), json!(false));
     }
 
     let stream = anthropic
@@ -320,7 +381,12 @@ fn web_result_text(content: Option<&Value>) -> String {
 
 /// Map an OpenAI chat-completions (non-streaming) response to an Anthropic
 /// Messages response. `requested_model` is the client-facing id to echo back.
-pub fn response_to_anthropic(openai: &Value, requested_model: &str, id: &str) -> Value {
+pub fn response_to_anthropic(
+    openai: &Value,
+    requested_model: &str,
+    id: &str,
+    opts: &ResponseOptions,
+) -> Value {
     let choice = openai
         .get("choices")
         .and_then(Value::as_array)
@@ -330,9 +396,19 @@ pub fn response_to_anthropic(openai: &Value, requested_model: &str, id: &str) ->
     let message = choice.get("message").cloned().unwrap_or(Value::Null);
 
     let mut content: Vec<Value> = Vec::new();
-    if let Some(thinking) = message.get("reasoning_content").and_then(Value::as_str) {
-        if !thinking.is_empty() {
-            content.push(json!({"type": "thinking", "thinking": thinking}));
+    // Gated on the request: the upstream returns `reasoning_content` on
+    // essentially every call, so an ungated bridge surfaces thinking blocks to
+    // clients that never asked for them — and to one that explicitly sent
+    // `thinking: {type: "disabled"}`.
+    if opts.thinking_requested {
+        if let Some(thinking) = message.get("reasoning_content").and_then(Value::as_str) {
+            if !thinking.is_empty() {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": thinking,
+                    "signature": synthetic_signature(thinking),
+                }));
+            }
         }
     }
     if let Some(text) = message.get("content").and_then(Value::as_str) {
@@ -376,7 +452,7 @@ pub fn response_to_anthropic(openai: &Value, requested_model: &str, id: &str) ->
         .and_then(Value::as_u64)
         .unwrap_or(0);
 
-    json!({
+    let mut response = json!({
         "id": id,
         "type": "message",
         "role": "assistant",
@@ -389,7 +465,106 @@ pub fn response_to_anthropic(openai: &Value, requested_model: &str, id: &str) ->
             "cache_read_input_tokens": cached,
             "output_tokens": output,
         }
-    })
+    });
+    apply_stop_sequences(&mut response, &opts.stop_sequences);
+    response
+}
+
+/// Truncate a translated response at the first stop sequence, the way
+/// Anthropic does server-side.
+///
+/// This is the whole reason the bridge does not forward `stop` upstream: by
+/// the time the text comes back, OpenAI has already removed the sequence, so
+/// there is nothing left to detect a hit with. Doing it here keeps
+/// `stop_reason` and `stop_sequence` truthful instead of reporting `end_turn`
+/// for both outcomes.
+///
+/// A sequence that straddles two adjacent text blocks is not detected — the
+/// search is per block. In practice a bridged answer is one text block.
+pub fn apply_stop_sequences(response: &mut Value, stops: &[String]) {
+    if stops.is_empty() {
+        return;
+    }
+    let Some(blocks) = response.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for i in 0..blocks.len() {
+        if blocks[i].get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(text) = blocks[i].get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((at, matched)) = earliest_stop(text, stops) else {
+            continue;
+        };
+        blocks[i]["text"] = json!(&text[..at]);
+        // The turn ended here: anything after the truncation point — a
+        // further text block, a tool call — was never part of the answer.
+        blocks.truncate(i + 1);
+        response["stop_reason"] = json!("stop_sequence");
+        response["stop_sequence"] = json!(matched);
+        return;
+    }
+}
+
+/// The earliest-occurring stop sequence in `text`, with its byte offset.
+pub fn earliest_stop(text: &str, stops: &[String]) -> Option<(usize, String)> {
+    stops
+        .iter()
+        .filter_map(|s| {
+            if s.is_empty() {
+                return None;
+            }
+            text.find(s.as_str()).map(|at| (at, s.clone()))
+        })
+        .min_by_key(|(at, _)| *at)
+}
+
+/// A stand-in for Anthropic's `signature` on a thinking block.
+///
+/// The bridge synthesizes thinking from the upstream's `reasoning_content`, so
+/// there is no real signature to carry — Anthropic's is a cryptographic
+/// attestation only it can produce. Emitting a **clearly synthetic** value
+/// keeps the block's shape valid for typed consumers, which is the actual
+/// divergence; the `turnpike-synthetic:` prefix is what keeps it from ever
+/// being mistaken for real provenance.
+///
+/// Replaying it to a real Anthropic endpoint fails exactly as a missing
+/// signature does, so nothing gets worse — and the bridge never forwards a
+/// signature upstream anyway (`translate_message` reads only `thinking`).
+pub fn synthetic_signature(thinking: &str) -> String {
+    let mut input = b"turnpike-synthetic:".to_vec();
+    input.extend_from_slice(thinking.as_bytes());
+    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+    base64_encode(digest.as_ref())
+}
+
+/// Minimal standard-alphabet base64. Hand-rolled rather than pulling in a
+/// crate for the one place the bridge needs it.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 pub fn map_finish(finish: Option<&str>, has_tools: bool) -> &'static str {
@@ -626,7 +801,15 @@ mod tests {
         }"#,
         )
         .unwrap();
-        let out = response_to_anthropic(&openai, "claude-sonnet-5", "msg_x");
+        let out = response_to_anthropic(
+            &openai,
+            "claude-sonnet-5",
+            "msg_x",
+            &ResponseOptions {
+                thinking_requested: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(out["type"], "message");
         assert_eq!(out["model"], "claude-sonnet-5");
         assert_eq!(out["content"][0]["type"], "thinking");
@@ -637,6 +820,40 @@ mod tests {
         assert_eq!(out["usage"]["input_tokens"], 11);
         assert_eq!(out["usage"]["cache_read_input_tokens"], 4);
         assert_eq!(out["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn disable_parallel_tool_use_maps_to_parallel_tool_calls() {
+        // Anthropic's flag is a field of `tool_choice`; OpenAI's equivalent is
+        // a *sibling* of `tools`. Reading only `type`/`name` (the old
+        // `map_tool_choice`) dropped it entirely, so a client asking for
+        // exactly one call got parallel calls instead.
+        let req: Value = serde_json::from_str(
+            r#"{
+            "model": "claude-sonnet-5", "max_tokens": 64,
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "any", "disable_parallel_tool_use": true},
+            "messages": [{"role": "user", "content": "hi"}]
+        }"#,
+        )
+        .unwrap();
+        let out = request_to_openai(&req, "m").unwrap();
+        assert_eq!(out["parallel_tool_calls"], false);
+        assert_eq!(out["tool_choice"], "required");
+
+        // Absent means absent: the key is not invented, so the upstream's own
+        // default (parallel allowed) stands.
+        let req: Value = serde_json::from_str(
+            r#"{
+            "model": "claude-sonnet-5", "max_tokens": 64,
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "any"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }"#,
+        )
+        .unwrap();
+        let out = request_to_openai(&req, "m").unwrap();
+        assert!(out.get("parallel_tool_calls").is_none());
     }
 
     #[test]

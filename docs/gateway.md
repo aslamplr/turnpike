@@ -14,9 +14,10 @@ uniform `DefaultBodyLimit` of 64 MiB (`MAX_BODY_BYTES`) applied to every route.
 | --- | --- | --- |
 | `/_health` | `health` | Returns `204 No Content` with the `x-turnpike-gateway: 1` header. Identifies the gateway to anything probing it. |
 | `/v1/models` | `models` | Anthropic-style model catalog built from the configured routes. |
+| `/v1/models/{id}` | `model_by_id` | One route as a bare `ModelInfo` (not the list envelope); unknown id → `404 not_found_error`. |
 | `/v1/messages/count_tokens` | `count_tokens` | Local heuristic estimate; no upstream call. |
 | `/v1/messages` | `forward_anthropic` | The primary Claude-spec path. |
-| `/v1/messages/batches` | `forward_anthropic` | **Not a batch API.** The path maps to the Messages handler, so a batch envelope (`{"requests": […]}`) is decoded as a Messages body and refused with `400 "model is required"`. See [anthropic-compat.md](anthropic-compat.md#bonus-v1messagesbatches-is-not-a-batch-api). |
+| `/v1/messages/batches` | `batches_unimplemented` | **Not a batch API.** Always `404 not_found_error` naming the Message Batches API as unimplemented. See [anthropic-compat.md](anthropic-compat.md#bonus-v1messagesbatches-is-not-a-batch-api). |
 | `/v1/chat/completions` | `forward_chat_completions` | OpenAI chat path (non-streaming and streaming `stream: true` both accepted). |
 | `/v1/completions` | `forward_completions` | Legacy completions path. |
 | `/v1/responses` | `forward_responses` | OpenAI Responses API path. |
@@ -26,9 +27,10 @@ Anything not in this table is a plain 404. The `/_health` route is the only
 GET that isn't `/v1/models`.
 
 All `forward_*` handlers are one-liners that call the shared `forward()`
-pipeline with the family their path implies: `forward_anthropic` and the
-batches handler pass `Family::Anthropic`; chat/completions/responses/embeddings
-pass `Family::OpenAI`.
+pipeline with the family their path implies: `forward_anthropic` passes
+`Family::Anthropic`; chat/completions/responses/embeddings pass
+`Family::OpenAI`. `batches_unimplemented` is the exception — it never reaches
+`forward()` at all, because there is nothing to forward to.
 
 ### The model catalog (`/v1/models`)
 

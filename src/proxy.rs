@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -106,9 +106,10 @@ pub fn router(gw: Arc<Gateway>) -> Router {
     Router::new()
         .route(HEALTH_PATH, get(health))
         .route("/v1/models", get(models))
+        .route("/v1/models/{id}", get(model_by_id))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/messages", post(forward_anthropic))
-        .route("/v1/messages/batches", post(forward_anthropic))
+        .route("/v1/messages/batches", post(batches_unimplemented))
         .route("/v1/chat/completions", post(forward_chat_completions))
         .route("/v1/completions", post(forward_completions))
         .route("/v1/responses", post(forward_responses))
@@ -136,30 +137,13 @@ async fn models(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
     if let Some(res) = guard(&headers) {
         return res;
     }
-    let mut data = Vec::new();
-    for (id, route) in &gw.config.routes {
-        // A strategy route serves several upstream models behind one id; name
-        // them in `detail` so the catalog is honest about what it will route to,
-        // without inventing synthetic per-target ids (which would change what
-        // Claude Desktop's picker lists).
-        let targets = route.targets();
-        let detail = if targets.len() > 1 {
-            let models: Vec<&str> = targets.iter().map(|t| t.model.as_str()).collect();
-            models.join(", ")
-        } else {
-            route.model.clone()
-        };
-        data.push(json!({
-            "type": "model",
-            "id": id,
-            "display_name": route.display_name.clone().unwrap_or_else(|| route.model.clone()),
-            "created_at": route.created_at.clone().unwrap_or_else(|| "2025-01-01T00:00:00Z".into()),
-            "max_tokens": route.max_tokens.unwrap_or(64_000),
-            "anthropic_family_tier": route.family,
-            "is_family_default": true,
-            "detail": detail,
-        }));
-    }
+    let search = gw.search.is_some();
+    let data: Vec<Value> = gw
+        .config
+        .routes
+        .iter()
+        .map(|(id, route)| model_entry(id, route, search))
+        .collect();
     let first = data.first().and_then(|m| m.get("id")).cloned();
     let last = data.last().and_then(|m| m.get("id")).cloned();
     Json(json!({
@@ -169,6 +153,130 @@ async fn models(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
         "has_more": false,
     }))
     .into_response()
+}
+
+/// Retrieve one model by id. Anthropic returns the bare `ModelInfo` object
+/// here — not the list envelope `models()` builds.
+async fn model_by_id(
+    State(gw): State<Arc<Gateway>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(res) = guard(&headers) {
+        return res;
+    }
+    match gw.config.routes.get(&id) {
+        Some(route) => Json(model_entry(&id, route, gw.search.is_some())).into_response(),
+        None => anthropic_error(StatusCode::NOT_FOUND, format!("model {id:?} not found")),
+    }
+}
+
+/// The Message Batches API is unimplemented, and this says so.
+///
+/// The path used to map to the Messages handler, so a well-formed batch
+/// envelope (`{"requests": […]}`) was decoded as a Messages body and refused
+/// with a confusing `400 "model is required"`. A shaped 404 states what is
+/// actually true — this endpoint is not served here — and reaches the client
+/// as a coherent Anthropic error rather than a parse failure.
+async fn batches_unimplemented(headers: HeaderMap) -> Response {
+    if let Some(res) = guard(&headers) {
+        return res;
+    }
+    anthropic_error(
+        StatusCode::NOT_FOUND,
+        "the Message Batches API is not implemented by turnpike",
+    )
+}
+
+/// One `/v1/models` entry.
+///
+/// Shared by the catalog and retrieve-by-id so the two cannot describe the same
+/// route differently. `search_configured` is what makes
+/// `capabilities.server_tools` honest: it is the middleware's real
+/// availability, not a claim about what the upstream model could do.
+fn model_entry(id: &str, route: &crate::config::RouteCfg, search_configured: bool) -> Value {
+    // A strategy route serves several upstream models behind one id; name
+    // them in `detail` so the catalog is honest about what it will route to,
+    // without inventing synthetic per-target ids (which would change what
+    // Claude Desktop's picker lists).
+    let targets = route.targets();
+    let detail = if targets.len() > 1 {
+        let models: Vec<&str> = targets.iter().map(|t| t.model.as_str()).collect();
+        models.join(", ")
+    } else {
+        route.model.clone()
+    };
+    // Anthropic's spec: "Keys are always present for all known capabilities",
+    // so the shape is the contract even where the answer is "no". Every value
+    // below describes what *turnpike* does, not what the upstream could do.
+    let cap = capability;
+    json!({
+        "type": "model",
+        "id": id,
+        "display_name": route.display_name.clone().unwrap_or_else(|| route.model.clone()),
+        "created_at": route.created_at.clone().unwrap_or_else(|| "2025-01-01T00:00:00Z".into()),
+        "max_tokens": route.max_tokens.unwrap_or(64_000),
+        // The context window, from config. `null` when the route declares
+        // none — never `max_tokens`, which is the *output* cap.
+        "max_input_tokens": crate::config::effective_context_tokens(route),
+        "capabilities": {
+            "batch": cap(false),
+            "citations": cap(false),
+            "code_execution": cap(false),
+            "context_management": {
+                "supported": false,
+                "clear_thinking_20251015": Value::Null,
+                "clear_tool_uses_20250919": Value::Null,
+                "compact_20260112": Value::Null,
+            },
+            "effort": {
+                "supported": false,
+                "low": cap(false),
+                "medium": cap(false),
+                "high": cap(false),
+                "max": cap(false),
+                "xhigh": Value::Null,
+            },
+            // image_to_url() bridges both base64 and url image blocks.
+            "image_input": cap(true),
+            "pdf_input": cap(false),
+            "server_tools": {
+                "supported": search_configured,
+                "web_search": cap(search_configured),
+                "code_execution": cap(false),
+            },
+            "structured_outputs": cap(false),
+            "thinking": {
+                "supported": true,
+                "types": {
+                    "enabled": cap(true),
+                    "disabled": cap(true),
+                    "adaptive": cap(false),
+                },
+            },
+        },
+        "line": anthropic_line(route),
+        "anthropic_family_tier": route.family,
+        "is_family_default": true,
+        "detail": detail,
+    })
+}
+
+fn capability(supported: bool) -> Value {
+    json!({ "supported": supported })
+}
+
+/// The route's `family` as Anthropic's `line`, or `null`.
+///
+/// Anthropic warns "do not infer a line from the `id`", and this does not: it
+/// reports the tier the route *declares*, and only when it is one of the lines
+/// Anthropic defines.
+fn anthropic_line(route: &crate::config::RouteCfg) -> Value {
+    const LINES: &[&str] = &["haiku", "sonnet", "opus", "fable", "mythos"];
+    match route.family.as_deref() {
+        Some(f) if LINES.contains(&f) => json!(f),
+        _ => Value::Null,
+    }
 }
 
 /// Whether a failed attempt against one target should fall over to the next.
@@ -288,7 +396,11 @@ async fn count_tokens(State(gw): State<Arc<Gateway>>, headers: HeaderMap, body: 
         .and_then(Value::as_str)
         .unwrap_or_default();
     if let Err(e) = gw.config.resolve(model) {
-        return resolve_error(StatusCode::BAD_REQUEST, &e, Family::Anthropic);
+        // 404, matching `forward()`. The same unknown id must not be
+        // `not_found_error` on /v1/messages and `invalid_request_error` here:
+        // a client branching on the error type would read one name as missing
+        // and the other as malformed.
+        return resolve_error(StatusCode::NOT_FOUND, &e, Family::Anthropic);
     }
     Json(json!({ "input_tokens": estimate_tokens(&payload) })).into_response()
 }
@@ -588,6 +700,10 @@ async fn bridge(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let input_estimate = estimate_tokens(&payload);
+    // What the client asked for, which has to shape the *response*: a thinking
+    // block is only part of the contract when the request asked for thinking,
+    // and `stop_sequences` are matched locally rather than forwarded upstream.
+    let opts = crate::translate::ResponseOptions::from_request(&payload);
 
     // Without a configured search provider, server tools are unexecutable —
     // drop them so the model never emits a tool call nobody would answer.
@@ -630,6 +746,7 @@ async fn bridge(
                 requested,
                 stream,
                 input_estimate,
+                &opts,
             )
             .await;
         }
@@ -645,11 +762,28 @@ async fn bridge(
         "bridge: agentic search middleware active"
     );
 
-    // --- Agentic middleware loop -------------------------------------------
-    // All iterations run non-streaming upstream; the client gets either the
-    // final JSON or an SSE rendition of it (streaming clients still see a
-    // valid Anthropic SSE stream — the first token just arrives after the
-    // searches complete, exactly like Ollama's buffering writer).
+    // A streaming client takes the live path: every iteration is streamed
+    // from the upstream and forwarded as it arrives, so the answer is
+    // incremental and the searches run *inside* the client's stream rather
+    // than before it. The non-streaming path below stays buffered — there is
+    // no stream to interleave with, and it is the reference implementation.
+    if stream {
+        return search_loop_streaming(
+            gw,
+            resolved,
+            key,
+            headers,
+            openai_payload,
+            requested,
+            input_estimate,
+            opts,
+            search,
+            max_loops,
+        )
+        .await;
+    }
+
+    // --- Agentic middleware loop (non-streaming) ---------------------------
     let mut history = openai_payload
         .get("messages")
         .and_then(Value::as_array)
@@ -742,53 +876,11 @@ async fn bridge(
 
         // Append the assistant tool-call turn, then execute each search and
         // append the results as tool messages.
-        let mut assistant = serde_json::Map::new();
-        assistant.insert("role".into(), json!("assistant"));
-        assistant.insert("content".into(), Value::Null);
-        assistant.insert("tool_calls".into(), Value::Array(calls.clone()));
-        history.push(Value::Object(assistant));
-
-        for call in &calls {
-            let id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("call_search")
-                .to_string();
-            let args = call
-                .pointer("/function/arguments")
-                .and_then(Value::as_str)
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .unwrap_or_else(|| json!({}));
-            let query = args
-                .get("query")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-
-            let (result_content, trace_blocks) = match search.search(&query).await {
-                Ok(results) => {
-                    tracing::info!(
-                        iteration,
-                        %query,
-                        results = results.len(),
-                        "search middleware: executed"
-                    );
-                    let blocks = search_trace_blocks(&id, &query, &results);
-                    (crate::search::format_results(&results), blocks)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, iteration, %query, "search middleware failed");
-                    let blocks = search_trace_error_blocks(&id, &query, &e.to_string());
-                    (format!("web search failed: {e}"), blocks)
-                }
-            };
-            trace.extend(trace_blocks);
-            history.push(json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": result_content,
-            }));
-        }
+        history.push(assistant_tool_call_turn(&calls));
+        let (trace_blocks, tool_messages) =
+            execute_search_calls(&search, &calls, iteration).await;
+        trace.extend(trace_blocks);
+        history.extend(tool_messages);
     }
 
     tracing::info!(
@@ -810,6 +902,7 @@ async fn bridge(
         &final_openai,
         &requested,
         &crate::translate::new_message_id(),
+        &opts,
     );
 
     // The loop-limit case can leave an unexecuted web_search tool_use in the
@@ -854,19 +947,370 @@ async fn bridge(
         "final response assembled"
     );
 
-    if stream {
-        let sse = anthropic_json_to_sse(&response);
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
-            .header(axum::http::header::CACHE_CONTROL, "no-cache")
-            .body(Body::from(sse))
-            .unwrap_or_else(|e| {
-                anthropic_error(StatusCode::BAD_GATEWAY, format!("stream setup failed: {e}"))
-            })
-    } else {
-        Json(response).into_response()
+    // No `if stream` here: a streaming client never reaches this loop — it
+    // took `search_loop_streaming` above, which renders SSE live. This path
+    // exists for the client that asked for JSON.
+    Json(response).into_response()
+}
+
+/// The assistant turn that carried `calls`, in the shape OpenAI expects it
+/// echoed back before the `tool` messages.
+fn assistant_tool_call_turn(calls: &[Value]) -> Value {
+    json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": calls,
+    })
+}
+
+/// Execute one turn's `web_search` calls.
+///
+/// Returns the client-visible trace blocks alongside the `role:"tool"`
+/// messages to append to the conversation. Shared by the buffered and the
+/// live loop so the two cannot diverge on what a search *means* — the
+/// difference between them is when the bytes reach the client, not what is
+/// searched.
+async fn execute_search_calls(
+    search: &crate::search::SearchManager,
+    calls: &[Value],
+    iteration: usize,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut trace = Vec::new();
+    let mut messages = Vec::new();
+    for call in calls {
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("call_search")
+            .to_string();
+        let args = call
+            .pointer("/function/arguments")
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .unwrap_or_else(|| json!({}));
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        let (result_content, trace_blocks) = match search.search(&query).await {
+            Ok(results) => {
+                tracing::info!(
+                    iteration,
+                    %query,
+                    results = results.len(),
+                    "search middleware: executed"
+                );
+                let blocks = search_trace_blocks(&id, &query, &results);
+                (crate::search::format_results(&results), blocks)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, iteration, %query, "search middleware failed");
+                let blocks = search_trace_error_blocks(&id, &query, &e);
+                (format!("web search failed: {e}"), blocks)
+            }
+        };
+        trace.extend(trace_blocks);
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "content": result_content,
+        }));
     }
+    (trace, messages)
+}
+
+/// The streaming half of the middleware loop.
+///
+/// Every iteration is streamed from the upstream and forwarded as it arrives,
+/// so the client paints tokens while the model is still generating — including
+/// the iteration that only asks for a search. This is Anthropic's own
+/// server-tool grammar: `server_tool_use` blocks stream as the model produces
+/// them, the loop executes the searches at that turn's `finish_reason`, emits
+/// `web_search_tool_result`, and re-invokes on the same SSE stream.
+///
+/// Iteration 0's connection is made *before* the response is built, so a
+/// transport failure or a non-2xx still reaches the client as an HTTP error
+/// rather than as a half-open SSE stream — the first-byte boundary the
+/// failover design depends on. A later iteration's failure can only be
+/// mid-stream, and ends the stream.
+#[allow(clippy::too_many_arguments)]
+async fn search_loop_streaming(
+    gw: Arc<Gateway>,
+    resolved: crate::config::Resolved,
+    key: String,
+    headers: HeaderMap,
+    openai_payload: Value,
+    requested: String,
+    input_estimate: u64,
+    opts: crate::translate::ResponseOptions,
+    search: Arc<crate::search::SearchManager>,
+    max_loops: usize,
+) -> Response {
+    let history = openai_payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut loop_template = openai_payload.clone();
+    loop_template["stream"] = json!(true);
+    loop_template["stream_options"] = json!({"include_usage": true});
+    // Relaxed on the template so iteration 0 cannot carry a forced choice
+    // either: a reasoning-mode upstream rejects one outright, and a pin to
+    // turnpike's own alias would re-force a search on every iteration.
+    if relax_forced_tool_choice(&mut loop_template) {
+        tracing::info!(
+            middleware = "search",
+            "relaxed a forced tool_choice to \"auto\" for the loop"
+        );
+    }
+
+    let mut first = loop_template.clone();
+    first["messages"] = Value::Array(history.clone());
+    let upstream = match send_openai_chat(&gw, &resolved, &key, &headers, &first).await {
+        Ok(r) => r,
+        Err(res) => return res,
+    };
+    let upstream = match upstream_error_response(upstream).await {
+        Ok(r) => r,
+        Err(res) => return res,
+    };
+
+    // Built outside the stream block so the converter — not a borrow of `opts`
+    // — is what gets moved in: the body must be `'static`.
+    let converter = crate::translate::stream::StreamConverter::new(
+        crate::translate::new_message_id(),
+        requested.clone(),
+        input_estimate,
+    )
+    .with_options(&opts)
+    .with_server_tools(vec![TURNPIKE_SEARCH_TOOL.to_string()])
+    .defer_finish(true);
+
+    let body = async_stream::stream! {
+        let mut converter = converter;
+        let mut upstream = Some(upstream);
+        let mut history = history;
+        let loop_template = loop_template;
+        let mut total_input = 0u64;
+        let mut total_output = 0u64;
+        let mut iteration = 0usize;
+        let mut final_stop: Option<String> = None;
+        let mut emitted_answer = false;
+        // Hoisted above the loop: the terminating events are framed into the
+        // same buffer after it, and every yield drains it anyway.
+        let mut out = String::new();
+
+        loop {
+            let Some(resp) = upstream.take() else { break };
+            let mut calls: Vec<Value> = Vec::new();
+            let mut buf = String::new();
+            let mut stream = Box::pin(resp.bytes_stream());
+
+            while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(e) => {
+                        yield Err::<Bytes, std::io::Error>(std::io::Error::other(e.to_string()));
+                        return;
+                    }
+                };
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(pos) = buf.find('\n') {
+                    let line: String = buf.drain(..=pos).collect();
+                    let line = line.trim_end_matches(['\r', '\n']);
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let payload = payload.trim();
+                    if payload == "[DONE]" {
+                        break;
+                    }
+                    let Ok(v) = serde_json::from_str::<Value>(payload) else {
+                        continue;
+                    };
+                    // Accumulated alongside the conversion: the converter frames
+                    // the blocks, the loop needs the arguments to execute them.
+                    if let Some(list) = v
+                        .pointer("/choices/0/delta/tool_calls")
+                        .and_then(Value::as_array)
+                    {
+                        for c in list {
+                            let idx = c.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                            // Seeded complete. The accumulated call is replayed
+                            // upstream as the assistant turn, and OpenAI requires
+                            // `type` on a tool call — a slot built only from the
+                            // deltas that happened to arrive is rejected as
+                            // malformed, which kills the loop on iteration 1.
+                            while calls.len() <= idx {
+                                calls.push(json!({
+                                    "type": "function",
+                                    "id": format!("call_{idx}"),
+                                    "function": {"name": "", "arguments": ""},
+                                }));
+                            }
+                            if let Some(id) = c.get("id").and_then(Value::as_str) {
+                                if !id.is_empty() {
+                                    calls[idx]["id"] = json!(id);
+                                }
+                            }
+                            if let Some(n) = c.pointer("/function/name").and_then(Value::as_str) {
+                                if !n.is_empty() {
+                                    calls[idx]["function"]["name"] = json!(n);
+                                }
+                            }
+                            if let Some(a) =
+                                c.pointer("/function/arguments").and_then(Value::as_str)
+                            {
+                                let prev = calls[idx]
+                                    .pointer("/function/arguments")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                calls[idx]["function"]["arguments"] =
+                                    json!(format!("{prev}{a}"));
+                            }
+                        }
+                    }
+                    if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+                        total_input += u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        total_output +=
+                            u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    }
+                    for event in converter.process(&v) {
+                        if event.name == "content_block_delta"
+                            && event
+                                .data
+                                .pointer("/delta/text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| !t.is_empty())
+                        {
+                            emitted_answer = true;
+                        }
+                        out += &crate::translate::format_sse(&event.name, &event.data);
+                    }
+                    if converter.stopped() {
+                        break;
+                    }
+                }
+                if !out.is_empty() {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut out)));
+                }
+                if converter.stopped() {
+                    break;
+                }
+            }
+
+            // Usage is summed from the raw chunks above, which is the only
+            // place `include_usage` reports it per iteration.
+            let (stop, _usage) = converter.end_iteration();
+            let all_turnpike = !calls.is_empty()
+                && calls.iter().all(|c| {
+                    c.pointer("/function/name").and_then(Value::as_str)
+                        == Some(TURNPIKE_SEARCH_TOOL)
+                });
+            tracing::info!(
+                iteration,
+                tool_calls = calls.len(),
+                all_turnpike,
+                usage_in = total_input,
+                usage_out = total_output,
+                "search loop: iteration complete"
+            );
+
+            // A stop sequence ends the turn for good, whatever the model did
+            // next; `finish_message` reports it.
+            if converter.stopped() {
+                break;
+            }
+            if !all_turnpike {
+                final_stop = stop;
+                break;
+            }
+
+            // The budget-exhausted turn must still run its searches: its
+            // `server_tool_use` blocks are already on the wire, and a dangling
+            // one is invalid grammar. The buffered path drops them instead,
+            // because there they were never sent.
+            let last = iteration >= max_loops;
+            if last {
+                tracing::warn!(loops = max_loops, "search loop budget exhausted");
+            }
+            history.push(assistant_tool_call_turn(&calls));
+            let (trace, tool_messages) = execute_search_calls(&search, &calls, iteration).await;
+            // Only the *result* blocks. The converter already streamed each
+            // search's `server_tool_use` block — with its `input_json_delta` —
+            // as the model produced the call, so emitting the trace's own
+            // `server_tool_use` would duplicate the block on the wire. The
+            // buffered path needs the whole pair because it never streamed the
+            // call.
+            for block in trace.iter().filter(|b| {
+                b.get("type").and_then(Value::as_str) == Some("web_search_tool_result")
+            }) {
+                for event in converter.emit_block(block) {
+                    out += &crate::translate::format_sse(&event.name, &event.data);
+                }
+            }
+            if !out.is_empty() {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut out)));
+            }
+            history.extend(tool_messages);
+            if last {
+                break;
+            }
+            iteration += 1;
+
+            let mut req_payload = loop_template.clone();
+            req_payload["messages"] = Value::Array(history.clone());
+            req_payload["tool_choice"] = json!("auto");
+            let next = match send_openai_chat(&gw, &resolved, &key, &headers, &req_payload).await {
+                Ok(r) => r,
+                Err(res) => {
+                    yield Err::<Bytes, std::io::Error>(std::io::Error::other(format!(
+                        "search loop: upstream unavailable ({})",
+                        res.status()
+                    )));
+                    return;
+                }
+            };
+            match upstream_error_response(next).await {
+                Ok(r) => upstream = Some(r),
+                Err(res) => {
+                    yield Err::<Bytes, std::io::Error>(std::io::Error::other(format!(
+                        "search loop: upstream error ({})",
+                        res.status()
+                    )));
+                    return;
+                }
+            }
+        }
+
+        // A turn that produced only searches leaves no answer; say so, as the
+        // buffered path does.
+        if !emitted_answer && final_stop.is_none() && !converter.stopped() {
+            for event in converter.emit_text_block("(no final answer produced)") {
+                out += &crate::translate::format_sse(&event.name, &event.data);
+            }
+        }
+        let usage = json!({"input_tokens": total_input, "output_tokens": total_output});
+        let tail = converter.finish_message(final_stop.as_deref().unwrap_or("end_turn"), &usage);
+        if !tail.is_empty() {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
+        }
+        if !out.is_empty() {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(body))
+        .unwrap_or_else(|e| {
+            anthropic_error(StatusCode::BAD_GATEWAY, format!("stream setup failed: {e}"))
+        })
 }
 
 /// The original single-request bridge path: translate, forward, translate
@@ -881,6 +1325,7 @@ async fn single_shot_bridge(
     requested: String,
     stream: bool,
     input_estimate: u64,
+    opts: &crate::translate::ResponseOptions,
 ) -> Response {
     let body = match serde_json::to_vec(&openai_payload) {
         Ok(v) => v,
@@ -915,7 +1360,7 @@ async fn single_shot_bridge(
 
     if stream {
         tracing::info!(%requested, "bridge: streaming passthrough to client");
-        bridged_stream_response(upstream, requested, input_estimate)
+        bridged_stream_response(upstream, requested, input_estimate, opts.clone())
     } else {
         let bytes = match upstream.bytes().await {
             Ok(b) => b,
@@ -953,6 +1398,7 @@ async fn single_shot_bridge(
             &openai_json,
             &requested,
             &crate::translate::new_message_id(),
+            opts,
         );
         Json(response).into_response()
     }
@@ -1128,7 +1574,28 @@ fn search_trace_blocks(
     vec![use_block, result_block]
 }
 
-fn search_trace_error_blocks(tool_use_id: &str, query: &str, error: &str) -> Vec<Value> {
+/// The Anthropic `error_code` for a failed search.
+///
+/// Only the codes turnpike can actually distinguish: a provider rate limit is
+/// the one case it can see. Everything else — a transport failure, an
+/// unparseable body, a provider-reported error — is `unavailable`, which is
+/// what Anthropic means by "an internal error occurred".
+fn search_error_code(e: &crate::search::SearchError) -> &'static str {
+    match e {
+        crate::search::SearchError::Http(err)
+            if err.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) =>
+        {
+            "too_many_requests"
+        }
+        _ => "unavailable",
+    }
+}
+
+fn search_trace_error_blocks(
+    tool_use_id: &str,
+    query: &str,
+    error: &crate::search::SearchError,
+) -> Vec<Value> {
     vec![
         json!({
             "type": "server_tool_use",
@@ -1139,129 +1606,15 @@ fn search_trace_error_blocks(tool_use_id: &str, query: &str, error: &str) -> Vec
         json!({
             "type": "web_search_tool_result",
             "tool_use_id": tool_use_id,
-            "content": format!("search error: {error}"),
+            // Anthropic returns an *object* here, not a string: "On an error,
+            // `content` is a single error object rather than a list of result
+            // blocks." A bare string is a shape a typed client cannot read.
+            "content": {
+                "type": "web_search_tool_result_error",
+                "error_code": search_error_code(error),
+            },
         }),
     ]
-}
-
-/// Render a complete Anthropic message JSON as a full SSE event sequence
-/// (message_start → content blocks → message_delta → message_stop), used
-/// when the middleware loop ran buffered upstream but the client asked to
-/// stream.
-fn anthropic_json_to_sse(msg: &Value) -> String {
-    let id = msg.get("id").cloned().unwrap_or(json!("msg_turnpike"));
-    let model = msg.get("model").cloned().unwrap_or(json!(""));
-    let input = msg
-        .pointer("/usage/input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output = msg
-        .pointer("/usage/output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let stop_reason = msg.get("stop_reason").cloned().unwrap_or(json!("end_turn"));
-
-    let mut out = String::new();
-    out += &crate::translate::format_sse(
-        "message_start",
-        &json!({
-            "type": "message_start",
-            "message": {
-                "id": id,
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [],
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {"input_tokens": input, "output_tokens": 0},
-            }
-        }),
-    );
-
-    for (index, block) in msg
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let btype = block.get("type").and_then(Value::as_str).unwrap_or("");
-        match btype {
-            "text" => {
-                out += &crate::translate::format_sse(
-                    "content_block_start",
-                    &json!({"type": "content_block_start", "index": index,
-                            "content_block": {"type": "text", "text": ""}}),
-                );
-                let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-                out += &crate::translate::format_sse(
-                    "content_block_delta",
-                    &json!({"type": "content_block_delta", "index": index,
-                            "delta": {"type": "text_delta", "text": text}}),
-                );
-            }
-            "thinking" => {
-                out += &crate::translate::format_sse(
-                    "content_block_start",
-                    &json!({"type": "content_block_start", "index": index,
-                            "content_block": {"type": "thinking", "thinking": ""}}),
-                );
-                let text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
-                out += &crate::translate::format_sse(
-                    "content_block_delta",
-                    &json!({"type": "content_block_delta", "index": index,
-                            "delta": {"type": "thinking_delta", "thinking": text}}),
-                );
-            }
-            "tool_use" | "server_tool_use" => {
-                let start_block = if btype == "tool_use" {
-                    json!({"type": "tool_use", "id": block.get("id").cloned().unwrap_or(json!("call_0")),
-                           "name": block.get("name").cloned().unwrap_or(json!("")), "input": {}})
-                } else {
-                    json!({"type": "server_tool_use", "id": block.get("id").cloned().unwrap_or(json!("srvtoolu_0")),
-                           "name": block.get("name").cloned().unwrap_or(json!("")), "input": {}})
-                };
-                out += &crate::translate::format_sse(
-                    "content_block_start",
-                    &json!({"type": "content_block_start", "index": index,
-                            "content_block": start_block}),
-                );
-                let input = block.get("input").cloned().unwrap_or(json!({}));
-                out += &crate::translate::format_sse(
-                    "content_block_delta",
-                    &json!({"type": "content_block_delta", "index": index,
-                            "delta": {"type": "input_json_delta",
-                                      "partial_json": serde_json::to_string(&input)
-                                          .unwrap_or_else(|_| "{}".into())}}),
-                );
-            }
-            // web_search_tool_result and anything else: emit the full block
-            // in content_block_start, no deltas.
-            _ => {
-                out += &crate::translate::format_sse(
-                    "content_block_start",
-                    &json!({"type": "content_block_start", "index": index,
-                            "content_block": block}),
-                );
-            }
-        }
-        out += &crate::translate::format_sse(
-            "content_block_stop",
-            &json!({"type": "content_block_stop", "index": index}),
-        );
-    }
-
-    out += &crate::translate::format_sse(
-        "message_delta",
-        &json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-            "usage": {"input_tokens": input, "output_tokens": output},
-        }),
-    );
-    out += &crate::translate::format_sse("message_stop", &json!({"type": "message_stop"}));
-    out
 }
 
 /// Wrap the upstream OpenAI SSE stream in the Anthropic SSE grammar.
@@ -1269,11 +1622,16 @@ fn bridged_stream_response(
     upstream: reqwest::Response,
     requested_model: String,
     input_estimate: u64,
+    opts: crate::translate::ResponseOptions,
 ) -> Response {
     let id = crate::translate::new_message_id();
+    // Built before the stream block so the converter — not a borrow of `opts` —
+    // is what gets moved in. The body must be `'static`.
+    let converter =
+        crate::translate::stream::StreamConverter::new(id, requested_model, input_estimate)
+            .with_options(&opts);
     let body = async_stream::stream! {
-        let mut converter =
-            crate::translate::stream::StreamConverter::new(id, requested_model, input_estimate);
+        let mut converter = converter;
         let mut upstream = Box::pin(upstream.bytes_stream());
         let mut buf = String::new();
         let mut out = String::new();
@@ -1531,8 +1889,12 @@ fn resolve_error(status: StatusCode, e: &ResolveError, family: Family) -> Respon
 // Token estimation
 // ---------------------------------------------------------------------------
 
-/// Rough estimate (~4 chars/token) over every string in system/messages,
+/// Rough estimate (~4 chars/token) over every string in system/messages/tools,
 /// mirroring the spirit of Ollama's EstimateCountTokens.
+///
+/// `tools` is walked because Anthropic's `count_tokens` counts tool
+/// definitions, and a Claude Code request is dominated by its tool list — the
+/// estimate was worst exactly where it mattered most.
 pub fn estimate_tokens(payload: &Value) -> u64 {
     let mut chars = 0u64;
     if let Some(system) = payload.get("system") {
@@ -1543,6 +1905,9 @@ pub fn estimate_tokens(payload: &Value) -> u64 {
             chars += s.chars().count() as u64
         });
     }
+    if let Some(tools) = payload.get("tools") {
+        collect_strings(tools, &mut |s| chars += s.chars().count() as u64);
+    }
     chars / 4
 }
 
@@ -1551,8 +1916,17 @@ fn collect_strings(v: &Value, f: &mut dyn FnMut(&str)) {
         Value::String(s) => f(s),
         Value::Array(items) => items.iter().for_each(|i| collect_strings(i, f)),
         Value::Object(map) => {
+            // A base64 image's payload is not text: its length is unrelated to
+            // the token count, and walking it inflated the estimate by roughly
+            // four characters per token of base64. Skipped rather than replaced
+            // with an invented per-image constant, so image tokens are
+            // consequently under-counted (see docs/anthropic-compat.md).
+            let base64_source = map.get("type").and_then(Value::as_str) == Some("base64");
             for (k, val) in map {
                 if k == "type" || k == "id" || k == "name" {
+                    continue;
+                }
+                if base64_source && k == "data" {
                     continue;
                 }
                 collect_strings(val, f);
@@ -1627,6 +2001,51 @@ display_name = "Sonnet 5"
         assert!(tokens > 0 && tokens < 100);
     }
 
+    #[test]
+    fn token_estimate_counts_tools() {
+        // Anthropic's count_tokens counts tool definitions, and a Claude Code
+        // request is dominated by its tool list — the estimate was worst
+        // exactly where it mattered most.
+        let base = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let big_tools: Vec<Value> = (0..20)
+            .map(|i| {
+                json!({
+                    "name": format!("tool_{i}"),
+                    "description": "A tool ".repeat(200),
+                    "input_schema": {"type": "object", "properties": {"a": {"type": "string"}}},
+                })
+            })
+            .collect();
+        let mut with_tools = base.clone();
+        with_tools["tools"] = Value::Array(big_tools);
+        assert!(
+            estimate_tokens(&with_tools) > estimate_tokens(&base),
+            "base={} with_tools={}",
+            estimate_tokens(&base),
+            estimate_tokens(&with_tools)
+        );
+    }
+
+    #[test]
+    fn token_estimate_skips_base64_image_payload() {
+        // base64 length is unrelated to token count; walking it inflated the
+        // estimate by roughly four characters per token of base64. Image
+        // tokens are consequently under-counted rather than over-counted —
+        // see docs/anthropic-compat.md.
+        let payload = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "A".repeat(40_000)}},
+            ]}]
+        });
+        assert!(
+            estimate_tokens(&payload) < 100,
+            "got {}",
+            estimate_tokens(&payload)
+        );
+    }
+
     #[tokio::test]
     async fn unknown_model_returns_anthropic_error() {
         let gw = Arc::new(Gateway::new(config()));
@@ -1648,6 +2067,30 @@ display_name = "Sonnet 5"
             .to_bytes();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "not_found_error");
+    }
+
+    #[tokio::test]
+    async fn count_tokens_unknown_model_is_404() {
+        // The same unknown id must not be `not_found_error` on /v1/messages
+        // and `invalid_request_error` here: a client branching on the error
+        // type would read one name as missing and the other as malformed.
+        let gw = Arc::new(Gateway::new(config()));
+        let res = router(gw);
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages/count_tokens")
+            .header("host", "127.0.0.1:8710")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"nope","messages":[]}"#))
+            .unwrap();
+        let res = tower::ServiceExt::oneshot(res, req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["error"]["type"], "not_found_error");
     }
 
@@ -1686,6 +2129,114 @@ display_name = "Sonnet 5"
         assert_eq!(v["data"][0]["type"], "model");
         assert_eq!(v["data"][0]["id"], "claude-sonnet-5");
         assert_eq!(v["has_more"], false);
+
+        // Anthropic's ModelInfo shape: the context window and the capability
+        // map. This route declares no `context_tokens`, so the window is
+        // `null` rather than the *output* cap in `max_tokens`.
+        assert!(v["data"][0].get("max_input_tokens").is_some());
+        assert_eq!(v["data"][0]["max_input_tokens"], Value::Null);
+        assert_eq!(v["data"][0]["line"], Value::Null);
+        let caps = &v["data"][0]["capabilities"];
+        // "Keys are always present for all known capabilities."
+        for key in [
+            "batch",
+            "citations",
+            "code_execution",
+            "context_management",
+            "effort",
+            "image_input",
+            "pdf_input",
+            "server_tools",
+            "structured_outputs",
+            "thinking",
+        ] {
+            assert!(caps.get(key).is_some(), "capabilities.{key} missing");
+        }
+        // Honest values: this gateway has no search provider configured.
+        assert_eq!(caps["batch"]["supported"], false);
+        assert_eq!(caps["image_input"]["supported"], true);
+        assert_eq!(caps["server_tools"]["supported"], false);
+        assert_eq!(caps["server_tools"]["web_search"]["supported"], false);
+        assert_eq!(caps["context_management"]["compact_20260112"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn model_by_id_returns_the_bare_model_object() {
+        let gw = Arc::new(Gateway::new(config()));
+        let res = router(gw);
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models/claude-sonnet-5")
+            .header("host", "127.0.0.1:8710")
+            .body(Body::empty())
+            .unwrap();
+        let res = tower::ServiceExt::oneshot(res, req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        // Anthropic returns the ModelInfo object here, not the list envelope.
+        assert_eq!(v["type"], "model");
+        assert_eq!(v["id"], "claude-sonnet-5");
+        assert!(v.get("data").is_none(), "retrieve is not the list envelope");
+    }
+
+    #[tokio::test]
+    async fn model_by_id_unknown_is_404() {
+        let gw = Arc::new(Gateway::new(config()));
+        let res = router(gw);
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models/no-such-model")
+            .header("host", "127.0.0.1:8710")
+            .body(Body::empty())
+            .unwrap();
+        let res = tower::ServiceExt::oneshot(res, req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "not_found_error");
+    }
+
+    #[tokio::test]
+    async fn batches_path_is_a_shaped_404() {
+        // The path used to map to the Messages handler, so a batch envelope was
+        // decoded as a Messages body and refused with a confusing
+        // `400 "model is required"`. The Message Batches API is unimplemented
+        // and the error now says so.
+        let gw = Arc::new(Gateway::new(config()));
+        let res = router(gw);
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages/batches")
+            .header("host", "127.0.0.1:8710")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"requests":[{"custom_id":"r1","params":{"model":"claude-sonnet-5","max_tokens":16,"messages":[]}}]}"#,
+            ))
+            .unwrap();
+        let res = tower::ServiceExt::oneshot(res, req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "not_found_error");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Batches"),
+            "message should name the API: {}",
+            v["error"]["message"]
+        );
     }
 
     #[tokio::test]
@@ -1919,7 +2470,11 @@ model = "deepseek-v4-flash"
             .header("host", "127.0.0.1:8710")
             .header("content-type", "application/json")
             .body(Body::from(
+                // Thinking has to be *requested* for a thinking block to be
+                // part of the response: the upstream returns reasoning_content
+                // on nearly every call, and the bridge now gates on the request.
                 r#"{"model":"claude-sonnet-5","max_tokens":64,"stream":true,
+                    "thinking":{"type":"enabled"},
                     "messages":[{"role":"user","content":[{"type":"text","text":"Paris?"}]}]}"#,
             ))
             .unwrap();
@@ -1949,6 +2504,7 @@ model = "deepseek-v4-flash"
                 "message_start",
                 "content_block_start", // thinking
                 "content_block_delta", // thinking_delta
+                "content_block_delta", // signature_delta, before the block closes
                 "content_block_stop",
                 "content_block_start", // text
                 "content_block_delta", // text_delta "Pa"
@@ -1961,6 +2517,9 @@ model = "deepseek-v4-flash"
                 "message_stop",
             ]
         );
+        // Anthropic completes a thinking block with a signature_delta; the
+        // bridge has no real signature, so it emits a clearly synthetic one.
+        assert!(text.contains("\"type\":\"signature_delta\""));
         assert!(text.contains("\"thinking_delta\""));
         assert!(text.contains("\"partial_json\":\"{\\\"city\\\":"));
         assert!(text.contains("\"partial_json\":\"\\\"Paris\\\"}\""));
@@ -1991,6 +2550,9 @@ model = "deepseek-v4-flash"
         let seen: Arc<tokio::sync::Mutex<Vec<Value>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let rx = seen.clone();
+        // The live loop streams every iteration upstream, so the stub speaks
+        // SSE: the first call asks for a search, the second — with the tool
+        // result in history — answers.
         let stub = axum::Router::new()
             .route(
                 "/v1/chat/completions",
@@ -1998,23 +2560,59 @@ model = "deepseek-v4-flash"
                     let v: Value = serde_json::from_slice(&body).unwrap();
                     rx.lock().await.push(v.clone());
                     let n_calls = rx.lock().await.len();
-                    if n_calls == 1 {
-                        return Json(json!({
-                            "id": "c1", "object": "chat.completion", "model": "deepseek-v4-flash",
-                            "choices": [{"index": 0, "finish_reason": "tool_calls",
-                                "message": {"role": "assistant", "content": null,
-                                    "tool_calls": [{"id": "call_ws", "type": "function",
-                                        "function": {"name": "web_search",
-                                            "arguments": "{\"query\":\"rust gateway\"}"}}]}}],
-                            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
-                        }));
-                    }
-                    Json(json!({
-                        "id": "c2", "object": "chat.completion", "model": "deepseek-v4-flash",
-                        "choices": [{"index": 0, "finish_reason": "stop",
-                            "message": {"role": "assistant", "content": "Found it."}}],
-                        "usage": {"prompt_tokens": 20, "completion_tokens": 3}
-                    }))
+                    let sse = if n_calls == 1 {
+                        format!(
+                            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            json!({"id":"c1","choices":[{"index":0,"finish_reason":null,
+                                "delta":{"tool_calls":[{"index":0,"id":"call_ws",
+                                    "type":"function","function":{"name":"web_search",
+                                        "arguments":"{\"query\":\"rust gateway\"}"}}]}}]}),
+                            json!({"id":"c1","choices":[{"index":0,"delta":{},
+                                "finish_reason":"tool_calls"}],
+                                "usage":{"prompt_tokens":10,"completion_tokens":5}})
+                        )
+                    } else {
+                        // OpenAI requires `type` on a tool call, and the live
+                        // loop replays the *streamed* call as the assistant
+                        // turn. A call assembled without it is rejected by a
+                        // real upstream, so the stub rejects it too — otherwise
+                        // the loop's second iteration looks healthy against a
+                        // stub that accepts anything.
+                        let malformed = v
+                            .get("messages")
+                            .and_then(Value::as_array)
+                            .map(|msgs| {
+                                msgs.iter()
+                                    .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
+                                    .flatten()
+                                    .any(|c| {
+                                        c.get("type").and_then(Value::as_str) != Some("function")
+                                    })
+                            })
+                            .unwrap_or(false);
+                        if malformed {
+                            return axum::response::Response::builder()
+                                .status(400)
+                                .header("content-type", "application/json")
+                                .body(Body::from(
+                                    r#"{"error":{"message":"tool_calls[0].type: field required"}}"#,
+                                ))
+                                .unwrap();
+                        }
+                        format!(
+                            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            json!({"id":"c2","choices":[{"index":0,"finish_reason":null,
+                                "delta":{"content":"Found it."}}]}),
+                            json!({"id":"c2","choices":[{"index":0,"delta":{},
+                                "finish_reason":"stop"}],
+                                "usage":{"prompt_tokens":20,"completion_tokens":3}})
+                        )
+                    };
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
                 }),
             )
             .into_make_service();
@@ -2099,6 +2697,13 @@ api_key = "test-key"
             .find(|m| m["role"] == "assistant" && m["tool_calls"].is_array())
             .expect("assistant tool-call turn appended");
         assert_eq!(assistant["tool_calls"][0]["function"]["name"], "web_search");
+        // The replayed call must be complete — the stub above 400s an
+        // incomplete one, exactly as a real upstream does.
+        assert_eq!(assistant["tool_calls"][0]["type"], "function");
+        assert!(assistant["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("rust gateway"));
         let tool_msg = msgs
             .iter()
             .find(|m| m["role"] == "tool")
@@ -2108,8 +2713,170 @@ api_key = "test-key"
             .as_str()
             .unwrap()
             .contains("About rust gateway"));
-        // Loop ran non-streaming upstream even though the client streamed.
-        assert_eq!(second["stream"], false);
+        // The converter streams the model's call as `server_tool_use`; the
+        // trace contributes only its *result*, or the block is emitted twice.
+        assert_eq!(
+            text.matches("\"type\":\"server_tool_use\"").count(),
+            1,
+            "one server_tool_use block — not the streamed call plus a trace duplicate"
+        );
+        // The loop streams upstream now — every iteration is forwarded as it
+        // arrives, which is what makes the rendition incremental.
+        assert_eq!(second["stream"], true);
+        assert_eq!(second["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn search_path_rendition_is_incremental() {
+        // The property divergence 1 recorded: the search path used to
+        // synthesize the whole message and re-emit it, so each block arrived as
+        // one whole-block delta and a client could paint blocks but never
+        // tokens. The live loop forwards each upstream chunk, so a block's
+        // delta index repeats — the same assertion the probe makes on the plain
+        // path as its positive control.
+        let seen: Arc<tokio::sync::Mutex<usize>> = Arc::new(tokio::sync::Mutex::new(0));
+        let rx = seen.clone();
+        let stub = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |body: Bytes| {
+                    let rx = rx.clone();
+                    async move {
+                        let n = {
+                            let mut n = rx.lock().await;
+                            *n += 1;
+                            *n
+                        };
+                        let _ = body;
+                        let sse = if n == 1 {
+                            // Turn 1: ask for a search.
+                            format!(
+                                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                                json!({"id":"c1","choices":[{"index":0,"finish_reason":null,
+                                    "delta":{"tool_calls":[{"index":0,"id":"call_ws",
+                                        "type":"function","function":{"name":"web_search",
+                                            "arguments":"{\"query\":\"rust gateway\"}"}}]}}]}),
+                                json!({"id":"c1","choices":[{"index":0,"delta":{},
+                                    "finish_reason":"tool_calls"}],
+                                    "usage":{"prompt_tokens":10,"completion_tokens":5}})
+                            )
+                        } else {
+                            // Turn 2: the answer, in several chunks — the whole
+                            // point is that each one reaches the client.
+                            let mut s = String::new();
+                            for piece in ["Found", " it", " here", "."] {
+                                s += &format!(
+                                    "data: {}\n\n",
+                                    json!({"id":"c2","choices":[{"index":0,
+                                        "finish_reason":null,"delta":{"content":piece}}]})
+                                );
+                            }
+                            s += &format!(
+                                "data: {}\n\ndata: [DONE]\n\n",
+                                json!({"id":"c2","choices":[{"index":0,"delta":{},
+                                    "finish_reason":"stop"}],
+                                    "usage":{"prompt_tokens":20,"completion_tokens":3}})
+                            );
+                            s
+                        };
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(sse))
+                            .unwrap()
+                    }
+                }),
+            )
+            .into_make_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.openai_up]
+spec = "openai"
+base_url = "http://{addr}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "openai_up"
+model = "deepseek-v4-flash"
+
+[search]
+provider = "exa"
+api_key = "test-key"
+"#
+        );
+        let cfg: Config = toml::from_str(&cfg_text).unwrap();
+        let mut gw = Gateway::new(Arc::new(cfg));
+        gw.search = Some(Arc::new(crate::search::SearchManager::new(Some(Box::new(
+            MockSearch,
+        )))));
+        let res = router(Arc::new(gw));
+
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("host", "127.0.0.1:8710")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"claude-sonnet-5","max_tokens":64,"stream":true,
+                    "tools":[{"type":"web_search_20250305","name":"web_search"}],
+                    "messages":[{"role":"user","content":[{"type":"text","text":"search for turnpike"}]}]}"#,
+            ))
+            .unwrap();
+        let res = tower::ServiceExt::oneshot(res, req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        let indices: Vec<u64> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .filter(|v| v["type"] == "content_block_delta")
+            .filter_map(|v| v["index"].as_u64())
+            .collect();
+        assert!(
+            indices.iter().any(|i| indices.iter().filter(|j| *j == i).count() > 1),
+            "a block's deltas must repeat on the search path too: {indices:?}"
+        );
+        // Every delta of the answer reaches the client, in order.
+        assert!(text.contains(r#""text":"Found""#));
+        assert!(text.contains(r#""text":" it""#));
+        assert!(text.contains(r#""text":" here""#));
+        assert!(text.contains(r#""text":".""#));
+    }
+
+    #[test]
+    fn a_failed_search_reports_an_anthropic_error_object() {
+        // Anthropic: "On an error, `content` is a single error object rather
+        // than a list of result blocks." turnpike used to emit a bare string
+        // here, which a typed client cannot read as a search result.
+        let blocks = search_trace_error_blocks(
+            "srvtoolu_1",
+            "rust",
+            &crate::search::SearchError::Api("boom".into()),
+        );
+        let result = blocks
+            .iter()
+            .find(|b| b["type"] == "web_search_tool_result")
+            .expect("result block");
+        assert_eq!(result["content"]["type"], "web_search_tool_result_error");
+        assert_eq!(result["content"]["error_code"], "unavailable");
+        // The tool_use half still names the query the search attempted.
+        let use_block = blocks
+            .iter()
+            .find(|b| b["type"] == "server_tool_use")
+            .expect("use block");
+        assert_eq!(use_block["input"]["query"], "rust");
     }
 
     #[test]
@@ -2430,47 +3197,6 @@ model = "m"
         assert_eq!(res.status(), StatusCode::OK);
         let openai = seen.lock().await.take().unwrap();
         assert!(openai.get("tools").is_none(), "server tools stripped");
-    }
-
-    #[test]
-    fn anthropic_json_to_sse_full_grammar() {
-        let msg = json!({
-            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
-            "content": [
-                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "q"}},
-                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
-                 "content": [{"type": "web_search_result", "url": "https://x", "title": "T"}]},
-                {"type": "text", "text": "Answer"}
-            ],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 11, "output_tokens": 4}
-        });
-        let sse = anthropic_json_to_sse(&msg);
-        let events: Vec<&str> = sse
-            .lines()
-            .filter(|l| l.starts_with("event: "))
-            .map(|l| &l[7..])
-            .collect();
-        assert_eq!(
-            events,
-            vec![
-                "message_start",
-                "content_block_start", // server_tool_use
-                "content_block_delta",
-                "content_block_stop",
-                "content_block_start", // web_search_tool_result
-                "content_block_stop",
-                "content_block_start", // text
-                "content_block_delta",
-                "content_block_stop",
-                "message_delta",
-                "message_stop",
-            ]
-        );
-        assert!(sse.contains("\"input_tokens\":11"));
-        // server_tool_use input travels as input_json_delta (escaped JSON).
-        assert!(sse.contains(r#"\"query\":\"q\""#));
-        assert!(sse.contains("https://x"));
     }
 
     // -----------------------------------------------------------------------

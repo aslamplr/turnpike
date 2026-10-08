@@ -95,8 +95,16 @@ cargo test        # inline #[cfg(test)] modules per file
   iteration 0 to forward the client's pin, and the upstream's 400 went straight back to the client
   with no search executed. `"auto"`/`"none"` and a pin to any *other* tool pass through untouched.
   With no search provider configured,
-  server tools are stripped from bridged requests. Search runs against the non-streaming upstream
-  and is rendered as full SSE if the client streamed. Every executed search's tool-result content
+  server tools are stripped from bridged requests. A non-streaming client gets the buffered loop
+  (iterations non-streaming upstream, assembled JSON back); a streaming client gets the **live**
+  loop, where every iteration is streamed from the upstream and forwarded as it arrives —
+  `web_search` calls open `server_tool_use` blocks as the model produces them, the searches run at
+  that iteration's `finish_reason`, `web_search_tool_result` is emitted, and the loop re-invokes on
+  the same SSE stream. That is Anthropic's own server-tool streaming grammar, and it is what makes
+  the rendition incremental (`anthropic_json_to_sse`, which synthesized the whole message and
+  re-emitted it, is gone). Thinking blocks are emitted only when the request asked for them;
+  `stop_sequences` are matched locally rather than forwarded as OpenAI's `stop`, because OpenAI
+  strips the sequence from the text it returns and a hit would otherwise be unrecoverable. Every executed search's tool-result content
   is wrapped in an explicit `untrusted web data` trust boundary by `format_results()` (the single
   choke point for Exa and SearXNG in `src/search/mod.rs`) — web content can carry prompt injection.
 - **Model resolution** (`Config::resolve()`): exact route id → route whose upstream model matches

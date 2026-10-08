@@ -25,6 +25,11 @@ Exit status is 0 when nothing regressed. Three outcomes are not failures:
   CHANGED  a documented divergence is *gone* — a fix landed and the doc (and
            this file) need updating
 
+The nine divergences that doc once recorded are all closed, so no check here
+calls `known(...)` today and a run should report `KNOWN 0`. The `known` helper
+stays: it is the right shape for the next divergence, because a suite that can
+only say PASS/FAIL goes quiet the moment a known gap is written down.
+
 Why the User-Agent matters: turnpike forwards the client's `User-Agent`
 verbatim, and the upstream WAF in front of opencode.ai blocks `Python-urllib/*`
 by name. A bare `urllib` probe therefore reports `403` against a gateway that
@@ -38,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -92,6 +98,36 @@ class Probe:
             return e.code, dict(e.headers), e.read().decode()
         except Exception as e:  # connection refused, timeout, ...
             return 0, {}, f"{type(e).__name__}: {e}"
+
+    def request_stream_timing(self, path: str, body: dict) -> tuple[float, float]:
+        """(seconds to first byte, seconds to last) for one streaming POST.
+
+        Read incrementally so the *spread* is measurable: a rendition that is
+        delivered as one lump has a first byte and a last byte a few
+        milliseconds apart, however long the request took overall. Returns
+        (0.0, 0.0) on failure.
+        """
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            self.base_url + path,
+            data=data,
+            headers={
+                "content-type": "application/json",
+                "anthropic-version": ANTHROPIC_VERSION,
+                "user-agent": CLIENT_UA,
+            },
+            method="POST",
+        )
+        start = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                resp.read(1)
+                first = time.monotonic()
+                while resp.read(65536):
+                    pass
+        except Exception:
+            return 0.0, 0.0
+        return first - start, time.monotonic() - start
 
     # -- assertions -------------------------------------------------------
 
@@ -185,6 +221,36 @@ def text_of(body: dict) -> str:
 
 def block_types(body: dict) -> list[str]:
     return [b.get("type") for b in (body or {}).get("content", [])]
+
+
+# Anthropic's error codes for a failed web search.
+SEARCH_ERROR_CODES = {
+    "too_many_requests",
+    "invalid_tool_input",
+    "max_uses_exceeded",
+    "query_too_long",
+    "request_too_large",
+    "unavailable",
+}
+
+
+def search_result_shape(content) -> str:
+    """Classify a `web_search_tool_result`'s content against Anthropic's schema.
+
+    Success is a (possibly empty) list of `web_search_result`; failure is a
+    single `web_search_tool_result_error` object — "on an error, `content` is a
+    single error object rather than a list of result blocks". A bare string is
+    neither, which is what turnpike used to emit.
+    """
+    if isinstance(content, list):
+        return (
+            "results"
+            if all(isinstance(x, dict) and x.get("type") == "web_search_result" for x in content)
+            else "malformed"
+        )
+    if isinstance(content, dict) and content.get("type") == "web_search_tool_result_error":
+        return "error"
+    return "malformed"
 
 
 WEATHER_TOOL = [
@@ -315,9 +381,9 @@ def local_checks(p: Probe) -> None:
         f"status={status} input_tokens={tokens}",
     )
 
-    # KNOWN: estimate_tokens() walks `system` and `messages` only, so the tool
-    # block Claude Code sends never enters the estimate. docs/anthropic-compat.md
-    # records the divergence and the fix.
+    # Anthropic's count_tokens counts tool definitions, and a Claude Code
+    # request is dominated by its tool list — so the estimate must move when
+    # the tools block does, and strictly upward.
     big_tools = [
         {
             "name": f"tool_{i}",
@@ -331,43 +397,72 @@ def local_checks(p: Probe) -> None:
         {"model": p.model, "tools": big_tools, "messages": [{"role": "user", "content": "hi"}]},
     )
     with_tools = (as_json(text) or {}).get("input_tokens")
-    p.known(
+    p.check(
         "count_tokens",
-        "tools are excluded from the estimate",
-        with_tools is not None and with_tools <= tokens,
+        "tools are counted in the estimate",
+        with_tools is not None and with_tools > tokens,
         f"base={tokens} with_20_large_tools={with_tools}",
     )
 
-    status, _, _ = p.request(
+    # Same unknown id as the /v1/messages check above, so the two must agree.
+    status, _, text = p.request(
         "/v1/messages/count_tokens", {"model": "no-such-model", "messages": []}
     )
-    p.known(
+    error = (as_json(text) or {}).get("error", {})
+    p.check(
         "count_tokens",
-        "unknown model -> 400, not the 404 /v1/messages gives",
-        status == 400,
-        f"status={status}",
+        "unknown model -> 404 not_found_error, as /v1/messages gives",
+        status == 404 and error.get("type") == "not_found_error",
+        f"status={status} type={error.get('type')}",
     )
 
     print("\n-- models API / batches --")
 
-    status, _, _ = p.request(f"/v1/models/{p.model}", method="GET")
-    p.known(
+    status, _, text = p.request(f"/v1/models/{p.model}", method="GET")
+    entry = as_json(text) or {}
+    p.check(
         "models",
-        "GET /v1/models/{id} is not routed",
-        status == 404,
+        "GET /v1/models/{id} returns the bare ModelInfo",
+        status == 200 and entry.get("type") == "model" and entry.get("id") == p.model,
+        f"status={status} id={entry.get('id')}",
+    )
+    status, _, text = p.request("/v1/models/no-such-model", method="GET")
+    p.check(
+        "models",
+        "unknown model id -> 404 not_found_error",
+        status == 404 and (as_json(text) or {}).get("error", {}).get("type") == "not_found_error",
         f"status={status}",
     )
 
     _, _, text = p.request("/v1/models", method="GET")
     entry = ((as_json(text) or {}).get("data") or [{}])[0]
-    p.known(
+    caps = entry.get("capabilities") or {}
+    p.check(
         "models",
-        "entries lack max_input_tokens / capabilities",
-        "max_input_tokens" not in entry and "capabilities" not in entry,
+        "entries carry max_input_tokens and capabilities",
+        "max_input_tokens" in entry and "capabilities" in entry,
         f"fields={sorted(entry.keys())}",
     )
+    # "Keys are always present for all known capabilities."
+    known_caps = [
+        "batch", "citations", "code_execution", "context_management", "effort",
+        "image_input", "pdf_input", "server_tools", "structured_outputs", "thinking",
+    ]
+    p.check(
+        "models",
+        "capabilities carry every known key",
+        all(k in caps for k in known_caps),
+        f"missing={[k for k in known_caps if k not in caps]}",
+    )
+    p.check(
+        "models",
+        "capability values are honest (batch off, images on)",
+        caps.get("batch", {}).get("supported") is False
+        and caps.get("image_input", {}).get("supported") is True,
+        f"batch={caps.get('batch')} image_input={caps.get('image_input')}",
+    )
 
-    status, _, _ = p.request(
+    status, _, text = p.request(
         "/v1/messages/batches",
         {
             "requests": [
@@ -378,11 +473,14 @@ def local_checks(p: Probe) -> None:
             ]
         },
     )
-    p.known(
+    error = (as_json(text) or {}).get("error", {})
+    p.check(
         "batches",
-        "Message Batches envelope is not accepted",
-        status == 400,
-        f"status={status}",
+        "Message Batches path -> shaped 404, not a parse error",
+        status == 404
+        and error.get("type") == "not_found_error"
+        and "Batches" in (error.get("message") or ""),
+        f"status={status} type={error.get('type')} message={error.get('message')}",
     )
 
 
@@ -556,8 +654,11 @@ def upstream_checks(p: Probe) -> None:
     )
     p.check("tools", "tool_choice=auto accepted", status == 200, f"status={status}")
 
-    # KNOWN: map_tool_choice() reads only `type` and `name`, so the flag never
-    # reaches the upstream and parallel calls still come back.
+    # The flag is now translated to OpenAI's `parallel_tool_calls: false`, but
+    # whether the *provider* honours it is the provider's business — so this
+    # asserts only that the request is accepted. The real assertion, that the
+    # field reaches the upstream payload, is a unit test on
+    # `request_to_openai` (it cannot be observed from outside the gateway).
     status, _, text = p.request(
         "/v1/messages",
         {
@@ -572,11 +673,11 @@ def upstream_checks(p: Probe) -> None:
     )
     body = as_json(text) or {}
     calls = [b for b in body.get("content", []) if b.get("type") == "tool_use"]
-    p.known(
+    p.check(
         "tools",
-        "disable_parallel_tool_use is dropped",
-        status == 200 and len(calls) != 1,
-        f"status={status} n_tool_use={len(calls)} (Anthropic would cap this at 1)",
+        "disable_parallel_tool_use accepted (cap is upstream-side)",
+        status == 200,
+        f"status={status} n_tool_use={len(calls)} (provider-dependent; forwarded as parallel_tool_calls=false)",
     )
 
     # tool_result round-trip: the follow-up assistant turn must see the result.
@@ -758,44 +859,67 @@ def upstream_checks(p: Probe) -> None:
     )
     p.check("blocks", "empty-signature thinking replay tolerated", status == 200, f"status={status}")
 
-    # KNOWN: thinking is synthesized from the upstream's `reasoning_content`,
-    # so there is no real signature to carry. See docs/anthropic-compat.md.
-    status, _, text = p.request("/v1/messages", message(p, max_tokens=200))
+    # Thinking has to be *requested* for a thinking block to be part of the
+    # response: the bridge gates on the request, because the upstream returns
+    # reasoning_content on essentially every call.
+    status, _, text = p.request(
+        "/v1/messages", message(p, max_tokens=200, thinking={"type": "enabled"})
+    )
     body = as_json(text) or {}
     thinking = [b for b in body.get("content", []) if b.get("type") == "thinking"]
     if thinking:
-        p.known(
+        # The bridge synthesizes thinking from `reasoning_content`, so there is
+        # no real signature to carry. Anthropic's is a cryptographic
+        # attestation only it can produce; the bridge emits a clearly synthetic
+        # one (base64 of a SHA-256, prefixed `turnpike-synthetic:` in the hash
+        # input) so the block's *shape* is valid for typed consumers.
+        signature = thinking[0].get("signature")
+        p.check(
             "blocks",
-            "thinking blocks carry no `signature`",
-            "signature" not in thinking[0],
-            f"keys={sorted(thinking[0].keys())}",
+            "thinking blocks carry a `signature`",
+            isinstance(signature, str) and len(signature) > 20,
+            f"keys={sorted(thinking[0].keys())} signature_len={len(signature) if isinstance(signature, str) else '?'}",
         )
     else:
         p.skip("blocks", "thinking block shape", "upstream returned no reasoning this run")
 
-    # The stream side of the same divergence: a renderer watching the events
-    # never sees a `signature_delta`, so a thinking block is never completed in
-    # the way Anthropic's grammar completes one. `grep signature
-    # src/translate/stream.rs` returns nothing — no path emits one.
-    status, _, text = p.request("/v1/messages", message(p, max_tokens=200, stream=True))
+    # The stream side of the same shape: a thinking block completes with a
+    # `signature_delta` before its `content_block_stop`, as Anthropic's grammar
+    # requires.
+    status, _, text = p.request(
+        "/v1/messages",
+        message(p, max_tokens=200, stream=True, thinking={"type": "enabled"}),
+    )
     events = parse_sse(text)
     saw_thinking = any(
         e == "content_block_start" and (d.get("content_block") or {}).get("type") == "thinking"
         for e, d in events
     )
     if saw_thinking:
-        p.known(
+        p.check(
             "blocks",
-            "no signature_delta is ever emitted",
-            not any(
+            "a signature_delta completes the thinking block",
+            any(
                 e == "content_block_delta"
                 and (d.get("delta") or {}).get("type") == "signature_delta"
                 for e, d in events
             ),
-            "thinking block streamed without a signature_delta",
+            "thinking block streamed with a signature_delta",
         )
     else:
         p.skip("blocks", "signature_delta", "upstream returned no reasoning this run")
+
+    # Divergence 7's replacement assertion: thinking must NOT appear when the
+    # request did not ask for it — and `{type: "disabled"}` is a request not to.
+    for label, extra in [("absent", {}), ("disabled", {"thinking": {"type": "disabled"}})]:
+        status, _, text = p.request("/v1/messages", message(p, max_tokens=200, **extra))
+        body = as_json(text) or {}
+        p.check(
+            "blocks",
+            f"no thinking block when the parameter is {label}",
+            status == 200 and "thinking" not in block_types(body),
+            f"status={status} blocks={block_types(body)}",
+        )
 
     # The upstream returned 400 for a URL source while base64 succeeded. That is
     # provider-side (it could not fetch the URL), not a translation gap — the
@@ -1039,19 +1163,43 @@ def upstream_checks(p: Probe) -> None:
         status == 200 and "server_tool_use" in types and "web_search_tool_result" in types,
         f"status={status} blocks={types}",
     )
-    result = next(
-        (b for b in body.get("content", []) if b.get("type") == "web_search_tool_result"), None
-    )
-    content = (result or {}).get("content")
+    # Every result block must be one of Anthropic's two shapes. A search that
+    # errors is not a probe failure — it is a live provider hiccup — but it
+    # must still be *shaped* the way a client can read.
+    results = [b for b in body.get("content", []) if b.get("type") == "web_search_tool_result"]
+    shapes = [search_result_shape(b.get("content")) for b in results]
     p.check(
         "search",
-        "tool result content is a list of web_search_result",
-        isinstance(content, list)
-        and bool(content)
-        and all(x.get("type") == "web_search_result" for x in content),
-        f"n={len(content) if isinstance(content, list) else '?'} "
-        f"first={content[0].get('title', '')[:40] if isinstance(content, list) and content else '?'}",
+        "tool result content is Anthropic-shaped (results or an error object)",
+        bool(results) and all(s != "malformed" for s in shapes),
+        f"shapes={shapes}",
     )
+    ok = next(
+        (b for b in results if isinstance(b.get("content"), list) and b["content"]),
+        None,
+    )
+    if ok:
+        first = ok["content"][0]
+        p.check(
+            "search",
+            "web_search_result carries url + title",
+            all(k in first for k in ("type", "url", "title")),
+            f"keys={sorted(first.keys())}",
+        )
+    else:
+        p.skip("search", "web_search_result shape", "every search failed this run")
+
+    errored = [b for b in results if search_result_shape(b.get("content")) == "error"]
+    if errored:
+        code = errored[0]["content"]["error_code"]
+        p.check(
+            "search",
+            "a failed search reports web_search_tool_result_error",
+            code in SEARCH_ERROR_CODES,
+            f"error_code={code}",
+        )
+    else:
+        p.skip("search", "search error shape", "no search failed this run")
     p.check(
         "search",
         "final answer text present",
@@ -1079,20 +1227,40 @@ def upstream_checks(p: Probe) -> None:
         and "server_tool_use" in [t for _, t in started],
         f"blocks={started} n={len(names)}",
     )
-    # KNOWN: anthropic_json_to_sse() synthesizes the complete message first and
-    # then re-emits it, so every block arrives as one whole-block delta. Valid
-    # SSE, but not incremental — a client can only paint whole blocks, never
-    # tokens. Contrast the plain-path control above.
+    # The same property the plain-path control asserts, now that the loop
+    # streams each iteration instead of synthesizing the message and re-emitting
+    # it: a block's delta index repeats, so a client paints tokens and not just
+    # whole blocks. This is divergence 1's assertion, inverted.
     search_indices = [d.get("index") for e, d in events if e == "content_block_delta"]
     if search_indices:
-        p.known(
+        p.check(
             "search",
-            "rendition is non-incremental (one delta per block)",
-            len(search_indices) == len(set(search_indices)),
-            f"delta_indices={search_indices} (the plain path repeats indices instead)",
+            "rendition is incremental (a block's deltas repeat)",
+            any(search_indices.count(i) > 1 for i in search_indices),
+            f"n_deltas={len(search_indices)} distinct_blocks={len(set(search_indices))} "
+            f"indices={search_indices}",
         )
     else:
         p.skip("search", "rendition granularity", "no deltas in this run")
+
+    # The stall that used to precede the rendition is a *timing* property and
+    # cannot be read off the event list, so it is measured: the stream has to
+    # span time rather than arrive as one lump. Before the loop streamed, the
+    # first byte landed ~38.8s in and everything else inside 4ms.
+    first_s, total_s = p.request_stream_timing(
+        "/v1/messages",
+        {"model": p.model, "max_tokens": 512, "stream": True, "tools": search_tools,
+         "messages": [{"role": "user", "content": search_ask}]},
+    )
+    if total_s:
+        p.check(
+            "search",
+            "stream spans time, not one lump at the end",
+            total_s - first_s > 0.3,
+            f"first_byte={first_s:.2f}s total={total_s:.2f}s spread={total_s - first_s:.2f}s",
+        )
+    else:
+        p.skip("search", "stream timing", "request failed")
 
     status, _, text = p.request(
         "/v1/messages",
@@ -1124,9 +1292,10 @@ def upstream_checks(p: Probe) -> None:
 
     print("\n-- stop_sequences and error shaping --")
 
-    # KNOWN: map_finish() turns the upstream's `stop` into end_turn, and
-    # stop_sequence is hardcoded null on both paths, so a stop-sequence hit is
-    # indistinguishable from a natural end.
+    # The bridge no longer forwards `stop` upstream — OpenAI strips the
+    # sequence from the text it returns, so a hit could not be recovered from
+    # `finish_reason` or from the text. It keeps the list and truncates
+    # locally, which is what Anthropic does server-side.
     status, _, text = p.request(
         "/v1/messages",
         {
@@ -1145,10 +1314,11 @@ def upstream_checks(p: Probe) -> None:
     # like a stop-sequence hit to a naive `"BANANA" not in text` test.
     hit = bool(answer) and "BANANA" not in answer
     if hit:
-        p.known(
+        p.check(
             "stop",
-            "a stop-sequence hit reports end_turn / null",
-            body.get("stop_reason") != "stop_sequence",
+            "a stop-sequence hit reports stop_sequence",
+            body.get("stop_reason") == "stop_sequence"
+            and body.get("stop_sequence") == "BANANA",
             f"stop_reason={body.get('stop_reason')} stop_sequence={body.get('stop_sequence')!r} "
             f"answer={answer[:24]!r}",
         )
