@@ -163,7 +163,12 @@ paths diverge (see [proxy.rs](gateway.md)'s `bridge()` and
    request goes **non-streaming** for all loop iterations, and the client's
    `stream` flag is honored only at the end, by rendering the final JSON as
    a complete SSE sequence (`anthropic_json_to_sse`). Interleaving a tool
-   loop with a live token stream is not worth the complexity.
+   loop with a live token stream is not worth the complexity. The rendition
+   is therefore valid SSE but not *incremental*: each block is emitted as
+   `content_block_start` → one whole-block `content_block_delta` → `stop`,
+   so a client can paint whole blocks and never tokens. The client-visible
+   consequence is recorded as divergence 1 in
+   [anthropic-compat.md](anthropic-compat.md).
 
 Both paths converge on the same translation functions above; only the framing
 differs. See [search.md](search.md) for the loop itself.

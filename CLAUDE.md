@@ -183,7 +183,9 @@ cargo test        # inline #[cfg(test)] modules per file
 ## Documentation
 
 `docs/` is the design source of truth: architecture, HTTP surface, bridge translation tables +
-streaming grammar, search middleware, configuration, launchers. The repo's own rule:
+streaming grammar, search middleware, configuration, launchers, and the Anthropic API surface as an
+outside client sees it (`anthropic-compat.md`, with its probe in `tests/anthropic_compat_check.py`).
+The repo's own rule:
 **"The code is the source of truth — if a doc and the code disagree, the doc is wrong."**
 So when behavior changes, update the relevant `docs/*.md` too.
 
@@ -215,7 +217,11 @@ So when behavior changes, update the relevant `docs/*.md` too.
   config resolution, and launcher env/profile shape. The one exception is `tests/config_edit_stdout.rs`:
   a process-boundary property (spawned binary, its stdout is one JSON line) that an inline test
   cannot assert, because every test in the binary shares one stdout and a capture there races
-  the suite.
+  the suite. The second is `tests/anthropic_compat_check.py`: a live-network probe of a *running*
+  gateway (findings in `docs/anthropic-compat.md`), which needs a real provider key behind it and
+  spends upstream quota, so it cannot be a `cargo test`. `--local-only` runs the subset that never
+  reaches the upstream. It reports `KNOWN` for each divergence that doc records, so a `FAIL` always
+  means something new.
 - **No env mutation in tests.** `TURNPIKE_HOME` points at `temp_root(tag)` instead of mutating
   `HOME`; `resolve_chain` is pure for the same reason.
 - Mock injection **by construction**, not by global: `MemoryStore` for the secret store,
