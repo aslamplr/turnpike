@@ -16,7 +16,7 @@ uniform `DefaultBodyLimit` of 64 MiB (`MAX_BODY_BYTES`) applied to every route.
 | `/v1/models` | `models` | Anthropic-style model catalog built from the configured routes. |
 | `/v1/messages/count_tokens` | `count_tokens` | Local heuristic estimate; no upstream call. |
 | `/v1/messages` | `forward_anthropic` | The primary Claude-spec path. |
-| `/v1/messages/batches` | `forward_anthropic` | Same handler: messages and batches share a family. |
+| `/v1/messages/batches` | `forward_anthropic` | **Not a batch API.** The path maps to the Messages handler, so a batch envelope (`{"requests": […]}`) is decoded as a Messages body and refused with `400 "model is required"`. See [anthropic-compat.md](anthropic-compat.md#bonus-v1messagesbatches-is-not-a-batch-api). |
 | `/v1/chat/completions` | `forward_chat_completions` | OpenAI chat path (non-streaming and streaming `stream: true` both accepted). |
 | `/v1/completions` | `forward_completions` | Legacy completions path. |
 | `/v1/responses` | `forward_responses` | OpenAI Responses API path. |

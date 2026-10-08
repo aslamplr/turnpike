@@ -10,6 +10,7 @@ disagree, the doc is wrong.
 | [architecture.md](architecture.md) | System overview, design goals, request lifecycle, module map, relation to Ollama |
 | [configuration.md](configuration.md) | Full config reference: `[server]`, `[providers.*]`, `[routes.*]`, `[search]`; resolution rules; defaults |
 | [gateway.md](gateway.md) | The proxy: HTTP surface, forwarding pipeline, model remapping, security posture, error shapes |
+| [anthropic-compat.md](anthropic-compat.md) | The Anthropic API as an outside client sees it: what the compatibility probe asserts, the known divergences from Anthropic's contract, and how to re-run it |
 | [routing.md](routing.md) | Per-route targets: the `[[…target]]` array, `static` / `load-balance` / `failover`, what is retryable, the context-window order |
 | [bridge.md](bridge.md) | The Anthropic ↔ OpenAI spec bridge: request, response, and streaming translation |
 | [search.md](search.md) | Agentic search middleware: `SearchProvider` trait, Exa, SearXNG, the closed-loop mechanics |
