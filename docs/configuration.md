@@ -123,7 +123,7 @@ loop instead of forwarding the tool call to the client. See [search.md](search.m
 | `api_key` | none | Inline key; only Exa needs one. Same three-tier precedence as above, and same advice: prefer the store. |
 | `api_key_env` | none | Env var holding the key, e.g. `EXA_API_KEY`. |
 | `base_url` | `http://127.0.0.1:8080` | Base URL for providers without a cloud API (SearXNG). |
-| `max_loops` | `5` | Maximum middleware iterations per request. |
+| `max_loops` | `5` | Maximum middleware iterations per request, tightened one-way by a declared `web_search` tool's `max_uses`. |
 
 If `provider` is set but the key can't be resolved (Exa), the middleware is
 disabled with a warning — server tools are then **dropped** from bridged

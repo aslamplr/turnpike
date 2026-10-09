@@ -89,17 +89,22 @@ When `[search]` is configured (Exa or SearXNG) **and** the bridged request
 declares the Anthropic `web_search` server tool, `bridge()` stops doing a
 single upstream call and runs Ollama's middleware loop instead:
 
-- the request is sent **non-streaming** to the upstream (iteration 0),
+- iteration 0 goes to the upstream however the client asked — buffered for a
+  non-streaming client, streamed for a streaming one,
 - if the model answers with a `web_search` tool call, the gateway runs the
   search itself, appends the `role:"tool"` result to the conversation, and
   re-invokes the model,
-- this repeats up to `max_loops` times; as soon as the model answers without a
+- this repeats up to `max_loops` times — the `[search]` budget, tightened
+  one-way by the tool's `max_uses`; as soon as the model answers without a
   search call, the loop ends,
 - the final answer is prefixed with `server_tool_use` + `web_search_tool_result`
   trace blocks — which Claude clients render natively as "Searched the web…" —
-  and usage is summed across every iteration,
-- if the client asked to stream, the final JSON is rendered as a complete
-  Anthropic SSE sequence rather than streamed intermediate tokens.
+  and usage is summed across every iteration (`input_tokens` the uncached
+  remainder, cache reads reported when any iteration had them),
+- a non-streaming client gets the buffered loop with the assembled JSON as the
+  response; a streaming client gets the **live** loop, where every iteration
+  streams from the upstream and is forwarded as it arrives — see
+  [search.md](search.md) for the streaming grammar.
 
 See [search.md](search.md) for the full mechanic.
 

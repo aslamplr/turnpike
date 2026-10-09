@@ -751,7 +751,16 @@ async fn bridge(
             .await;
         }
     };
-    let max_loops = gw.search_max_loops;
+    let configured_loops = gw.search_max_loops;
+    let max_loops = request_search_budget(configured_loops, &payload);
+    if max_loops != configured_loops {
+        tracing::info!(
+            %requested,
+            max_loops = configured_loops,
+            clamped_to = max_loops,
+            "search loop budget tightened by the tool's max_uses"
+        );
+    }
     tracing::info!(
         %requested,
         upstream = %resolved.upstream_model,
@@ -809,6 +818,11 @@ async fn bridge(
     let mut trace: Vec<Value> = Vec::new();
     let mut total_input = 0u64;
     let mut total_output = 0u64;
+    // Raw cache-read counts, summed in provider units and split at the end —
+    // `input_tokens` must be the uncached remainder (Anthropic semantics), so
+    // the subtraction happens after the loop, not per iteration.
+    let mut total_cached = 0u64;
+    let mut saw_cache = false;
     let mut final_openai: Option<Value> = None;
 
     for iteration in 0..=max_loops {
@@ -837,14 +851,25 @@ async fn bridge(
                 return anthropic_error(StatusCode::BAD_GATEWAY, format!("decode upstream: {e}"));
             }
         };
-        total_input += openai_json
+        let prompt = openai_json
             .pointer("/usage/prompt_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        total_input += prompt;
         total_output += openai_json
             .pointer("/usage/completion_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        if let Some(c) = openai_json
+            .pointer("/usage/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+        {
+            saw_cache = true;
+            // Clamped per iteration, as `split_usage` clamps per response: an
+            // upstream that over-reports must not inflate the summed reads
+            // past the summed prompts.
+            total_cached += c.min(prompt);
+        }
 
         let calls = openai_json
             .pointer("/choices/0/message/tool_calls")
@@ -884,8 +909,8 @@ async fn bridge(
 
     tracing::info!(
         %requested,
-        input_tokens = total_input,
-        output_tokens = total_output,
+        usage_in = total_input,
+        usage_out = total_output,
         trace_blocks = trace.len(),
         "search loop complete: assembling final response"
     );
@@ -925,8 +950,13 @@ async fn bridge(
     }
     response["content"] = Value::Array(content);
 
-    // Usage spans every loop iteration.
-    response["usage"]["input_tokens"] = json!(total_input);
+    // Usage spans every loop iteration. Anthropic semantics: `input_tokens`
+    // is the uncached remainder, so the summed cache reads come back out of
+    // it; the key is omitted entirely when no iteration reported cache data.
+    response["usage"]["input_tokens"] = json!(total_input.saturating_sub(total_cached));
+    if saw_cache {
+        response["usage"]["cache_read_input_tokens"] = json!(total_cached);
+    }
     response["usage"]["output_tokens"] = json!(total_output);
 
     let stop_reason = response
@@ -1094,6 +1124,11 @@ async fn search_loop_streaming(
         let loop_template = loop_template;
         let mut total_input = 0u64;
         let mut total_output = 0u64;
+        // Raw cache-read counts, summed in provider units and split at the
+        // end — the same invariant as the buffered loop: `input_tokens` is
+        // the uncached remainder.
+        let mut total_cached = 0u64;
+        let mut saw_cache = false;
         let mut iteration = 0usize;
         let mut final_stop: Option<String> = None;
         let mut emitted_answer = false;
@@ -1173,9 +1208,17 @@ async fn search_loop_streaming(
                         }
                     }
                     if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                        total_input += u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        let prompt = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        total_input += prompt;
                         total_output +=
                             u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        if let Some(c) = u
+                            .pointer("/prompt_tokens_details/cached_tokens")
+                            .and_then(Value::as_u64)
+                        {
+                            saw_cache = true;
+                            total_cached += c.min(prompt);
+                        }
                     }
                     for event in converter.process(&v) {
                         if event.name == "content_block_delta"
@@ -1292,7 +1335,13 @@ async fn search_loop_streaming(
                 out += &crate::translate::format_sse(&event.name, &event.data);
             }
         }
-        let usage = json!({"input_tokens": total_input, "output_tokens": total_output});
+        let mut usage = json!({
+            "input_tokens": total_input.saturating_sub(total_cached),
+            "output_tokens": total_output,
+        });
+        if saw_cache {
+            usage["cache_read_input_tokens"] = json!(total_cached);
+        }
         let tail = converter.finish_message(final_stop.as_deref().unwrap_or("end_turn"), &usage);
         if !tail.is_empty() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
@@ -1490,6 +1539,37 @@ async fn upstream_error_response(
 // ---------------------------------------------------------------------------
 
 const TURNPIKE_SEARCH_TOOL: &str = "web_search";
+
+/// The loop's budget for one request: `[search] max_loops`, tightened —
+/// one-way — by any declared `web_search` tool's `max_uses`.
+///
+/// `max_uses` is how a client caps gateway-executed searches (the budget is
+/// what the operator allowed the gateway to spend). Omitted, zero, or
+/// non-numeric keeps the configured budget; a larger value cannot raise it.
+fn request_search_budget(configured: usize, payload: &Value) -> usize {
+    let mut budget = configured;
+    let tools = payload.get("tools").and_then(Value::as_array);
+    for tool in tools.into_iter().flatten() {
+        let is_search = tool
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|ty| ty.starts_with("web_search"))
+            .unwrap_or(false);
+        if !is_search {
+            continue;
+        }
+        // Anthropic types `max_uses` as a number, not a strict integer;
+        // `as_f64` accepts the `5.0` spelling a raw `as_u64` would drop.
+        let uses = tool
+            .get("max_uses")
+            .and_then(|m| m.as_u64().or_else(|| m.as_f64().map(|f| f as u64)))
+            .filter(|u| *u > 0);
+        if let Some(uses) = uses {
+            budget = budget.min(uses as usize);
+        }
+    }
+    budget
+}
 
 /// True when the bridged OpenAI request advertises a turnpike-executed tool.
 fn has_turnpike_search_tool(openai_payload: &Value) -> bool {
@@ -2875,6 +2955,46 @@ api_key = "test-key"
             .find(|b| b["type"] == "server_tool_use")
             .expect("use block");
         assert_eq!(use_block["input"]["query"], "rust");
+    }
+
+    #[test]
+    fn search_budget_tightens_only_below_the_configured_budget() {
+        let tool = |uses: Option<u64>| {
+            let mut t = json!({"type": "web_search_20250305", "name": "web_search"});
+            if let Some(u) = uses {
+                t["max_uses"] = json!(u);
+            }
+            t
+        };
+        // Absent, zero and negative keep the configured budget.
+        assert_eq!(request_search_budget(5, &json!({"tools": [tool(None)]})), 5);
+        assert_eq!(
+            request_search_budget(5, &json!({"tools": [tool(Some(0))]})),
+            5
+        );
+        // A smaller cap tightens; a larger one cannot raise it.
+        assert_eq!(
+            request_search_budget(5, &json!({"tools": [tool(Some(2))]})),
+            2
+        );
+        assert_eq!(
+            request_search_budget(5, &json!({"tools": [tool(Some(9))]})),
+            5
+        );
+        // Several search tools tighten to the smallest cap.
+        assert_eq!(
+            request_search_budget(5, &json!({"tools": [tool(Some(4)), tool(Some(1))]})),
+            1
+        );
+        // A non-search tool's cap is none of the gateway's business.
+        assert_eq!(
+            request_search_budget(
+                5,
+                &json!({"tools": [{"type": "web_fetch_20250910", "max_uses": 1}]})
+            ),
+            5
+        );
+        assert_eq!(request_search_budget(5, &json!({})), 5);
     }
 
     #[test]

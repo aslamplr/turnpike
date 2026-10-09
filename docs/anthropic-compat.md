@@ -111,8 +111,10 @@ A non-streaming bridged response carries exactly:
 `id` is `msg_<hex>` and `model` is the **requested** id, never the upstream's.
 Anthropic additionally returns `stop_details` (populated only for a `refusal`,
 `null` otherwise) and `container`; both are absent here rather than wrong, which
-every SDK treats as `null`. `usage` carries `input_tokens`, `output_tokens` and
-`cache_read_input_tokens`, but not `cache_creation_input_tokens`.
+every SDK treats as `null`. `usage` carries `input_tokens` — the **uncached
+remainder**, per Anthropic's semantics, with `cache_read_input_tokens` beside
+it (omitted rather than zero when the upstream reported no cache data) — and
+`output_tokens`, but not `cache_creation_input_tokens`.
 
 ### The SSE grammar
 

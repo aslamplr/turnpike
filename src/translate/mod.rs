@@ -440,17 +440,15 @@ pub fn response_to_anthropic(
     );
 
     let usage = openai.get("usage").cloned().unwrap_or(Value::Null);
-    let input = usage
-        .get("prompt_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached = usage
-        .pointer("/prompt_tokens_details/cached_tokens")
-        .and_then(Value::as_u64);
-    let output = usage
-        .get("completion_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let (input, cached, output) = split_usage(&usage);
+
+    let mut usage_out = json!({
+        "input_tokens": input,
+        "output_tokens": output,
+    });
+    if let Some(c) = cached {
+        usage_out["cache_read_input_tokens"] = json!(c);
+    }
 
     let mut response = json!({
         "id": id,
@@ -460,14 +458,46 @@ pub fn response_to_anthropic(
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": input,
-            "cache_read_input_tokens": cached,
-            "output_tokens": output,
-        }
+        "usage": usage_out,
     });
     apply_stop_sequences(&mut response, &opts.stop_sequences);
     response
+}
+
+/// Split OpenAI's usage object into Anthropic's `(input, cached, output)`
+/// triple.
+///
+/// Anthropic semantics: `input_tokens` is the **uncached remainder only** —
+/// total prompt size is `input_tokens + cache_read_input_tokens` when the
+/// provider reports cache reads — while OpenAI's `prompt_tokens` is the full
+/// logical count and `prompt_tokens_details.cached_tokens` the part served
+/// from cache. Passing `prompt_tokens` through as `input_tokens` therefore
+/// double-counts every cached read, and a client summing the two fields
+/// overshoots the prompt itself.
+///
+/// A reported cached count is clamped into `[0, prompt_tokens]` — an
+/// upstream can over-report. `None` means the upstream reported no cache
+/// data at all, and the caller emits the full count with no cache field, the
+/// same shape as before this mapping existed.
+pub fn split_usage(usage: &Value) -> (u64, Option<u64>, u64) {
+    let prompt = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    match usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+    {
+        Some(c) => {
+            let cached = c.min(prompt);
+            (prompt - cached, Some(cached), output)
+        }
+        None => (prompt, None, output),
+    }
 }
 
 /// Truncate a translated response at the first stop sequence, the way
@@ -816,9 +846,62 @@ mod tests {
         assert_eq!(out["content"][2]["type"], "tool_use");
         assert_eq!(out["content"][2]["input"]["city"], "Paris");
         assert_eq!(out["stop_reason"], "tool_use");
-        assert_eq!(out["usage"]["input_tokens"], 11);
+        // Anthropic semantics: input_tokens is the uncached remainder —
+        // 11 total prompt, 4 served from cache.
+        assert_eq!(out["usage"]["input_tokens"], 7);
         assert_eq!(out["usage"]["cache_read_input_tokens"], 4);
         assert_eq!(out["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn usage_without_cache_data_stays_the_full_count() {
+        let openai: Value = serde_json::from_str(
+            r#"{"id":"c","choices":[{"finish_reason":"stop",
+                "message":{"content":"ok"}}],
+                "usage":{"prompt_tokens":42,"completion_tokens":3}}"#,
+        )
+        .unwrap();
+        let out = response_to_anthropic(
+            &openai,
+            "claude-sonnet-5",
+            "msg_x",
+            &ResponseOptions::default(),
+        );
+        assert_eq!(out["usage"]["input_tokens"], 42);
+        assert!(out["usage"]["cache_read_input_tokens"].is_null());
+        assert_eq!(out["usage"]["output_tokens"], 3);
+    }
+
+    #[test]
+    fn a_reported_cache_count_over_the_prompt_clamps() {
+        let (input, cached, output) =
+            split_usage(&json!({"prompt_tokens": 5, "completion_tokens": 1,
+                                "prompt_tokens_details": {"cached_tokens": 8}}));
+        assert_eq!(input, 0);
+        assert_eq!(cached, Some(5));
+        assert_eq!(output, 1);
+    }
+
+    #[test]
+    fn tool_use_argument_key_order_survives_translation() {
+        // Ollama's ac83ac2: re-serializing tool-call arguments through an
+        // unordered map emits the keys in a different order than the model
+        // generated — the replayed turn tokenizes differently and the
+        // upstream's prefix/KV cache misses from that point on. serde_json
+        // without `preserve_order` is exactly that map, so the feature must
+        // stay enabled and the order carried byte-for-byte.
+        let req: Value = serde_json::from_str(
+            r#"{"model":"m","max_tokens":1,"messages":[
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"t1","name":"f",
+                     "input":{"zebra":1,"alpha":2,"middle":3,"beta":4}}]}]}"#,
+        )
+        .unwrap();
+        let out = request_to_openai(&req, "m").unwrap();
+        let args = out["messages"][0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert_eq!(args, r#"{"zebra":1,"alpha":2,"middle":3,"beta":4}"#);
     }
 
     #[test]

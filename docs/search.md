@@ -39,12 +39,17 @@ module provides the providers and `src/proxy.rs` runs the loop.
    - Otherwise the assistant tool-call turn is appended to the conversation,
      each search executes against the provider, and the results are appended
      as `role: "tool"` messages (`tool_call_id` matching the call).
-   - Iterations run `0..=max_loops`; exhausting the budget logs a warning and
+   - Iterations run `0..=max_loops` — the `[search]` budget, tightened one-way
+     by any declared `web_search` tool's `max_uses` (`request_search_budget`:
+     a client can lower it, never raise it; absent, zero or non-numeric keeps
+     the configured budget); exhausting the budget logs a warning and
      terminates with whatever the last response was. The last iteration's
      searches still execute on the streaming path — a `server_tool_use` block
      without its result is invalid grammar.
 4. **Assemble.** The final response is translated back to Anthropic shape,
-   usage **summed across all iterations**, and every executed search appears
+   usage **summed across all iterations** — with `input_tokens` the uncached
+   remainder, the summed cache reads reported under `cache_read_input_tokens`
+   when any iteration had them — and every executed search appears
    as a `server_tool_use` + `web_search_tool_result` trace pair — the block
    types Anthropic itself emits for server tools, which Claude clients render
    natively ("Searched the web…", citation chips, source list).

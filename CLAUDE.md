@@ -86,7 +86,8 @@ cargo test        # inline #[cfg(test)] modules per file
   before forwarding; the provider key is injected per request. 64 MiB body limit.
 - **Agentic search middleware**: only when `[search]` is configured (a `web_search` server tool
   alias is declared by the client) AND the request is bridged. turnpike executes the searches
-  itself in a bounded loop (`0..=max_loops`, default 5), appends `role:"tool"` results, relaxes a
+  itself in a bounded loop (`0..=max_loops`, default 5, tightened one-way by the tool's
+  `max_uses`), appends `role:"tool"` results, relaxes a
   **forced** `tool_choice` (`"required"`, or a pin to `web_search`) to `"auto"` **before** the loop
   via `relax_forced_tool_choice()`, sums usage, and prefixes the final answer with
   `server_tool_use` + `web_search_tool_result` trace blocks. The relaxation is pre-loop, not

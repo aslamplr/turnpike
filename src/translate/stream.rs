@@ -412,23 +412,20 @@ impl StreamConverter {
                 .cloned()
                 .or_else(|| self.usage.take())
                 .unwrap_or(Value::Null);
-            let input = usage
-                .get("prompt_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let output = usage
-                .get("completion_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
+            // Anthropic semantics via the shared splitter: `input_tokens` is
+            // the uncached remainder, `cache_read_input_tokens` the reads —
+            // omitted entirely when the upstream reported no cache data.
+            let (input, cached, output) = super::split_usage(&usage);
+            let mut usage_out = json!({"input_tokens": input, "output_tokens": output});
+            if let Some(c) = cached {
+                usage_out["cache_read_input_tokens"] = json!(c);
+            }
             // The middleware loop drives the message's lifetime itself: this
             // iteration's blocks are closed, but a search round may follow on
             // the same stream, so the message must stay open.
             if self.defer_finish {
                 self.iteration_stop = Some(stop);
-                self.iteration_usage = Some(json!({
-                    "input_tokens": input,
-                    "output_tokens": output,
-                }));
+                self.iteration_usage = Some(usage_out);
                 return events;
             }
             events.push(Event {
@@ -436,7 +433,7 @@ impl StreamConverter {
                 data: json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": stop, "stop_sequence": seq},
-                    "usage": {"input_tokens": input, "output_tokens": output},
+                    "usage": usage_out,
                 }),
             });
             events.push(Event {
@@ -827,6 +824,29 @@ mod tests {
             .find(|(n, _)| n == "message_delta")
             .unwrap();
         assert_eq!(message_delta["usage"]["input_tokens"], 100);
+        assert_eq!(message_delta["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn streamed_usage_reports_the_uncached_remainder() {
+        let mut c = StreamConverter::new("msg_1".into(), "m".into(), 0);
+        let _ = c.process(&chunk(json!({"content": "x"}), None));
+        // include_usage sends a final choices-less chunk; a cached read rides
+        // alongside it there.
+        let _ = c.process(&json!({
+            "id": "chatcmpl-1", "choices": [],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 5,
+                      "prompt_tokens_details": {"cached_tokens": 84}}
+        }));
+        let all = c.process(&chunk(json!({}), Some("stop")));
+        let (_, message_delta) = event_bodies(&all)
+            .into_iter()
+            .rev()
+            .find(|(n, _)| n == "message_delta")
+            .unwrap();
+        // Anthropic semantics: the remainder only, reads reported separately.
+        assert_eq!(message_delta["usage"]["input_tokens"], 16);
+        assert_eq!(message_delta["usage"]["cache_read_input_tokens"], 84);
         assert_eq!(message_delta["usage"]["output_tokens"], 5);
     }
 

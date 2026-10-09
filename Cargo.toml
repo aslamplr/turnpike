@@ -16,7 +16,12 @@ http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2", "charset", "gzip", "deflate", "brotli"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` keeps Map keys in insertion order, not sorted. Without it a
+# tool-call's argument object round-trips with different key order than the
+# model generated, the replayed history tokenizes differently, and the
+# upstream's prefix/KV cache misses from that point on (Ollama fixed the same
+# degradation in its translating proxy).
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.9"
 anyhow = "1"
 thiserror = "2"

@@ -26,7 +26,7 @@ remapped upstream id — the client's id never reaches the provider.
 | `tool_use` blocks | `tool_calls` with `arguments` JSON-stringified |
 | `tool_result` / `web_search_tool_result` blocks | a separate `role: "tool"` message carrying `tool_call_id` (see ordering below) |
 | image blocks (`base64` or `url` source) | `image_url` content parts (`data:<media_type>;base64,…` / plain url) |
-| `max_tokens`, `temperature`, `top_p`, `stop_sequences` | `max_tokens`, `temperature`, `top_p`, `stop` |
+| `max_tokens`, `temperature`, `top_p`, `stop_sequences` | `max_tokens`, `temperature`, `top_p` — `stop` is **not** forwarded (matched locally, see below) |
 | `stream: true` | `stream: true` **plus** `stream_options: { include_usage: true }` so the provider emits a final usage chunk |
 
 **Tool-result ordering:** Anthropic's `tool_result` blocks arrive inside a
@@ -92,7 +92,17 @@ Anthropic message from a chat-completions response:
 | `message.content` | a `text` block |
 | `message.tool_calls` | `tool_use` blocks (arguments JSON-parsed back into `input`) |
 | `finish_reason` | `stop_reason` via `map_finish` (below) |
-| `usage.prompt_tokens` / `.completion_tokens` / `.prompt_tokens_details.cached_tokens` | `input_tokens` / `output_tokens` / `cache_read_input_tokens` |
+| `usage.prompt_tokens` / `.completion_tokens` / `.prompt_tokens_details.cached_tokens` | `input_tokens` (the **uncached remainder**) / `output_tokens` / `cache_read_input_tokens` |
+
+`split_usage()` does the mapping, and the semantics are Anthropic's:
+`input_tokens` is the uncached remainder — total prompt size is
+`input_tokens + cache_read_input_tokens` when the provider reports cache
+reads — while OpenAI's `prompt_tokens` is the full logical count, so passing
+it through would double-count every cached read. A reported cached count is
+clamped into `[0, prompt_tokens]` (an upstream can over-report), and the
+`cache_read_input_tokens` key is **omitted entirely** when the upstream
+reported no cache data — a reported zero and no data at all stay
+distinguishable on the wire.
 
 `map_finish(finish, has_tools)`:
 
