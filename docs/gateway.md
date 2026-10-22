@@ -165,9 +165,11 @@ dispatches: Anthropic family → `anthropic_error`, OpenAI family →
 { "type": "error", "error": { "type": "<et>", "message": "…" } }
 ```
 
-The error `type` (`et`) is derived from the HTTP status: `401 →
-authentication_error`, `403 → permission_error`, `404 → not_found_error`,
-`429 → rate_limit_error`, anything else → `invalid_request_error`.
+The error `type` (`et`) is derived from the HTTP status by
+`anthropic_error_type`, shared with the streaming terminal error events:
+`401 → authentication_error`, `403 → permission_error`, `404 →
+not_found_error`, `429 → rate_limit_error`, `529 → overloaded_error`,
+`500..=599 → api_error`, anything else → `invalid_request_error`.
 
 **OpenAI shape:**
 
@@ -181,8 +183,9 @@ Here `401 → authentication_error`, everything else (including 404) →
 The pipeline uses these per phase: guard failures `403` (permission_error),
 unresolvable model `404`, missing key `401`, oversized body `413` (shaped as
 `invalid_request_error` on the Anthropic side), invalid JSON and missing model
-`400`, upstream transport failure `502` `invalid_request_error` "upstream
-{provider} unavailable: {e}", and spec-mismatch `400`.
+`400`, upstream transport failure `502` `api_error` "upstream
+{provider} unavailable: {e}" (`anthropic_error_type` maps every 5xx to
+`api_error`, Anthropic's own meaning), and spec-mismatch `400`.
 
 ## What this file owns vs. what delegation means
 

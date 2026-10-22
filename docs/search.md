@@ -64,11 +64,15 @@ module provides the providers and `src/proxy.rs` runs the loop.
      loop re-invokes on the same SSE stream. This is Anthropic's own
      server-tool streaming grammar, and it means the client paints tokens
      while the model is still generating rather than after every search has
-     finished.
+     finished. A failure *after* streaming began — an upstream that dies
+     mid-body, a non-2xx re-invocation, an in-band error chunk — ends the
+     stream with Anthropic's terminal `error` event instead of truncating it;
+     see [bridge.md](bridge.md) for the grammar.
 
-Search failures don't kill the request: the tool result becomes a
-`search error: …` string and the trace pair is emitted in error form (see
-`search_trace_error_blocks`).
+Search failures don't kill the request: the result block is emitted in
+Anthropic's error form — `content` becomes
+`{"type": "web_search_tool_result_error", "error_code": …}` rather than a
+list of results (see `search_trace_error_blocks`).
 
 ## The `SearchProvider` trait
 

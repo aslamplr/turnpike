@@ -15,6 +15,23 @@ pub struct Event {
     pub data: Value,
 }
 
+/// An upstream error carried inside a data chunk: `{"error": "…"}` bare, or
+/// OpenAI-style `{"error": {"message": …, "type": …}}`. Returns the message
+/// and, when the upstream named its own error type, that too. `None` for a
+/// happy-path or usage-only chunk.
+fn in_band_error(chunk: &Value) -> Option<(Option<String>, String)> {
+    let e = chunk.get("error").filter(|e| !e.is_null())?;
+    let msg = e
+        .as_str()
+        .map(String::from)
+        .or_else(|| e.get("message").and_then(Value::as_str).map(String::from))?;
+    if msg.is_empty() {
+        return None;
+    }
+    let etype = e.get("type").and_then(Value::as_str).map(String::from);
+    Some((etype, msg))
+}
+
 enum OpenBlock {
     Thinking(usize),
     Text(usize),
@@ -35,6 +52,9 @@ pub struct StreamConverter {
     open_block: Option<OpenBlock>,
     tools: std::collections::HashMap<u64, ToolState>,
     finished: bool,
+    /// A terminal error event has been emitted. Nothing — not
+    /// `finish`/`finish_message`, not another block — may follow it.
+    errored: bool,
     /// Real usage from the provider, captured from usage-bearing chunks
     /// (stream_options.include_usage sends it in a final choices-less chunk).
     usage: Option<Value>,
@@ -84,6 +104,7 @@ impl StreamConverter {
             open_block: None,
             tools: HashMap::new(),
             finished: false,
+            errored: false,
             usage: None,
             thinking_requested: false,
             stop_sequences: Vec::new(),
@@ -116,6 +137,60 @@ impl StreamConverter {
     /// upstream: `stop` was not forwarded, so the model is still generating.
     pub fn stopped(&self) -> bool {
         self.stop_override.is_some()
+    }
+
+    /// True once a terminal error event has been emitted. The caller must
+    /// stop reading the upstream — nothing may follow the error event.
+    pub fn errored(&self) -> bool {
+        self.errored
+    }
+
+    /// Emit the terminal error event and mark the stream done.
+    ///
+    /// The HTTP response is committed — status 200, `text/event-stream` — and
+    /// the message may already have blocks on the wire, so neither a status
+    /// change nor the happy-path completion would be truthful: a
+    /// `message_stop` after a failure tells the client the message
+    /// *succeeded*. What is left is Anthropic's terminal error event, and
+    /// nothing after it — no block stop, no `message_delta`, no
+    /// `message_stop` (Ollama adopted the same shape for errors that arrive
+    /// after streaming starts, leaving an open block open). `etype` is the
+    /// Anthropic error `type` to report; `api_error` fits everything turnpike
+    /// cannot classify further.
+    pub fn error_event(&mut self, etype: &str, message: &str) -> Vec<Event> {
+        if self.errored || self.finished {
+            return Vec::new();
+        }
+        self.errored = true;
+        self.finished = true;
+        let mut events = Vec::new();
+        // A stream that never opened must still open before it errors, or the
+        // client sees an `error` event with no message to attach it to.
+        if !self.started {
+            self.started = true;
+            events.push(Event {
+                name: "message_start".into(),
+                data: json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": self.id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": self.model,
+                        "content": [],
+                        "usage": {"input_tokens": self.input_estimate, "output_tokens": 0},
+                    }
+                }),
+            });
+        }
+        events.push(Event {
+            name: "error".into(),
+            data: json!({
+                "type": "error",
+                "error": {"type": etype, "message": message},
+            }),
+        });
+        events
     }
 
     /// Names the gateway executes itself. Their tool calls open
@@ -241,6 +316,15 @@ impl StreamConverter {
     pub fn process(&mut self, chunk: &Value) -> Vec<Event> {
         if self.finished {
             return Vec::new();
+        }
+        // An upstream carries its own failures in-band — a data chunk with an
+        // `error` field and no choices to translate. The response is
+        // committed and may already have blocks on the wire, so the only
+        // honest grammar left is a terminal error event; swallowing the chunk
+        // would end the stream with a `message_stop` that reported success.
+        if let Some((etype, msg)) = in_band_error(chunk) {
+            let etype = etype.as_deref().unwrap_or("api_error");
+            return self.error_event(etype, &msg);
         }
         let mut events = Vec::new();
 
@@ -848,6 +932,61 @@ mod tests {
         assert_eq!(message_delta["usage"]["input_tokens"], 16);
         assert_eq!(message_delta["usage"]["cache_read_input_tokens"], 84);
         assert_eq!(message_delta["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn an_in_band_error_chunk_becomes_the_terminal_error_event() {
+        // Upstream runners report failures in-band: a data chunk with an
+        // `error` field and no choices. Swallowing it would end the stream
+        // with a message_stop that reported success.
+        let mut c = StreamConverter::new("msg_1".into(), "m".into(), 0);
+        let _ = c.process(&chunk(json!({"content": "Pa"}), None));
+        let all = c.process(&json!({
+            "error": {"message": "model runner has unexpectedly stopped", "type": "provider_error"}
+        }));
+        // Exactly one event, the terminal one — no block stop, no
+        // message_delta, no message_stop may follow.
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "error");
+        assert_eq!(all[0].data["type"], "error");
+        // The upstream named its own error type; it passes through.
+        assert_eq!(all[0].data["error"]["type"], "provider_error");
+        assert_eq!(
+            all[0].data["error"]["message"],
+            "model runner has unexpectedly stopped"
+        );
+        // The stream is done: `finish` is a no-op, so no completion event can
+        // sneak in after the error.
+        assert!(c.errored());
+        assert_eq!(c.finish(), "");
+    }
+
+    #[test]
+    fn a_bare_string_error_still_terminates_with_api_error() {
+        let mut c = StreamConverter::new("msg_1".into(), "m".into(), 0);
+        let _ = c.process(&chunk(json!({"content": "x"}), None));
+        let all = c.process(&json!({"error": "model runner has unexpectedly stopped"}));
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "error");
+        // No named type falls back to api_error, what turnpike reports for
+        // everything it cannot classify further.
+        assert_eq!(all[0].data["error"]["type"], "api_error");
+        assert_eq!(c.finish(), "");
+    }
+
+    #[test]
+    fn an_error_before_the_stream_started_still_opens_the_message() {
+        // A client never sees a bare `error` event with no message to attach
+        // it to — the stream must open first, even when the failure is the
+        // very first chunk.
+        let mut c = StreamConverter::new("msg_1".into(), "m".into(), 7);
+        let all = c.process(&json!({"error": "boom"}));
+        let names: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["message_start", "error"]);
+        assert_eq!(all[0].data["message"]["usage"]["input_tokens"], 7);
+        // Idempotent, like finish(): a second terminal error is a no-op.
+        assert!(c.error_event("api_error", "boom").is_empty());
+        assert_eq!(c.finish(), "");
     }
 
     #[test]

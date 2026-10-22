@@ -98,7 +98,7 @@ reachable (see [What this does not cover](#what-this-does-not-cover)).
 | Resolution | route id, upstream-model match, `provider/model`, `provider:model` — with the requested id echoed in `model` and the upstream id never leaking |
 | Streaming | `content-type`; framing; balanced 0-based `content_block_start`/`stop`; delta types; `message_delta` carrying `stop_reason` + `output_tokens`; `input_json_delta` fragments concatenating to valid JSON; truncated streams closing cleanly; multi-delta text assembly; incrementality on both the plain and search paths |
 | Search | the full agentic loop (`server_tool_use` + `web_search_tool_result` with real results + thinking + text), its live SSE rendition and its timing spread, graceful degradation on a non-search turn, and both `web_search_20250305` and the current `web_search_20260209` |
-| Error shaping | a **non-JSON** upstream error body still comes back as a valid Anthropic error envelope |
+| Error shaping | a **non-JSON** upstream error body still comes back as a valid Anthropic error envelope; a failure **after streaming began** — an in-band upstream error chunk, a mid-body transport failure, a failed loop re-invocation — ends the stream with Anthropic's terminal `error` event, nothing after it |
 
 ### The message envelope
 

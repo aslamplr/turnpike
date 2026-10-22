@@ -51,7 +51,7 @@ cargo test        # inline #[cfg(test)] modules per file
 - `src/config.rs` — config load/validate; `Spec` (Anthropic/Openai), `Family` + `family_for_path()`, model `resolve()`; the comments-only starter skeleton (`default_config_text()` — a `[server]` block plus instructions, deliberately not a usable config).
 - `src/proxy.rs` — the HTTP server. **The one place everything meets: `forward()`** builds the request pipeline; `bridge()` runs the agentic search middleware.
 - `src/translate/mod.rs` — Anthropic↔OpenAI request/response translation (edges only: system↔system, thinking↔reasoning_content, tool_use↔tool_calls, tool_result↔role:"tool", images↔image_url, `tool_choice` mapping).
-- `src/translate/stream.rs` — `StreamConverter`: stateful OpenAI SSE→Anthropic SSE (thinking_delta, fragmented tool-call args→`input_json_delta`, real usage from the final choices-less chunk, idempotent `finish()`).
+- `src/translate/stream.rs` — `StreamConverter`: stateful OpenAI SSE→Anthropic SSE (thinking_delta, fragmented tool-call args→`input_json_delta`, real usage from the final choices-less chunk split via `split_usage`, idempotent `finish()`, and the terminal `error` event that ends a stream whose upstream failed after streaming began).
 - `src/search/mod.rs` — `SearchProvider` trait + `ExaSearch` / `SearxSearch` implementations; `SearchManager::from_config` (exa needs an API key, searxng/searx keyless).
 - `src/launch/claude_code.rs` — finds/installs the `claude` binary, spawns it with env vars routing every model tier to one route id.
 - `src/launch/claude_desktop.rs` — writes a third-party inference-gateway profile (`00000000-0000-5000-9000-000000000128.json`) into Claude Desktop's configLibrary, with backup/restore and a running-app safety check.

@@ -134,7 +134,22 @@ content_block_start / content_block_delta / content_block_stop
   (repeated per block, in thinking → text → tool_use order)
 message_delta  (stop_reason + usage)
 message_stop
+error             (terminal: a failure after streaming began ends the stream with it)
 ```
+
+The grammar has a third terminal besides `message_stop`. The upstream carries
+its own failures **in-band** — a data chunk with an `error` field and no
+choices — and the response is already committed (status 200,
+`text/event-stream`), so no status change is possible. On such a chunk the
+converter emits exactly one `error` event and marks the stream done: no block
+stop, no `message_delta`, no `message_stop` may follow — a `message_stop`
+after a failure would tell the client the message *succeeded*. The error
+`type` is the upstream's own when it named one (`{"error": {"type": …}}`),
+else `api_error`; a stream that never opened opens with `message_start` first,
+so a client never sees a bare `error` event. Mid-body transport failures and
+non-2xx re-invocations in the search loop report the same way, with the
+status-derived `type` (`anthropic_error_type` — `500..=599 → api_error`,
+`529 → overloaded_error`).
 
 **State transitions:**
 

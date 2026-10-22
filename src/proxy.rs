@@ -1146,7 +1146,20 @@ async fn search_loop_streaming(
                 let bytes = match chunk {
                     Ok(b) => b,
                     Err(e) => {
-                        yield Err::<Bytes, std::io::Error>(std::io::Error::other(e.to_string()));
+                        // The response is committed — status 200, SSE, and the
+                        // searches' `server_tool_use` blocks are already on the
+                        // wire — so a mid-body transport failure cannot change
+                        // the status (aborting instead truncates the stream at
+                        // the client). The terminal error event is the only
+                        // honest grammar left.
+                        for event in
+                            converter.error_event("api_error", &format!("upstream stream failed: {e}"))
+                        {
+                            out += &crate::translate::format_sse(&event.name, &event.data);
+                        }
+                        if !out.is_empty() {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut out)));
+                        }
                         return;
                     }
                 };
@@ -1242,6 +1255,16 @@ async fn search_loop_streaming(
                 if converter.stopped() {
                     break;
                 }
+                if converter.errored() {
+                    break;
+                }
+            }
+
+            // An in-band error already emitted the terminal error event; the
+            // loop cannot search-and-re-invoke after it, and
+            // `finish_message`/`end_iteration` are no-ops past it.
+            if converter.errored() {
+                break;
             }
 
             // Usage is summed from the raw chunks above, which is the only
@@ -1309,28 +1332,45 @@ async fn search_loop_streaming(
             let next = match send_openai_chat(&gw, &resolved, &key, &headers, &req_payload).await {
                 Ok(r) => r,
                 Err(res) => {
-                    yield Err::<Bytes, std::io::Error>(std::io::Error::other(format!(
-                        "search loop: upstream unavailable ({})",
-                        res.status()
-                    )));
+                    let status = res.status();
+                    for event in converter.error_event(
+                        anthropic_error_type(status),
+                        &format!("search loop: upstream unavailable ({status})"),
+                    ) {
+                        out += &crate::translate::format_sse(&event.name, &event.data);
+                    }
+                    if !out.is_empty() {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut out)));
+                    }
                     return;
                 }
             };
             match upstream_error_response(next).await {
                 Ok(r) => upstream = Some(r),
                 Err(res) => {
-                    yield Err::<Bytes, std::io::Error>(std::io::Error::other(format!(
-                        "search loop: upstream error ({})",
-                        res.status()
-                    )));
+                    let status = res.status();
+                    for event in converter.error_event(
+                        anthropic_error_type(status),
+                        &format!("search loop: upstream error ({status})"),
+                    ) {
+                        out += &crate::translate::format_sse(&event.name, &event.data);
+                    }
+                    if !out.is_empty() {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut out)));
+                    }
                     return;
                 }
             }
         }
 
         // A turn that produced only searches leaves no answer; say so, as the
-        // buffered path does.
-        if !emitted_answer && final_stop.is_none() && !converter.stopped() {
+        // buffered path does. Not after a terminal error — nothing follows
+        // the error event.
+        if !emitted_answer
+            && final_stop.is_none()
+            && !converter.stopped()
+            && !converter.errored()
+        {
             for event in converter.emit_text_block("(no final answer produced)") {
                 out += &crate::translate::format_sse(&event.name, &event.data);
             }
@@ -1743,9 +1783,25 @@ fn bridged_stream_response(
                     if !out.is_empty() {
                         yield Ok(Bytes::from(std::mem::take(&mut out)));
                     }
+                    // A terminal error event already went out; nothing — not
+                    // `finish`, not the remaining upstream bytes — may follow.
+                    if converter.errored() {
+                        return;
+                    }
                 }
                 Err(e) => {
-                    yield Err(std::io::Error::other(e.to_string()));
+                    // The stream is committed — status 200, SSE — so a
+                    // transport failure mid-body cannot change the status
+                    // (aborting truncates the body instead). The terminal
+                    // error event is the only honest grammar left.
+                    for event in
+                        converter.error_event("api_error", &format!("upstream stream failed: {e}"))
+                    {
+                        out += &crate::translate::format_sse(&event.name, &event.data);
+                    }
+                    if !out.is_empty() {
+                        yield Ok(Bytes::from(std::mem::take(&mut out)));
+                    }
                     return;
                 }
             }
@@ -1920,14 +1976,25 @@ fn inject_auth(
 // Error shapes
 // ---------------------------------------------------------------------------
 
-fn anthropic_error(status: StatusCode, msg: impl Into<String>) -> Response {
-    let etype = match status.as_u16() {
+/// The Anthropic error `type` for an HTTP status. Shared by `anthropic_error`
+/// and the terminal error events, because both report the same taxonomy:
+/// `500..=599 → api_error` and `529 → overloaded_error` are Anthropic's own
+/// meanings; `invalid_request_error` is what remains for the client-side and
+/// unmappable cases.
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
         401 => "authentication_error",
         403 => "permission_error",
         404 => "not_found_error",
         429 => "rate_limit_error",
+        529 => "overloaded_error",
+        500..=599 => "api_error",
         _ => "invalid_request_error",
-    };
+    }
+}
+
+fn anthropic_error(status: StatusCode, msg: impl Into<String>) -> Response {
+    let etype = anthropic_error_type(status);
     (
         status,
         Json(json!({
@@ -2602,6 +2669,101 @@ model = "deepseek-v4-flash"
         assert!(text.contains("\"stop_reason\":\"tool_use\""));
         assert!(!text.contains("\"output_tokens\":8"));
         assert!(text.contains("\"input_tokens\":")); // estimated at start, real usage in message_delta
+    }
+
+    #[tokio::test]
+    async fn an_in_band_upstream_error_ends_the_client_stream_at_the_error_event() {
+        // Ollama efabf6bc: an upstream runner can carry its failure in-band —
+        // a data chunk with an `error` field — after content is already on the
+        // wire. Swallowed, the stream ends with a message_stop that reports
+        // success; aborted (yield Err), the body truncates and the client sees
+        // a network fault. The grammar that survives both: the terminal error
+        // event, and nothing after it.
+        let stub = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    // Content first (blocks on the wire — the stream is
+                    // committed), then the in-band error, then a normal
+                    // completion the error must preempt.
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(format!(
+                            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
+                            json!({"id":"c1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
+                            json!({"id":"c1","choices":[{"index":0,"delta":{"content":"Pa"},"finish_reason":null}]}),
+                            json!({"error": "model runner has unexpectedly stopped"}),
+                            json!({"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":3}})
+                        )))
+                        .unwrap()
+                }),
+            )
+            .into_make_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.openai_up]
+spec = "openai"
+base_url = "http://{addr}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "openai_up"
+model = "deepseek-v4-flash"
+"#
+        );
+        let cfg: Config = toml::from_str(&cfg_text).unwrap();
+        let gw = Arc::new(Gateway::new(Arc::new(cfg)));
+        let res = router(gw);
+
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("host", "127.0.0.1:8710")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"claude-sonnet-5","max_tokens":64,"stream":true,
+                    "messages":[{"role":"user","content":[{"type":"text","text":"Paris?"}]}]}"#,
+            ))
+            .unwrap();
+        let res = tower::ServiceExt::oneshot(res, req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        let events: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("event: "))
+            .map(|l| &l[7..])
+            .collect();
+        // Partial text survived, the error terminated, and the error is the
+        // last event — no message_delta, no message_stop after it.
+        assert!(text.contains(r#""text_delta""#));
+        assert!(text.contains("Pa"));
+        assert_eq!(events.last().copied(), Some("error"));
+        assert!(!events.contains(&"message_stop"), "events: {events:?}");
+        let error_data = text
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("data: "))
+            .map(|l| serde_json::from_str::<Value>(&l[6..]).unwrap())
+            .unwrap();
+        assert_eq!(error_data["type"], "error");
+        assert_eq!(error_data["error"]["type"], "api_error");
+        assert_eq!(
+            error_data["error"]["message"],
+            "model runner has unexpectedly stopped"
+        );
     }
 
     struct MockSearch;
