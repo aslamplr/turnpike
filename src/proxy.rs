@@ -43,6 +43,34 @@ pub struct Gateway {
     /// round-robin into "always target 0", a bug that passes a single-request
     /// test and fails the moment anything is concurrent.
     round_robin: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// Conversation-affinity pins for the `load-balance` routes that opted in
+    /// (`cache_affinity = true`): route id → head-key → pinned target.
+    ///
+    /// Prompt-cache state lives on the (provider, model) pair a target points
+    /// at, so plain rotation re-bills one conversation's whole history at full
+    /// price on every turn and writes duplicate caches on both sides. The pin
+    /// keeps a conversation on the target that already holds its cache; a key
+    /// nobody has seen takes the next round-robin slot, so distinct
+    /// conversations still spread. In-memory on purpose: a restart re-rolls
+    /// each conversation once, then re-sticks, which is the same one-turn cost
+    /// the provider's cold cache would charge anyway.
+    affinity: std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::HashMap<[u8; 32], Affinity>>,
+    >,
+}
+
+/// How long a pinned target stays valid — about Anthropic's prompt-cache
+/// lifetime. A stick that outlives a warm cache is worthless twice over: it
+/// keeps steering a conversation at a provider that would charge full price,
+/// long after the miss it was avoiding stopped being avoidable.
+const AFFINITY_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// One conversation's pin: which chain position serves it (refreshed on every
+/// hit, re-pointed when a fallback had to serve the turn), and when it was
+/// last used — the TTL's clock.
+struct Affinity {
+    index: usize,
+    last_seen: std::time::Instant,
 }
 
 impl Gateway {
@@ -63,6 +91,7 @@ impl Gateway {
         Self {
             search_max_loops: config.search.max_loops.max(1),
             round_robin: std::sync::Mutex::new(std::collections::HashMap::new()),
+            affinity: std::sync::Mutex::new(std::collections::HashMap::new()),
             config,
             http,
             search,
@@ -77,28 +106,119 @@ impl Gateway {
     /// answer target 0 (for `failover` the *ordering of attempts* is the
     /// policy, so choosing among them is not a decision); `load-balance`
     /// advances a per-route cursor.
-    fn select_target(&self, res: &crate::config::RouteResolution) -> crate::config::Resolved {
+    fn select_target<'a>(
+        &self,
+        res: &'a crate::config::RouteResolution,
+    ) -> &'a crate::config::Resolved {
         use crate::config::Strategy;
         let first = || {
             res.targets
                 .first()
-                .cloned()
                 .expect("a RouteResolution always carries at least one target")
         };
         match res.strategy {
             Strategy::Static | Strategy::Failover => first(),
             Strategy::LoadBalance if res.targets.len() < 2 => first(),
             Strategy::LoadBalance => {
-                let n = {
-                    let mut cursors = self.round_robin.lock().unwrap();
-                    let slot = cursors.entry(res.route_id.clone()).or_insert(0);
-                    let n = *slot % res.targets.len();
-                    *slot = slot.wrapping_add(1);
-                    n
-                };
-                res.targets[n].clone()
+                let n = self.advance_cursor(&res.route_id, res.targets.len());
+                &res.targets[n]
             }
         }
+    }
+
+    /// The one round-robin advance — `load-balance` and the affinity miss
+    /// path draw from the same cursor, so a policy change here cannot leave
+    /// one caller picking from a distribution the other never sees.
+    fn advance_cursor(&self, route_id: &str, total: usize) -> usize {
+        let mut cursors = self.round_robin.lock().unwrap();
+        let cur = cursors.entry(route_id.to_string()).or_insert(0);
+        let slot = *cur % total;
+        *cur = cur.wrapping_add(1);
+        slot
+    }
+
+    /// The sticky half of cache-aware selection for the `load-balance` routes
+    /// that opted in (`cache_affinity = true`): a conversation — identified by
+    /// its head key — keeps serving from the target it was first assigned to.
+    ///
+    /// The design carries measured evidence, kept in one home —
+    /// docs/routing.md's "Cache affinity" section — so a re-measurement
+    /// updates a single place.
+    ///
+    /// - **The cursor advances on a miss only.** Distinct conversations keep
+    ///   taking turns of the round-robin, so load still spreads; a pinned
+    ///   conversation never touches the counter again.
+    /// - **Entries expire at ~Anthropic's cache TTL.** A pin that outlives a
+    ///   warm cache steers at a provider that charges full price. Expiry prunes
+    ///   on the miss that notices it — hits must stay cheap.
+    ///
+    /// Nested-lock order is fixed here: `affinity` before `round_robin`;
+    /// `select_target` takes the latter alone.
+    fn select_affinity(&self, res: &crate::config::RouteResolution, key: [u8; 32]) -> usize {
+        let now = std::time::Instant::now();
+        let total = res.targets.len();
+        let mut pins = self.affinity.lock().unwrap();
+        // The hit path answers straight off a borrow — no route-id clone, no
+        // insert machinery; the `entry()` walk below only runs on a miss.
+        if let Some(pin) = pins
+            .get_mut(&res.route_id)
+            .and_then(|per| per.get_mut(&key))
+        {
+            if now.duration_since(pin.last_seen) < AFFINITY_TTL && pin.index < total {
+                pin.last_seen = now;
+                tracing::debug!(
+                    route = %res.route_id,
+                    key = %short_hex(&key),
+                    index = pin.index,
+                    "affinity: sticky hit"
+                );
+                return pin.index;
+            }
+            // The TTL ran out, or the config shrank under the pin: the refill
+            // below removes the dead entry.
+        }
+        let per_route = pins.entry(res.route_id.clone()).or_default();
+        per_route.remove(&key);
+        let slot = self.advance_cursor(&res.route_id, total);
+        per_route.retain(|_, p| now.duration_since(p.last_seen) < AFFINITY_TTL);
+        per_route.insert(
+            key,
+            Affinity {
+                index: slot,
+                last_seen: now,
+            },
+        );
+        tracing::debug!(
+            route = %res.route_id,
+            key = %short_hex(&key),
+            index = slot,
+            "affinity: new pin"
+        );
+        slot
+    }
+
+    /// Point a conversation's pin at the target that served it when a
+    /// *fallback* had to: that target now holds a fresh copy of the prompt,
+    /// so the conversation's cache moved with it. The sticky path never
+    /// calls this — [`Gateway::select_affinity`] already refreshed the pin's
+    /// clock on the hit — and a turn where *no* target answered never does
+    /// either: the next turn retries the sticky pick first, exactly as
+    /// `failover` would.
+    fn repoint_affinity(&self, res: &crate::config::RouteResolution, key: [u8; 32], index: usize) {
+        let mut pins = self.affinity.lock().unwrap();
+        pins.entry(res.route_id.clone()).or_default().insert(
+            key,
+            Affinity {
+                index,
+                last_seen: std::time::Instant::now(),
+            },
+        );
+        tracing::debug!(
+            route = %res.route_id,
+            key = %short_hex(&key),
+            index,
+            "affinity: re-pointed"
+        );
     }
 }
 
@@ -306,8 +426,9 @@ fn is_retryable(status: StatusCode) -> bool {
 enum Attempt {
     /// The attempt produced the client's response. For a spec match this is
     /// the raw upstream response, still holding its body; for a bridged target
-    /// it is the already-converted `Response`, because `bridge` owns its own
-    /// streaming rendition and cannot hand back a body to convert later.
+    /// it is the already-converted `Response` — `bridge` owns its rendition
+    /// and classifies its own statuses, as the one place that sees its own
+    /// first-contact boundary.
     Responded(Response),
     /// The attempt failed and the status, when there was one, is retryable.
     /// Carries the client-facing error so the *first* target's message can be
@@ -333,14 +454,23 @@ async fn classify(upstream: reqwest::Response, provider: &str) -> Attempt {
     Attempt::Retry(spec_error_of(status, provider, upstream).await)
 }
 
+/// The transport-failure response, built once: a 502 that `is_retryable`
+/// classifies retryable, naming the provider. Passthrough
+/// ([`transport_attempt`]) and bridged ([`send_openai_chat`],
+/// [`single_shot_bridge`]) both spell their transport failure through this
+/// one builder, so the message and the class cannot drift between spec paths.
+fn transport_error<E: std::fmt::Display>(e: E, provider: &str) -> Response {
+    anthropic_error(
+        StatusCode::BAD_GATEWAY,
+        format!("upstream {provider} unavailable: {e}"),
+    )
+}
+
 /// A transport failure — refused, DNS, TLS, connect timeout — provably never
 /// reached the model, so a retry costs nothing and is the safest case there is.
 fn transport_attempt<E: std::fmt::Display>(e: E, provider: &str) -> Attempt {
     tracing::warn!(error = %e, provider, "upstream unreachable; trying the next target");
-    Attempt::Retry(anthropic_error(
-        StatusCode::BAD_GATEWAY,
-        format!("upstream {provider} unavailable: {e}"),
-    ))
+    Attempt::Retry(transport_error(e, provider))
 }
 
 /// Read a retryable upstream failure into a client-facing error, keeping the
@@ -446,6 +576,123 @@ async fn forward_embeddings(
 }
 
 // ---------------------------------------------------------------------------
+// Conversation fingerprinting
+// ---------------------------------------------------------------------------
+
+/// A fingerprint term's canonical form, hashed from one serialization: the
+/// `Value`'s own compact form, with its byte length returned alongside the
+/// digest so the fingerprint log reports exactly the bytes hashed.
+/// `preserve_order` keeps map keys in wire order, so the same payload always
+/// serializes byte-identically (whitespace — which carries no tokens —
+/// normalizes away; key order changes are a new identity, because the
+/// replayed prompt would tokenize differently anyway).
+fn term_digest(value: &Value) -> ([u8; 32], usize) {
+    let ser = serde_json::to_string(value).expect("serde_json::Value serialization is infallible");
+    (crate::secrets::sha256(ser.as_bytes()), ser.len())
+}
+
+/// The absent-system placeholder: hashing `null` distinguishes "no system
+/// term" from a system that is literally the empty string, and a const item
+/// gives the borrow a 'static home.
+const NULL_SYSTEM: Value = Value::Null;
+
+/// The replay-stable head of a conversation: `(system, anchor)`. Spec-aware:
+/// an Anthropic body's `system` field is the system term and `messages[0]`
+/// the anchor; for an OpenAI body a leading `role == "system"` message is the
+/// system term and vacates itself from the anchor slot, so the two terms stay
+/// disjoint. Borrowed, not cloned — the head can be 100+ KB of JSON, and
+/// hashing only needs its serialization. `None` when there is no first
+/// conversation message at all.
+fn head_terms(payload: &Value) -> Option<(&Value, &Value)> {
+    let msgs = payload.get("messages").and_then(Value::as_array)?;
+    let (system, skip) = match payload.get("system").filter(|s| !s.is_null()) {
+        Some(field) => (field, 0usize),
+        None => match msgs.first() {
+            Some(first) if first.get("role").and_then(Value::as_str) == Some("system") => {
+                (first, 1usize)
+            }
+            _ => (&NULL_SYSTEM, 0usize),
+        },
+    };
+    let anchor = msgs.get(skip)?;
+    Some((system, anchor))
+}
+
+/// The conversation-affinity fingerprint, in one pass over the replay-stable
+/// head: the digest over (model, system, first message) plus the serialized
+/// sizes the debug fingerprint line reports, from the same bytes — the log
+/// can never describe a head the key did not hash. Deliberately excludes
+/// anything that grows per turn: a key that moves on turn 2 would re-import
+/// the per-turn matching problem this head hash exists to avoid, and one
+/// re-rolled stick costs a full-price re-read of the entire prompt. The
+/// digest is the key [`Gateway::select_affinity`] pins by.
+fn head_fingerprint(payload: &Value) -> Option<([u8; 32], usize, usize)> {
+    let (system, anchor) = head_terms(payload)?;
+    let (model_hash, _) = term_digest(payload.get("model").unwrap_or(&Value::Null));
+    let (system_hash, system_len) = term_digest(system);
+    let (anchor_hash, anchor_len) = term_digest(anchor);
+    let mut joined = Vec::with_capacity(96);
+    for part in [model_hash, system_hash, anchor_hash] {
+        joined.extend_from_slice(&part);
+    }
+    Some((crate::secrets::sha256(&joined), system_len, anchor_len))
+}
+
+fn affinity_key(payload: &Value) -> Option<[u8; 32]> {
+    head_fingerprint(payload).map(|(key, _, _)| key)
+}
+
+fn short_hex(bytes: &[u8]) -> String {
+    crate::secrets::to_hex(&bytes[..8])
+}
+
+/// The per-request fingerprint at debug level: `head_key` plus the head's
+/// sizes and the routed model, no bodies. Its live purpose is debugging a
+/// pin — this is the key [`Gateway::select_affinity`] pins by, and a re-pin
+/// is visible as the key changing between two lines.
+fn log_fingerprint(payload: &Value) {
+    let msgs = payload.get("messages").and_then(Value::as_array);
+    // One pass: the key and the logged lengths come from the same
+    // serializations.
+    let fp = head_fingerprint(payload);
+    let head = match &fp {
+        Some((k, _, _)) => crate::secrets::to_hex(k),
+        None => "none".into(),
+    };
+    let (system_len, anchor_len) = fp.map_or((0, 0), |(_, s, a)| (s, a));
+    // Bound outside the macro: a type-relative path (`Value::as_str`) inside a
+    // tracing field list resolves against tracing's own `field::Value` trait,
+    // not serde_json's, and fails to compile.
+    let model_name = payload.get("model").and_then(Value::as_str).unwrap_or("?");
+    tracing::debug!(
+        head_key = %head,
+        n_msgs = msgs.map_or(0, |m| m.len()),
+        system_len,
+        anchor_len,
+        model = %model_name,
+        "request fingerprint"
+    );
+}
+
+/// The turn's Anthropic-shaped usage, as a debug line: the cache economics a
+/// sticky pin is meant to improve, visible per turn. Reads back what the
+/// assembly wrote and delegates the field shape to
+/// [`crate::translate::log_usage_trace`] — passthrough streams are raw bytes
+/// and are not scanned, so the bridge paths carry the only usage evidence.
+fn log_usage_trace(usage: &Value) {
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    crate::translate::log_usage_trace(input, cached, output, "turn usage");
+}
+
+// ---------------------------------------------------------------------------
 // Core forwarding logic
 // ---------------------------------------------------------------------------
 
@@ -487,6 +734,12 @@ async fn forward(
         return spec_error(family, StatusCode::BAD_REQUEST, "model is required");
     }
 
+    // Request fingerprint, debug-gated: the default (info) output never
+    // reaches here, so the hashing costs nothing unless asked for.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        log_fingerprint(&payload);
+    }
+
     let route = match gw.config.resolve_route(&requested) {
         Ok(r) => r,
         Err(e) => return resolve_error(StatusCode::NOT_FOUND, &e, family),
@@ -500,20 +753,53 @@ async fn forward(
         );
     }
 
-    // The attempt loop. `static` and `load-balance` make exactly one attempt
-    // (selection already answered); `failover` walks the chain in order until
-    // one target answers or the budget runs out. The budget is the target
-    // count: every target gets exactly one try, so a 3-target chain cannot
-    // retry a flaky primary three times and starve the tertiary.
-    let attempts: Vec<crate::config::Resolved> = match route.strategy {
-        crate::config::Strategy::Failover => route.targets.clone(),
-        _ => vec![gw.select_target(&route)],
+    // The attempt chain. `static` and plain `load-balance` make exactly one
+    // attempt (selection already answered); `failover` walks the chain in
+    // order until one target answers or the budget runs out. A `load-balance`
+    // route with `cache_affinity = true` re-uses that walk, led by the
+    // conversation's sticky pick: the "route A is temporarily down" case is
+    // handled by the same first-contact rule — the pinned target gets its try,
+    // and its retryable failure moves the chain on like any other failover.
+    // The budget is the chain length: every candidate gets exactly one try, so
+    // a 3-target chain cannot retry a flaky primary three times and starve
+    // the tertiary. Each attempt carries its position in the configured chain,
+    // so a fallback serve can re-point the pin at the target that answered.
+    let mut sticky: Option<[u8; 32]> = None;
+    // The chain borrows the route's own target list: `attempt_target` takes
+    // `&Resolved`, so per-request `ProviderCfg` clones would only feed a
+    // borrow ("hits must stay cheap"). The single-attempt arms share one
+    // lazily-called expression — their position is only ever consumed by a
+    // sticky re-point, which a no-key turn (or a non-affinity strategy)
+    // never performs.
+    let single = || vec![(0usize, gw.select_target(&route))];
+    let attempts: Vec<(usize, &crate::config::Resolved)> = match route.strategy {
+        crate::config::Strategy::Failover => route.targets.iter().enumerate().collect(),
+        crate::config::Strategy::LoadBalance
+            if route.cache_affinity && route.targets.len() >= 2 =>
+        {
+            match affinity_key(&payload) {
+                Some(key) => {
+                    // The pin's *position* is all the chain needs: the pinned
+                    // slot moves to the front as attempt 1; the rest keep the
+                    // configured order behind it.
+                    let index = gw.select_affinity(&route, key);
+                    let mut chain: Vec<(usize, &crate::config::Resolved)> =
+                        route.targets.iter().enumerate().collect();
+                    let pinned = chain.remove(index);
+                    chain.insert(0, pinned);
+                    sticky = Some(key);
+                    chain
+                }
+                None => single(),
+            }
+        }
+        _ => single(),
     };
     let budget = attempts.len();
     let mut first_error: Option<Response> = None;
 
-    for (i, target) in attempts.into_iter().enumerate() {
-        let attempt = attempt_target(&gw, path, family, &headers, &payload, &target).await;
+    for (i, (chain_index, target)) in attempts.into_iter().enumerate() {
+        let attempt = attempt_target(&gw, path, family, &headers, &payload, target).await;
         match attempt {
             // A response was produced, whichever path made it. For a spec
             // match, a non-2xx lands here too: relaying the provider's status
@@ -527,6 +813,18 @@ async fn forward(
                         attempt = i + 1,
                         "failover: request served by a fallback target"
                     );
+                    // Only a success actually served the turn: a relayed
+                    // non-2xx ("Responded" is also the passthrough contract
+                    // for errors) leaves the pin pointing where it was. The
+                    // sticky path never re-points — select_affinity refreshed
+                    // the clock on the hit — so this fires exactly when a
+                    // fallback answered and the provider's copy of the prompt
+                    // cache moved with it.
+                    if response.status().is_success() {
+                        if let Some(key) = sticky {
+                            gw.repoint_affinity(&route, key, chain_index);
+                        }
+                    }
                 }
                 return response;
             }
@@ -562,8 +860,10 @@ async fn forward(
 ///
 /// The first-byte boundary is what governs this whole feature: once the first
 /// upstream byte is in hand, the client's SSE stream is committed and there is
-/// nothing left to fall over to. Nothing here buffers — the boundary is
-/// exactly where `bridge` takes the response and starts streaming.
+/// nothing left to fall over to. Nothing here buffers — on the passthrough
+/// route the boundary is `classify`, on the raw upstream; on the bridged
+/// route it lives inside `bridge`, which returns an `Attempt` sorted at its
+/// own boundary.
 async fn attempt_target(
     gw: &Arc<Gateway>,
     path: &'static str,
@@ -636,20 +936,19 @@ async fn attempt_target(
     // (e.g. DeepSeek/GLM/Kimi via OpenCode Go). The reverse direction is not
     // bridged yet.
     if family == Family::Anthropic && provider_spec == Family::OpenAI {
-        // `bridge` owns its own response conversion (it must, to stream), so
-        // it hands back a finished `Response` rather than one to classify —
-        // which also means a bridged attempt has already passed the
-        // first-byte boundary by the time it returns.
-        return Attempt::Responded(
-            bridge(
-                gw.clone(),
-                target.clone(),
-                key,
-                headers.clone(),
-                payload.clone(),
-            )
-            .await,
-        );
+        // `bridge` owns its own response conversion, so it cannot hand back a
+        // raw upstream for `classify` — and it alone knows where its
+        // first-contact boundary sits (a single-shot error is before it, a
+        // mid-loop search failure is past it). So it returns an `Attempt`
+        // sorted by its own boundary; this branch forwards it.
+        return bridge(
+            gw.clone(),
+            target.clone(),
+            key,
+            headers.clone(),
+            payload.clone(),
+        )
+        .await;
     }
 
     Attempt::Fatal(spec_error(
@@ -668,6 +967,40 @@ async fn attempt_target(
     ))
 }
 
+/// Sort a bridged *contact* failure into an `Attempt`, by the status its
+/// converted error carries.
+///
+/// Sound because of where this runs: every call site sits before the first
+/// client byte — the streaming loop's pre-stream contact, buffered-loop
+/// iteration 0, and the single-shot path's upstream contact (its post-2xx
+/// body failures are `single_shot_bridge`'s own `Fatal`, because that model
+/// run was already billed). The status is the one the failure preserved
+/// (`upstream_error_response` keeps the upstream's; a transport failure is
+/// the built 502). The passthrough route runs `classify` on the raw
+/// upstream instead; `bridge` has no raw response to hand it.
+fn bridged_attempt(response: Response) -> Attempt {
+    let status = response.status();
+    if is_retryable(status) {
+        // Whether a next target exists is the attempt loop's knowledge, not
+        // this classifier's — say what failed, not what happens next.
+        tracing::warn!(%status, "bridged upstream failed with a retryable status");
+        return Attempt::Retry(response);
+    }
+    Attempt::Responded(response)
+}
+
+/// The buffered search loop's sorting of its failures. Iteration 0 is still
+/// first contact — nothing searched, nothing streamed — so a retryable status
+/// moves the chain on. From iteration 1 the loop has already spent searches
+/// on this target, and a retry would re-run them on the next one, which is
+/// why a mid-loop failure stays a hard error (`Attempt::Fatal`).
+fn search_loop_attempt(iteration: usize, response: Response) -> Attempt {
+    if iteration == 0 {
+        return bridged_attempt(response);
+    }
+    Attempt::Fatal(response)
+}
+
 /// Translate an Anthropic Messages request into an OpenAI chat-completions
 /// request, forward it, and translate the response (or stream) back.
 ///
@@ -678,13 +1011,20 @@ async fn attempt_target(
 /// the conversation, and re-invokes the model — never surfacing the loop to
 /// the client, which just sees `server_tool_use` / `web_search_tool_result`
 /// blocks followed by the final answer.
+///
+/// Returns an `Attempt` sorted at this function's own first-byte boundary,
+/// the only place it is visible: contact failures classify by the status
+/// preserved in the converted error ([`bridged_attempt`]); anything charged
+/// before the classification — a post-2xx body read/decode, a mid-loop
+/// search iteration — is `Fatal`, because a retry would re-pay runs the
+/// upstream already completed.
 async fn bridge(
     gw: Arc<Gateway>,
     resolved: crate::config::Resolved,
     key: String,
     headers: HeaderMap,
     payload: Value,
-) -> Response {
+) -> Attempt {
     // The client's requested model id, taken from the payload rather than
     // threaded through as its own argument: it is only ever used for
     // daisy-chaining into `bridge` from the attempt loop, where the payload is
@@ -715,7 +1055,10 @@ async fn bridge(
         match crate::translate::request_to_openai(&payload, &resolved.upstream_model) {
             Ok(v) => v,
             Err(e) => {
-                return anthropic_error(StatusCode::BAD_REQUEST, format!("bridge request: {e}"))
+                return Attempt::Fatal(anthropic_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("bridge request: {e}"),
+                ))
             }
         };
 
@@ -777,19 +1120,21 @@ async fn bridge(
     // than before it. The non-streaming path below stays buffered — there is
     // no stream to interleave with, and it is the reference implementation.
     if stream {
-        return search_loop_streaming(
-            gw,
-            resolved,
-            key,
-            headers,
-            openai_payload,
-            requested,
-            input_estimate,
-            opts,
-            search,
-            max_loops,
-        )
-        .await;
+        return bridged_attempt(
+            search_loop_streaming(
+                gw,
+                resolved,
+                key,
+                headers,
+                openai_payload,
+                requested,
+                input_estimate,
+                opts,
+                search,
+                max_loops,
+            )
+            .await,
+        );
     }
 
     // --- Agentic middleware loop (non-streaming) ---------------------------
@@ -838,17 +1183,22 @@ async fn bridge(
 
         let upstream = match send_openai_chat(&gw, &resolved, &key, &headers, &req_payload).await {
             Ok(r) => r,
-            Err(res) => return res,
+            Err(res) => return search_loop_attempt(iteration, res),
         };
         let upstream = match upstream_error_response(upstream).await {
             Ok(r) => r,
-            Err(res) => return res,
+            Err(res) => return search_loop_attempt(iteration, res),
         };
         let openai_json: Value = match upstream.json().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "search loop: upstream 2xx was not JSON");
-                return anthropic_error(StatusCode::BAD_GATEWAY, format!("decode upstream: {e}"));
+                // Past the contact boundary: the 2xx means this target's run
+                // completed and was billed — commit, don't re-pay.
+                return Attempt::Fatal(anthropic_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("decode upstream: {e}"),
+                ));
             }
         };
         let prompt = openai_json
@@ -958,6 +1308,7 @@ async fn bridge(
         response["usage"]["cache_read_input_tokens"] = json!(total_cached);
     }
     response["usage"]["output_tokens"] = json!(total_output);
+    log_usage_trace(&response["usage"]);
 
     let stop_reason = response
         .get("stop_reason")
@@ -979,7 +1330,7 @@ async fn bridge(
     // No `if stream` here: a streaming client never reaches this loop — it
     // took `search_loop_streaming` above, which renders SSE live. This path
     // exists for the client that asked for JSON.
-    Json(response).into_response()
+    Attempt::Responded(Json(response).into_response())
 }
 
 /// The assistant turn that carried `calls`, in the shape OpenAI expects it
@@ -1382,6 +1733,7 @@ async fn search_loop_streaming(
         if saw_cache {
             usage["cache_read_input_tokens"] = json!(total_cached);
         }
+        log_usage_trace(&usage);
         let tail = converter.finish_message(final_stop.as_deref().unwrap_or("end_turn"), &usage);
         if !tail.is_empty() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
@@ -1403,6 +1755,11 @@ async fn search_loop_streaming(
 
 /// The original single-request bridge path: translate, forward, translate
 /// back — streaming passthrough for SSE clients, JSON otherwise.
+///
+/// Owns its own Attempt sort: the upstream contact (transport, then any
+/// non-2xx) classifies through [`bridged_attempt`], but a 2xx body that
+/// fails to read or decode is `Fatal` — the model run on this target
+/// completed and was billed, so a re-send would pay for it twice.
 #[allow(clippy::too_many_arguments)]
 async fn single_shot_bridge(
     gw: Arc<Gateway>,
@@ -1414,10 +1771,15 @@ async fn single_shot_bridge(
     stream: bool,
     input_estimate: u64,
     opts: &crate::translate::ResponseOptions,
-) -> Response {
+) -> Attempt {
     let body = match serde_json::to_vec(&openai_payload) {
         Ok(v) => v,
-        Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, format!("bridge encode: {e}")),
+        Err(e) => {
+            return Attempt::Fatal(anthropic_error(
+                StatusCode::BAD_REQUEST,
+                format!("bridge encode: {e}"),
+            ))
+        }
     };
 
     let mut req = gw.http.request(Method::POST, upstream_chat_url(&resolved));
@@ -1434,29 +1796,33 @@ async fn single_shot_bridge(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "bridged upstream request failed");
-            return anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                format!("upstream {} unavailable: {e}", resolved.provider),
-            );
+            return bridged_attempt(transport_error(e, &resolved.provider));
         }
     };
 
     let upstream = match upstream_error_response(upstream).await {
         Ok(r) => r,
-        Err(res) => return res,
+        Err(res) => return bridged_attempt(res),
     };
 
     if stream {
         tracing::info!(%requested, "bridge: streaming passthrough to client");
-        bridged_stream_response(upstream, requested, input_estimate, opts.clone())
+        Attempt::Responded(bridged_stream_response(
+            upstream,
+            requested,
+            input_estimate,
+            opts.clone(),
+        ))
     } else {
         let bytes = match upstream.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                return anthropic_error(
+                // Past the contact boundary: the 2xx means this target's
+                // model run completed and was billed — commit, don't re-pay.
+                return Attempt::Fatal(anthropic_error(
                     StatusCode::BAD_GATEWAY,
                     format!("upstream read failed: {e}"),
-                )
+                ));
             }
         };
         let openai_json: Value = match serde_json::from_slice(&bytes) {
@@ -1476,10 +1842,11 @@ async fn single_shot_bridge(
                     })
                     .collect();
                 tracing::warn!(error = %e, preview = %preview, "bridge: upstream 2xx was not JSON");
-                return anthropic_error(
+                // Same boundary: the run was billed; commit.
+                return Attempt::Fatal(anthropic_error(
                     StatusCode::BAD_GATEWAY,
                     format!("decode upstream: {e} (body starts with: {preview})"),
-                );
+                ));
             }
         };
         let response = crate::translate::response_to_anthropic(
@@ -1488,13 +1855,15 @@ async fn single_shot_bridge(
             &crate::translate::new_message_id(),
             opts,
         );
-        Json(response).into_response()
+        log_usage_trace(&response["usage"]);
+        Attempt::Responded(Json(response).into_response())
     }
 }
 
 /// Build and send one OpenAI chat-completions request against the resolved
 /// provider. Returns the raw response, or an error Response on transport
-/// failure (status checking is the caller's job).
+/// failure — built once by [`transport_error`], so the passthrough and
+/// bridged spellings cannot drift (status checking is the caller's job).
 #[allow(clippy::result_large_err)]
 async fn send_openai_chat(
     gw: &Gateway,
@@ -1533,10 +1902,7 @@ async fn send_openai_chat(
         }
         Err(e) => {
             tracing::warn!(error = %e, "bridged upstream request failed");
-            Err(anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                format!("upstream {} unavailable: {e}", resolved.provider),
-            ))
+            Err(transport_error(e, &resolved.provider))
         }
     }
 }
@@ -3719,6 +4085,453 @@ model = "m-b"
         assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    // -- cache affinity (the `cache_affinity` knob) --------------------------
+
+    /// A two-target `load-balance` route that opted into cache affinity.
+    ///
+    /// `b` is declared as the second target, so target 0 is `a`: a new
+    /// conversation pins to `a`, where plain round-robin would have alternated
+    /// a, b, a.
+    fn affinity_gw(a: &str, b: &str) -> Arc<Gateway> {
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "anthropic"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+strategy = "load-balance"
+cache_affinity = true
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+"#
+        );
+        Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )))
+    }
+
+    /// Like `send`, parameterized by the raw body: affinity tests need control
+    /// of the head (system, first message) to make and break conversation
+    /// keys, which the fixed replay `send` cannot.
+    async fn send_body(gw: Arc<Gateway>, body: &str) -> Response {
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("host", "127.0.0.1:8710")
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        tower::ServiceExt::oneshot(router(gw), req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn cache_affinity_sticks_one_conversation_to_one_target() {
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let gw = affinity_gw(&a, &b);
+
+        // The same body replayed is one conversation: turn 1 is a miss that
+        // takes the next round-robin slot, turns 2 and 3 hit the pin.
+        for _ in 0..3 {
+            assert_eq!(
+                reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+                "from-a"
+            );
+        }
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_affinity_spreads_distinct_conversations() {
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let gw = affinity_gw(&a, &b);
+        let conv = |system: &str| {
+            format!(
+                r#"{{"model":"claude-sonnet-5","max_tokens":16,"system":"{system}",
+                    "messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}]}}"#
+            )
+        };
+
+        // The first send of each conversation is a miss and consumes the next
+        // round-robin slot, so they land on different targets; after that each
+        // sticks to its own.
+        let first = reply_text(send_body(gw.clone(), &conv("one")).await).await;
+        let second = reply_text(send_body(gw.clone(), &conv("two")).await).await;
+        let third = reply_text(send_body(gw.clone(), &conv("one")).await).await;
+        let fourth = reply_text(send_body(gw.clone(), &conv("two")).await).await;
+        assert_eq!(first, "from-a");
+        assert_eq!(second, "from-b");
+        assert_eq!(third, "from-a");
+        assert_eq!(fourth, "from-b");
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_expired_pin_is_treated_as_a_miss() {
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let gw = affinity_gw(&a, &b);
+        assert_eq!(
+            reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+            "from-a"
+        );
+
+        // Age every pin past the TTL — about the provider's cache lifetime.
+        // The pin that outlives a warm cache holds no cache to hit, so it is
+        // worthless rather than sticky.
+        {
+            let mut pins = gw.affinity.lock().unwrap();
+            for route in pins.values_mut() {
+                for pin in route.values_mut() {
+                    pin.last_seen -= AFFINITY_TTL + std::time::Duration::from_secs(10);
+                }
+            }
+        }
+
+        // The expired key is a miss: it consumes the next round-robin slot
+        // (b), then the fresh pin re-sticks.
+        assert_eq!(
+            reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+            "from-b"
+        );
+        assert_eq!(
+            reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+            "from-b"
+        );
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_fallback_serve_moves_the_pin_to_the_target_that_answered() {
+        let (a, a_hits) =
+            stub_upstream(StatusCode::INTERNAL_SERVER_ERROR, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let gw = affinity_gw(&a, &b);
+
+        // First turn: the pinned target 500s (retryable), the fallback serves,
+        // and the pin moves — the fallback now holds the conversation's
+        // prompt, so the cache moved with it.
+        assert_eq!(
+            reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+            "from-b"
+        );
+        // Second turn: straight to `b`, without re-paying the 500.
+        assert_eq!(
+            reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+            "from-b"
+        );
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_relayed_4xx_does_not_move_the_pin() {
+        // `400` is fatal: committed, not fallen over from. And nothing was
+        // served, so the pin does not move — the next turn retries the pinned
+        // target first, exactly as the down-then-back case wants.
+        let (a, a_hits) = stub_upstream(StatusCode::BAD_REQUEST, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let gw = affinity_gw(&a, &b);
+
+        for _ in 0..2 {
+            let res = send(gw.clone(), "claude-sonnet-5").await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bridged-path failover
+    //
+    // A bridged target fails over at its own first-contact boundary. The stubs
+    // here are OpenAI-spec (`/v1/chat/completions`); the earlier failover tests
+    // all use Anthropic-spec stubs, which is exactly how a committed bridged
+    // 5xx survived unnoticed in the suite while `classify` saw only the
+    // passthrough route.
+    // -----------------------------------------------------------------------
+
+    /// A `/v1/chat/completions` stub upstream, the bridge-direction twin of
+    /// `stub_upstream`: tagged reply on 2xx, tagged error body otherwise.
+    async fn openai_stub(
+        status: StatusCode,
+        tag: &str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let tag = tag.to_string();
+        let stub = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |_body: Bytes| {
+                    let counter = counter.clone();
+                    let tag = tag.clone();
+                    async move {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let body = if status.is_success() {
+                            json!({"id": "c1", "object": "chat.completion", "model": "m-x",
+                                "choices": [{"index": 0, "finish_reason": "stop",
+                                    "message": {"role": "assistant", "content": tag}}],
+                                "usage": {"prompt_tokens": 10, "completion_tokens": 1}})
+                        } else {
+                            json!({"error": {"message": tag, "type": "api_error"}})
+                        };
+                        (status, Json(body))
+                    }
+                }),
+            )
+            .into_make_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// A two-target gateway over OpenAI-spec providers — every target in the
+    /// chain goes through `bridge`, which is what the real routed configs
+    /// look like.
+    async fn bridged_gw(
+        strategy: &str,
+        affinity: bool,
+    ) -> (
+        Arc<Gateway>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (a, a_hits) = openai_stub(StatusCode::INTERNAL_SERVER_ERROR, "from-a").await;
+        let (b, b_hits) = openai_stub(StatusCode::OK, "from-b").await;
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "openai"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "openai"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+strategy = "{strategy}"
+cache_affinity = {affinity}
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+"#
+        );
+        let gw = Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )));
+        (gw, a_hits, b_hits)
+    }
+
+    #[tokio::test]
+    async fn a_bridged_targets_5xx_fails_over() {
+        // The gap this pins: on the bridged path the non-2xx upstream was
+        // converted inside `bridge` and committed as `Attempt::Responded` —
+        // `classify` only ever saw the raw response on the passthrough route,
+        // so a bridged chain's 500 silently could not fall over. Now `bridge`
+        // sorts its own `Attempt`, and the retryable status moves the chain.
+        let (gw, a_hits, b_hits) = bridged_gw("failover", false).await;
+        let res = send(gw.clone(), "claude-sonnet-5").await;
+        assert_eq!(res.status(), StatusCode::OK, "a bridged 5xx must fail over");
+        assert_eq!(reply_text(res).await, "from-b");
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_relayed_bridged_4xx_commits() {
+        // The exclusion, on the bridged route: 400 is per-request — the same
+        // error on every target — so it commits and the secondary is never
+        // contacted. The bridged twin of `failover_stops_on_400`.
+        let (gw, a_hits, b_hits) = {
+            // Rebuild with a 400-answering primary, rebinding so the tagged
+            // stub's fixed status matches.
+            let (a, a_hits) = openai_stub(StatusCode::BAD_REQUEST, "from-a").await;
+            let (b, b_hits) = openai_stub(StatusCode::OK, "from-b").await;
+            let cfg_text = format!(
+                r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "openai"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "openai"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+strategy = "failover"
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+"#
+            );
+            let gw = Arc::new(Gateway::new(Arc::new(
+                toml::from_str::<Config>(&cfg_text).unwrap(),
+            )));
+            (gw, a_hits, b_hits)
+        };
+        let res = send(gw.clone(), "claude-sonnet-5").await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_bridged_fallback_serve_re_points_the_pin() {
+        // The re-point contract on bridged targets — the shape the real config
+        // is in: turn 1's pinned target 500s, the fallback serves, the pin
+        // moves with the cache; turn 2 goes straight to `b` without re-paying
+        // the 500.
+        let (gw, a_hits, b_hits) = bridged_gw("load-balance", true).await;
+        assert_eq!(
+            reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+            "from-b"
+        );
+        assert_eq!(
+            reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+            "from-b"
+        );
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_search_loop_failure_past_iteration_zero_stays_fatal() {
+        // The boundary `bridge()` alone owns. Iteration 0 is first contact: a
+        // retryable status there fails over like anything else. From iteration
+        // 1 the searches are already spent on this target — a retry would
+        // re-run them on the next one for a turn that already paid for them —
+        // so the failure is fatal and the fallback is never contacted. One
+        // stub plays both halves: call 1 answers the tool call, call 2 fails
+        // retryably, and `b` must see zero.
+        let a_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = a_hits.clone();
+        let a_stub = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |_body: Bytes| {
+                    let counter = counter.clone();
+                    async move {
+                        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        if n == 1 {
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "id": "c1", "object": "chat.completion", "model": "m",
+                                    "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                        "message": {"role": "assistant", "content": null,
+                                            "tool_calls": [{"id": "call_ws", "type": "function",
+                                                "function": {"name": "web_search",
+                                                    "arguments": "{\"query\":\"x\"}"}}]}}],
+                                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                                })),
+                            )
+                        } else {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": {"message": "down", "type": "api_error"}})),
+                            )
+                        }
+                    }
+                }),
+            )
+            .into_make_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, a_stub).await.unwrap() });
+        let (b, b_hits) = openai_stub(StatusCode::OK, "from-b").await;
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "openai"
+base_url = "http://{a_addr}"
+api_key = "k"
+
+[providers.b]
+spec = "openai"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+strategy = "failover"
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+
+[search]
+provider = "exa"
+api_key = "test-key"
+"#
+        );
+        let mut gw = Gateway::new(Arc::new(toml::from_str::<Config>(&cfg_text).unwrap()));
+        gw.search = Some(Arc::new(crate::search::SearchManager::new(Some(Box::new(
+            MockSearch,
+        )))));
+        let gw = Arc::new(gw);
+
+        let (status, _text) = send_messages(
+            router(gw.clone()),
+            r#"{"model":"claude-sonnet-5","max_tokens":64,"stream":false,
+                "tools":[{"type":"web_search_20250305","name":"web_search"}],
+                "messages":[{"role":"user","content":[{"type":"text","text":"search it"}]}]}"#,
+        )
+        .await;
+        // Iteration 1's 500 surfaces as-is: fatal, not walked down the chain.
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            a_hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both of the loop's iterations went to the primary"
+        );
+        assert_eq!(
+            b_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a mid-loop failure must not reach the fallback"
+        );
+    }
+
     /// A failover route: primary `a`, secondary `b`. Returns the gateway and
     /// both hit counters.
     async fn failover_gateway(
@@ -4062,5 +4875,74 @@ strategy = "load-balance"
         // non-retryable bucket, so it is relayed rather than retried.
         assert!(!is_retryable(StatusCode::MOVED_PERMANENTLY));
         assert!(!is_retryable(StatusCode::FOUND));
+    }
+
+    // -- affinity fingerprint -------------------------------------------------
+
+    #[test]
+    fn appending_turns_keeps_the_affinity_key() {
+        let mut req = json!({
+            "model": "m",
+            "system": "s",
+            "messages": [{"role": "user", "content": "first"}],
+        });
+        let key = affinity_key(&req).unwrap();
+        req["messages"] = json!([
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+        ]);
+        // Growth along the tail is the one property the head hash exists for:
+        // a key that moved per turn would re-roll every stick, and one
+        // re-roll costs a full-price re-read of the entire prompt.
+        assert_eq!(affinity_key(&req), Some(key));
+    }
+
+    #[test]
+    fn the_key_tracks_every_term_of_the_head() {
+        let req = json!({
+            "model": "m",
+            "system": "s",
+            "messages": [{"role": "user", "content": "first"}],
+        });
+        let key = affinity_key(&req).unwrap();
+        for tweak in [
+            json!({"model": "other", "system": "s",
+                   "messages": [{"role": "user", "content": "first"}]}),
+            json!({"model": "m", "system": "changed",
+                   "messages": [{"role": "user", "content": "first"}]}),
+            json!({"model": "m", "system": "s",
+                   "messages": [{"role": "user", "content": "changed"}]}),
+        ] {
+            assert_ne!(affinity_key(&tweak), Some(key));
+        }
+    }
+
+    #[test]
+    fn no_messages_means_no_key() {
+        assert_eq!(affinity_key(&json!({"model": "m"})), None);
+        assert_eq!(affinity_key(&json!({"model": "m", "messages": []})), None);
+    }
+
+    #[test]
+    fn the_openai_system_message_vacates_the_anchor_slot() {
+        let mut req = json!({"model": "m", "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "first"},
+        ]});
+        let key = affinity_key(&req).unwrap();
+        req["messages"] = json!([
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+        ]);
+        assert_eq!(affinity_key(&req), Some(key));
+        // The anchor is the first conversation turn, not the system message.
+        req["messages"][1] = json!({"role": "user", "content": "changed"});
+        assert_ne!(affinity_key(&req), Some(key));
+        // The leading system message is itself a term: only it changes, the
+        // key still re-rolls.
+        req["messages"][1] = json!({"role": "user", "content": "first"});
+        req["messages"][0] = json!({"role": "system", "content": "changed"});
+        assert_ne!(affinity_key(&req), Some(key));
     }
 }

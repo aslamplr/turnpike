@@ -507,7 +507,10 @@ rules of equal specificity over one class is a coin toss on which stylesheet lan
   "edit the route," and `targets()` synthesizes it); chain index `i` removes
   **array index `i - 1`**, which is the argument the CLI takes. The strategy select
   **disables** the non-`static` options below two targets, so the window cannot ask
-  for the state `set_strategy` refuses.
+  for the state `set_strategy` refuses. A route with `cache_affinity = true` carries
+  a `sticky` badge beside its strategy badge; the view echoes the flag wherever it
+  is set, and `doctor`'s `routes-affinity-shape` is the lint that names a
+  set-but-unengaging one.
 - **Doctor** — `turnpike doctor --json`, read-only, `Fail` toned `bad` and `Warn`
   toned `warn`. Advisory: a failure here is an empty list, never a broken window.
 

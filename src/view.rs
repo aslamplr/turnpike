@@ -56,6 +56,10 @@ pub struct ProviderView {
 pub struct RouteView {
     pub id: String,
     pub strategy: String,
+    /// Whether the route opted into sticky per-conversation selection
+    /// (`cache_affinity = true`). Echoed as set even where the pin cannot
+    /// engage — `doctor`'s `routes-affinity-shape` lint names that state.
+    pub cache_affinity: bool,
     pub display_name: Option<String>,
     /// The window the route advertises, after [`effective_context_tokens`]
     /// (the route's own field when set, else the minimum over declaring
@@ -159,6 +163,7 @@ fn route_view(id: &str, r: &RouteCfg, providers: &BTreeMap<String, ProviderCfg>)
     RouteView {
         id: id.to_string(),
         strategy: r.strategy.as_str().to_string(),
+        cache_affinity: r.cache_affinity,
         display_name: r.display_name.clone(),
         context_tokens: config::effective_context_tokens(r),
         // `targets()` synthesizes target 0 from the route's flat pair, so the
@@ -422,6 +427,37 @@ model = "gemma3:27b"
                 ("lms", "gemma3:27b"),
             ]
         );
+    }
+
+    #[test]
+    fn view_reports_the_affinity_knob() {
+        // The read surface's only record that the knob was set: a route that
+        // opted in renders as sticky, and a route that didn't must not.
+        let view = build_from(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes.sticky]
+provider = "zen"
+model = "a"
+strategy = "load-balance"
+cache_affinity = true
+
+[[routes.sticky.target]]
+provider = "zen"
+model = "b"
+
+[routes.plain]
+provider = "zen"
+model = "a"
+"#,
+        );
+        let sticky = view.routes.iter().find(|r| r.id == "sticky").unwrap();
+        assert!(sticky.cache_affinity);
+        let plain = view.routes.iter().find(|r| r.id == "plain").unwrap();
+        assert!(!plain.cache_affinity);
     }
 
     #[test]

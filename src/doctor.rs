@@ -83,6 +83,7 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
     let mut spec_problems = Vec::new();
     let mut context_problems = Vec::new();
     let mut failover_problems = Vec::new();
+    let mut affinity_problems = Vec::new();
 
     for (id, route) in &cfg.routes {
         let targets = route.targets();
@@ -191,6 +192,21 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
                 ));
             }
         }
+
+        // 7. A `cache_affinity` pin only engages under `load-balance` with two
+        // or more targets: the conversation key has no other consumer, so
+        // anywhere else it is a key the config layer parses and the gateway
+        // ignores — the exact shape of a typo'd expectation, worth one line.
+        if route.cache_affinity
+            && (route.strategy != config::Strategy::LoadBalance || !route.has_multiple_targets())
+        {
+            affinity_problems.push(format!(
+                "{id:?} sets cache_affinity on a {:?} route with {} target(s); the pin \
+                 only engages under \"load-balance\" with 2+",
+                route.strategy.as_str(),
+                targets.len()
+            ));
+        }
     }
 
     vec![
@@ -244,6 +260,14 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
              still takes the route down",
             Status::Warn,
         ),
+        lint_or_ok(
+            "routes-affinity-shape",
+            &affinity_problems,
+            "`cache_affinity` is set on a route where the pin cannot engage",
+            "pair `cache_affinity = true` with `strategy = \"load-balance\"` and 2+ \
+             targets, or drop the key",
+            Status::Warn,
+        ),
     ]
 }
 
@@ -251,8 +275,8 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
 /// collected lines as its detail when something was.
 ///
 /// Every strategy lint has this shape: gather per-route complaints into a
-/// `Vec`, then either say nothing is wrong or report all of them at once. Six
-/// copies of that branch would be six places to get the detail formatting
+/// `Vec`, then either say nothing is wrong or report all of them at once. Seven
+/// copies of that branch would be seven places to get the detail formatting
 /// subtly different.
 fn lint_or_ok(id: &str, problems: &[String], summary: &str, fix: &str, status: Status) -> Check {
     if problems.is_empty() {
@@ -370,7 +394,7 @@ pub struct DoctorOptions {
 /// build), and the constant is the thing it asserts against. `cargo build` sees
 /// no reader; the test profile does.
 #[allow(dead_code)]
-pub const CHECK_IDS: [&str; 26] = [
+pub const CHECK_IDS: [&str; 27] = [
     "config-found",
     "config-parse",
     "validate",
@@ -390,6 +414,7 @@ pub const CHECK_IDS: [&str; 26] = [
     "routes-mixed-spec",
     "routes-context-mixed",
     "routes-failover-single-provider",
+    "routes-affinity-shape",
     "base-url-shape",
     "config-perms",
     "backups",
@@ -874,6 +899,7 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
             "routes-mixed-spec",
             "routes-context-mixed",
             "routes-failover-single-provider",
+            "routes-affinity-shape",
             "base-url-shape",
         ] {
             checks.push(Check::skip(id, "skipped — the config did not parse"));
@@ -1963,6 +1989,71 @@ model = "same"
             r.detail.as_deref().unwrap().contains("both point at"),
             "{r:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cache_affinity_pin_off_its_shape_is_warned_about() {
+        // Two shapes the pin cannot engage in, both the same lint: absent
+        // targets, and a strategy that is not `load-balance`.
+        let one_target = format!(
+            r#"{TWO_PROVIDERS}
+[routes."sonny"]
+provider = "zen"
+model = "primary"
+cache_affinity = true
+"#
+        );
+        let path = write_config(&one_target);
+        let checks = diagnose_with(path, &one_target, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-affinity-shape")
+            .unwrap();
+        assert_eq!(c.status, Status::Warn);
+
+        let multi_static = format!(
+            r#"{TWO_PROVIDERS}
+[routes."sonny"]
+provider = "zen"
+model = "primary"
+cache_affinity = true
+
+[[routes."sonny".target]]
+provider = "local"
+model = "backup"
+"#
+        );
+        let path = write_config(&multi_static);
+        let checks = diagnose_with(path, &multi_static, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-affinity-shape")
+            .unwrap();
+        assert_eq!(c.status, Status::Warn);
+    }
+
+    #[tokio::test]
+    async fn cache_affinity_on_an_engaging_route_is_quiet() {
+        let raw = format!(
+            r#"{TWO_PROVIDERS}
+[routes."sonny"]
+provider = "zen"
+model = "primary"
+strategy = "load-balance"
+cache_affinity = true
+
+[[routes."sonny".target]]
+provider = "local"
+model = "backup"
+"#
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-affinity-shape")
+            .unwrap();
+        assert_eq!(c.status, Status::Ok);
     }
 
     /// Two providers, so a chain can be built that does or does not diversify.

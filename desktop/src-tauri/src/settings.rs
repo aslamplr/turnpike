@@ -38,6 +38,10 @@ pub struct ProviderView {
 pub struct RouteView {
     pub id: String,
     pub strategy: String,
+    /// Defaulted so an older supervised CLI (whose view predates the knob)
+    /// still deserializes instead of failing the whole settings read.
+    #[serde(default)]
+    pub cache_affinity: bool,
     pub display_name: Option<String>,
     pub context_tokens: Option<u64>,
     pub targets: Vec<TargetView>,

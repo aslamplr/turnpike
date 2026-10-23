@@ -37,6 +37,7 @@ export interface TargetView {
 export interface RouteView {
   id: string;
   strategy: string;
+  cache_affinity: boolean;
   display_name: string | null;
   context_tokens: number | null;
   targets: TargetView[];

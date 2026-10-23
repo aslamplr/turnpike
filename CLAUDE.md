@@ -126,7 +126,11 @@ cargo test        # inline #[cfg(test)] modules per file
   rewrites target 0, which stays the route's flat `provider`/`model`: `targets()` synthesizes
   target 0, so a block for that pair would give the route two of them. It refuses a non-`static`
   strategy on a 1-target route (the state `routes-strategy` lints) and resets a stranded strategy
-  to `static` when a removal leaves one target.
+  to `static` when a removal leaves one target. `cache_affinity = true` opts a
+  `load-balance` route into **sticky per-conversation selection** — a SHA-256 pin over the
+  replay-stable head `(model, system, messages[0])`, next-cursor pick on a miss, ~5-min TTL, and a
+  fallback-served turn re-points the pin; plain `load-balance` keeps its documented single attempt
+  (see docs/routing.md).
 - **Failover is pre-first-byte only.** Once the first SSE byte reaches the client the response is
   committed; buffering to allow mid-stream failover would cost streaming latency on every request
   to such a route. Failover covers the **first upstream contact** only — `bridge()` re-sends the

@@ -504,14 +504,17 @@ impl StreamConverter {
             if let Some(c) = cached {
                 usage_out["cache_read_input_tokens"] = json!(c);
             }
-            // The middleware loop drives the message's lifetime itself: this
-            // iteration's blocks are closed, but a search round may follow on
-            // the same stream, so the message must stay open.
+            // One usage line per path, through the shared shape (see
+            // `log_usage_trace`): the live loop logs per iteration, since its
+            // message stays open across search rounds; a plain stream logs
+            // once, at its finish.
             if self.defer_finish {
+                super::log_usage_trace(input, cached, output, "bridge: iteration usage");
                 self.iteration_stop = Some(stop);
                 self.iteration_usage = Some(usage_out);
                 return events;
             }
+            super::log_usage_trace(input, cached, output, "bridge: turn usage");
             events.push(Event {
                 name: "message_delta".into(),
                 data: json!({

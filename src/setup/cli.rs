@@ -747,14 +747,20 @@ fn spec_from(name: &str) -> Result<Spec> {
 
 /// A JSON scalar as a `toml_edit` value.
 ///
-/// Numbers are tried first so `max_loops` and `context_tokens` land as integers
-/// rather than strings — `config::load_from_str` would reject `"200000"` where it
-/// wants a number, and the failure would appear at validate time, far from here.
+/// Typed scalars are tried before the string fallback — integers first, then
+/// booleans — so `max_loops`/`context_tokens` land as integers and
+/// `cache_affinity` (the schema's first route-level bool) lands as a bool,
+/// rather than as strings `config::load_from_str` would reject at commit, far
+/// from the op that wrote them.
 fn value_for(raw: &str) -> toml_edit::Value {
     if let Ok(n) = raw.parse::<i64>() {
         return n.into();
     }
-    raw.into()
+    match raw {
+        "true" => true.into(),
+        "false" => false.into(),
+        _ => raw.into(),
+    }
 }
 
 /// A session as a fresh value, for ops that do not change it.
@@ -1324,6 +1330,23 @@ mod tests {
         let cfg = crate::config::load_from_str(&session.doc).unwrap();
         assert_eq!(cfg.search.max_loops, 3);
         assert_eq!(cfg.search.provider, "searxng");
+    }
+
+    #[test]
+    fn bool_arguments_land_as_bools_not_strings() {
+        // `cache_affinity` is the schema's first route-level bool. Left to the
+        // string fallback, `value_for` would write `cache_affinity = "true"`,
+        // and the failure would surface at commit as a generic validation
+        // error naming no key — the same trap the numeric test pins.
+        let session = chain(
+            &starter_session("bool-scalar"),
+            &[(
+                "set-route",
+                r#"{"id":"claude-sonnet-5","key":"cache_affinity","value":"true"}"#,
+            )],
+        );
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        assert!(cfg.routes["claude-sonnet-5"].cache_affinity);
     }
 
     /// **The regression test for the live bug.** The window sent

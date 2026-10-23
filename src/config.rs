@@ -159,7 +159,9 @@ pub enum Strategy {
     /// Target 0, every request. What a route with no `strategy` key means.
     #[default]
     Static,
-    /// Round-robin across targets, one per request.
+    /// Round-robin across targets, one per request. With `cache_affinity`,
+    /// sticky per conversation instead — the cursor advances on new
+    /// conversations only.
     LoadBalance,
     /// Try targets in order; on a retryable failure, move to the next.
     Failover,
@@ -203,6 +205,13 @@ pub struct RouteCfg {
     /// Selection policy across [`RouteCfg::targets`]. Defaults to `Static`.
     #[serde(default)]
     pub strategy: Strategy,
+    /// Sticky per-conversation selection for `load-balance` routes: turns of
+    /// one conversation keep serving from the target that already holds the
+    /// provider's copy of the prompt cache, instead of rotating into a target
+    /// that must re-read the whole prompt at full price. Ignored on any other
+    /// strategy — `doctor` lints that (`routes-affinity-shape`).
+    #[serde(default)]
+    pub cache_affinity: bool,
     /// Extra candidate upstreams, in declaration order. Target 0 is always the
     /// route's own `provider`/`model`; this array holds targets 1..n.
     #[serde(default)]
@@ -401,6 +410,9 @@ pub struct RouteResolution {
     /// Targets in order. Target 0 is always the route's flat `provider`/`model`.
     pub targets: Vec<Resolved>,
     pub strategy: Strategy,
+    /// Whether the route opted into cache-affinity selection. Consumed by the
+    /// gateway only — `resolve` stays pure, and selection is request-scoped.
+    pub cache_affinity: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -478,6 +490,9 @@ impl Config {
                         upstream_model: model.to_string(),
                     }],
                     strategy: Strategy::Static,
+                    // Explicit provider/model routing: no route owns this
+                    // name, so there is no route-level knob to carry.
+                    cache_affinity: false,
                 });
             }
             return Err(ResolveError::UnknownProvider(prov.to_string()));
@@ -505,6 +520,7 @@ impl Config {
             route_id: id.to_string(),
             targets,
             strategy: route.strategy,
+            cache_affinity: route.cache_affinity,
         })
     }
 
@@ -783,6 +799,7 @@ model = "openai/gpt-5"
                 context_tokens: None,
                 family: Some("opus".into()),
                 strategy: Strategy::Static,
+                cache_affinity: false,
                 target: Vec::new(),
             },
         );
@@ -799,6 +816,7 @@ model = "openai/gpt-5"
                 context_tokens: None,
                 family: Some("haiku".into()),
                 strategy: Strategy::Static,
+                cache_affinity: false,
                 target: Vec::new(),
             },
         );
@@ -1084,6 +1102,43 @@ strategy = "{s}"
         assert!(toml::from_str::<Config>(&doc("load_balance")).is_err());
         assert_eq!(Strategy::default(), Strategy::Static);
         assert_eq!(Strategy::LoadBalance.as_str(), "load-balance");
+    }
+
+    #[test]
+    fn cache_affinity_parses_and_defaults_false() {
+        // Additive knob: absent means off, exactly as no `strategy` key means
+        // `static`.
+        let doc = |s: &str| {
+            format!(
+                r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "claude-sonnet-4-5"
+{s}
+"#
+            )
+        };
+        let plain = toml::from_str::<Config>(&doc("")).unwrap();
+        assert!(!plain.routes["claude-sonnet-5"].cache_affinity);
+        let set = toml::from_str::<Config>(&doc("cache_affinity = true")).unwrap();
+        assert!(set.routes["claude-sonnet-5"].cache_affinity);
+    }
+
+    #[test]
+    fn resolution_carries_the_affinity_knob() {
+        // The knob is route-owned config, so it must reach the gateway through
+        // the resolution — the same ride-along the strategy makes.
+        let mut cfg = multi_target_config();
+        cfg.routes
+            .get_mut("claude-sonnet-5")
+            .unwrap()
+            .cache_affinity = true;
+        let res = cfg.resolve_route("claude-sonnet-5").unwrap();
+        assert!(res.cache_affinity);
     }
 
     #[test]

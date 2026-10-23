@@ -15,7 +15,7 @@ disagree, the doc is wrong.
 | [bridge.md](bridge.md) | The Anthropic ↔ OpenAI spec bridge: request, response, and streaming translation |
 | [search.md](search.md) | Agentic search middleware: `SearchProvider` trait, Exa, SearXNG, the closed-loop mechanics |
 | [secrets.md](secrets.md) | The encrypted key store: layout, crypto, the precedence chain, what it does and does not protect |
-| [setup-and-doctor.md](setup-and-doctor.md) | `turnpike setup` (the wizard, comment preservation, the migration invariant), `turnpike config` (the redacted view), and `turnpike doctor` (the 26 checks, `--json`), plus the stdout/stderr prompt discipline |
+| [setup-and-doctor.md](setup-and-doctor.md) | `turnpike setup` (the wizard, comment preservation, the migration invariant), `turnpike config` (the redacted view), and `turnpike doctor` (the 27 checks, `--json`), plus the stdout/stderr prompt discipline |
 | [launchers.md](launchers.md) | `turnpike launch`: Claude Code env vars, Claude Desktop gateway profile, model resolution |
 | [desktop.md](desktop.md) | The desktop shell: the supervisor state machine over `turnpike serve`, the tray, autostart, the settings window that edits the config, the CLI it bundles and installs to `PATH`, the auto-updater, and the release pipeline |
 

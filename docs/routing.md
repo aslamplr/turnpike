@@ -12,7 +12,7 @@ Three strategies, all per route, all optional:
 | `strategy` | Behavior |
 | --- | --- |
 | `static` | The route's own `provider`/`model`, every request. **The default**, and what a route with no `strategy` key means. |
-| `load-balance` | Round-robin across the route's targets, one per request. |
+| `load-balance` | Round-robin across the route's targets, one per request. With `cache_affinity = true`, sticky per conversation instead — see [Cache affinity](#cache-affinity). |
 | `failover` | Try targets in order; on a retryable failure, move to the next. |
 
 **Keys are snake_case, values are hyphenated or a single word.** That is the
@@ -96,6 +96,8 @@ The three matching rules are unchanged, with one compatibility fix:
 
 - `static` → target 0, counter untouched.
 - `load-balance` → `n = counter[route_id] % targets.len()`, then increment.
+  With `cache_affinity = true`, the pick is sticky per conversation instead —
+  the cursor advances on new conversations only. [Cache affinity](#cache-affinity).
 - `failover` → target 0. The *ordering* of attempts is the policy, so selection
   itself is trivial.
 
@@ -113,6 +115,121 @@ The counter is per-process. Several `turnpike serve` processes, or a restart,
 each start their own, so balancing is approximate. That is acceptable for a
 loopback dev gateway and is not a correctness property.
 
+## Cache affinity
+
+Prompt-cache state lives on the (provider, model) pair each target points at —
+an upstream caches the prefix *it* has seen, per model. Plain round-robin is
+the wrong shape for that: one conversation's turns rotate a, b, a, b, and every
+direction loses. Target b has never seen the prompt, so each of its turns
+re-bills the whole history at full input price; target a re-reads a prompt that
+last grew on b's side. Both targets write duplicate caches of the shared head.
+
+`cache_affinity = true` opts a `load-balance` route out of that:
+
+```toml
+[routes."claude-sonnet-5"]
+provider = "a"
+model = "m-a"
+strategy = "load-balance"
+cache_affinity = true
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+```
+
+### The fingerprint
+
+`affinity_key()` (`src/proxy.rs`) hashes the **replay-stable head** — the part
+of the request every agent client sends unchanged on every turn:
+
+```text
+key = SHA256( H(model) ‖ H(system) ‖ H(messages[0]) )
+```
+
+- **`model`** — the client-requested id. Provider caches are model-scoped, so a
+  conversation that switches models cannot hit a cache on the far side of the
+  switch anyway; the key re-rolls there and re-sticks.
+- **`system`** — spec-aware: the Anthropic `system` field, or the leading
+  `role == "system"` message of an OpenAI body (which then vacates the anchor
+  slot, so the same message is never hashed twice).
+- **`messages[0]`** — the first conversation message, after any vacated system
+  one.
+
+Each term is hashed through its exact `serde_json` serialization, so field
+order is the client's own. **Nothing that grows per turn enters the key** —
+last message, message count, tool results: a key that moves every turn cannot
+pin anything, and one re-rolled stick costs a full-price re-read of the entire
+prompt.
+
+The design is measured, not assumed: in an evidence run of a real Claude Code
+session through the instrumented gateway (561 fingerprinted requests), the
+three-term key was identical on **every genuinely distinct turn — 278 of 278,
+zero re-rolls** — while a whole-history rolling key would have re-rolled
+almost every distinct turn, because real clients mutate early history (on this
+run, *no* turn-to-turn transition preserved the full message prefix).
+
+Collisions are benign by construction: two conversations that share a head
+share a real prompt prefix, so co-locating them yields cross-conversation
+cache hits — the "false positive" saves money.
+
+The named trade: templated workloads — many conversations with the same
+`system` and first message — collapse onto one key and bunch on one target.
+Neutral-or-better for cost (the shared head caches once instead of twice),
+mild for spread; the additive release valve is hashing the `tools` array into
+the key, which is also cache-coherent — Anthropic's cacheable prefix is
+tools → system → messages. Deferred until such a fleet is observed.
+
+### Selection
+
+- **Known, fresh key → its target.** The round-robin cursor is untouched; a
+  pinned conversation never advances it.
+- **Unknown or expired key → the next round-robin slot.** The shared cursor
+  advances on misses only, so distinct conversations still alternate; the key
+  then pins there.
+- **TTL: five minutes** — about Anthropic's prompt-cache lifetime. Entries are
+  pruned lazily, on the miss that notices them; a pin that outlived a warm
+  cache steers at a provider that charges full price, so it is dropped rather
+  than honored.
+
+The store is in-memory, per process, like the round-robin counter. A gateway
+restart re-rolls each conversation once, then re-sticks — the same one-turn
+cost an upstream's cold cache would charge.
+
+### "Route A is temporarily down"
+
+The knob reuses the failover walk instead of inventing health checks. A route
+with `cache_affinity` set builds its attempt chain as the sticky pick plus the
+remaining targets in configured order, under the same rules as
+[Failover](#failover-is-pre-first-byte-only): one try per target, retryable
+statuses (`429`, `5xx`, transport) move the chain, `400`/`422` commit, a `401`
+still does not fail over, and the first-byte boundary is unchanged — a
+fallback can only happen before streaming begins.
+
+When a fallback target serves the turn, the pin **re-points** to it: the
+prompt has been written on that target now, so the cache moved with the
+answer, and the conversation sticks there until the TTL runs out. A turn where
+*no* target answered leaves the pin alone; the next turn retries the sticky
+pick first, as `failover` would.
+
+**Plain `load-balance` is untouched** — no config change, one attempt,
+byte-identical behavior. The chain extension applies only to routes that set
+the key.
+
+### Seeing it
+
+`RUST_LOG=turnpike=debug` prints the pin: `affinity: sticky hit`,
+`affinity: new pin`, `affinity: re-pointed` (each with the key prefix and
+target position), plus the per-request `request fingerprint` line and the
+per-turn usage lines (`turn usage` on loop-assembled paths, `bridge: turn
+usage` on a plain bridged stream, `bridge: iteration usage` per round of the
+live search loop) that show the cache economics.
+
+`doctor` warns (`routes-affinity-shape`) when `cache_affinity` is set where
+the pin cannot engage — any strategy other than `load-balance`, or fewer than
+two targets. Hand-editing is the way to set it today; the setup wizard does
+not yet offer it.
+
 ## Failover is pre-first-byte only
 
 The attempt loop lives entirely in `forward()`, where the first-byte boundary is
@@ -128,7 +245,9 @@ fixes.
 resolved target on every iteration of the agentic search loop; a mid-loop failure
 stays a hard error. Otherwise a 5-iteration loop across three flaky targets
 multiplies into 15 attempts, and partial search traces would need a rule for
-which iteration's history survives.
+which iteration's history survives. A bridged chain's *first-contact* failure
+does fail over — the exception is the mid-loop one; see the ordering constraint
+below.
 
 **Failover covers *fails*, not *is slow*.** `gw.http` sets a connect timeout and
 deliberately no overall timeout, because streams are long-lived. An upstream that
@@ -200,6 +319,20 @@ enum Attempt {
 }
 ```
 
+A **bridged** target has no raw response to hand `classify` — `bridge()` owns
+its conversion. So `bridge()` sorts its own `Attempt` at its own first-contact
+boundary (`bridged_attempt`, `search_loop_attempt`, `src/proxy.rs`): a
+single-shot failure, the streaming loop's pre-stream contact, and buffered-loop
+iteration 0 classify by the status the converted error preserves
+(`upstream_error_response` keeps the upstream's status; a transport failure is
+a `502`), while a mid-loop failure past iteration 0 is `Fatal` — the searches
+are already spent on that target, and a retry would re-run them on the next
+one. This classification is not decorative: before it existed, a bridged
+chain's 5xx silently could not fail over, because `attempt_target` committed
+whatever `bridge()` returned — a gap the live smoke of cache affinity caught,
+and that every pre-existing failover test missed by using Anthropic-spec stubs,
+which never reach the bridge.
+
 **The translation path is chosen per attempt** from `provider_spec == family`, so
 failover across differing specs works: a retry against an Anthropic-spec target
 takes the passthrough branch even if the primary was OpenAI-spec. That is why a
@@ -252,6 +385,7 @@ picker lists.
 | `routes-mixed-spec` | `Warn` | A route mixes anthropic- and openai-spec targets; the translation path changes per request. |
 | `routes-context-mixed` | `Warn` | A strategy route where some targets declare `context_tokens` and others don't. |
 | `routes-failover-single-provider` | `Warn` | A `failover` chain whose targets are all one provider — a provider-wide outage still takes the route down. |
+| `routes-affinity-shape` | `Warn` | `cache_affinity` set on a route where the pin cannot engage — any strategy other than `load-balance`, or fewer than 2 targets; the key parses and is then ignored. |
 
 `key-resolvable` gains importance rather than changing: with failover, an
 unresolvable primary key no longer fails loudly at request time, so the static
@@ -296,9 +430,10 @@ than a known limit.
 
 ## What is not here, explicitly
 
-- **Weighted or weighted-random balancing.** `load-balance` is round-robin only.
-  The schema leaves room: a `weight` field on `TargetCfg` is additive and no
-  existing key changes meaning.
+- **Weighted or weighted-random balancing.** `load-balance` is round-robin
+  (and, with `cache_affinity`, sticky per conversation) — there is no weight
+  key. The schema leaves room: a `weight` field on `TargetCfg` is additive and
+  no existing key changes meaning.
 - **First-byte timeout**, and with it the "is slow" half.
 - **Mid-stream failover** — requires buffering; see above.
 - **The `401`/`402`/`403`/`404`/`408` retry allowlist** — see
@@ -313,5 +448,5 @@ than a known limit.
   `[routes.<id>]` and the target array.
 - [gateway.md](gateway.md) — the forwarding pipeline and where the attempt loop
   sits in it.
-- [setup-and-doctor.md](setup-and-doctor.md) — the check list these six checks
+- [setup-and-doctor.md](setup-and-doctor.md) — the check list these seven checks
   joined.

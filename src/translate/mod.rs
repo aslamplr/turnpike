@@ -500,6 +500,15 @@ pub fn split_usage(usage: &Value) -> (u64, Option<u64>, u64) {
     }
 }
 
+/// The per-turn usage debug line, one shape for every assembly path: the
+/// buffered loop, the live loop, and the stream converter all report the
+/// turn's (uncached input, cache reads, output) identically, so a field
+/// addition cannot land in one path and diverge the rest. `event` is the
+/// message string each path emits — the ones docs/routing.md names.
+pub(crate) fn log_usage_trace(input: u64, cached: Option<u64>, output: u64, event: &str) {
+    tracing::debug!(input, cache_read = ?cached, output, "{}", event);
+}
+
 /// Truncate a translated response at the first stop sequence, the way
 /// Anthropic does server-side.
 ///
@@ -566,8 +575,7 @@ pub fn earliest_stop(text: &str, stops: &[String]) -> Option<(usize, String)> {
 pub fn synthetic_signature(thinking: &str) -> String {
     let mut input = b"turnpike-synthetic:".to_vec();
     input.extend_from_slice(thinking.as_bytes());
-    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
-    base64_encode(digest.as_ref())
+    base64_encode(&crate::secrets::sha256(&input))
 }
 
 /// Minimal standard-alphabet base64. Hand-rolled rather than pulling in a

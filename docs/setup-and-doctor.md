@@ -387,6 +387,7 @@ chance to disagree. `--json` is the real interface:
     {
       "id": "claude-sonnet-5",
       "strategy": "failover",
+      "cache_affinity": false,
       "context_tokens": 200000,
       "targets": [
         { "provider": "zen", "model": "claude-sonnet-4-5", "spec": "anthropic" },
@@ -485,7 +486,7 @@ explains it. The rest of the list is advice.
 
 ### The check list
 
-The 26 checks, in the order they run — from "is there even a config" to "does
+The 27 checks, in the order they run — from "is there even a config" to "does
 the upstream answer":
 
 | # | Check | Reports |
@@ -509,13 +510,14 @@ the upstream answer":
 | 17 | `routes-mixed-spec` | A route mixing anthropic- and openai-spec targets; the translation path is chosen per attempt. |
 | 18 | `routes-context-mixed` | A strategy route where some targets declare `context_tokens` and others don't — the route minimum then ignores the silent ones. |
 | 19 | `routes-failover-single-provider` | A `failover` chain whose targets are all one provider, so a provider-wide outage still takes the route down. |
-| 20 | `base-url-shape` | Parses with `reqwest::Url`; warns when an Anthropic-spec `base_url` ends in `/v1`, since turnpike appends the spec path itself. |
-| 21 | `config-perms` | Warns if an inline key is present and `mode & 0o077 != 0`. |
-| 22 | `backups` | Whether a config backup exists yet. |
-| 23 | `launchers` | Claude Code on `PATH` / installed, and whether the Claude Desktop gateway profile is applied. |
-| 24 | `gateway-detected` | `GET /_health` on the configured gateway address, expecting 204 + `x-turnpike-gateway: 1`. |
-| 25 | `gateway-shadows-config` | Compares the running gateway's `/v1/models` route ids against this config and warns on divergence. |
-| 26 | `provider-reach` | Live-only. `GET` the cheap endpoint per provider with injected auth and an 8s timeout. Any HTTP response means reachable; **only** a 401/403 escalates, and then doctor asks before a billed call. |
+| 20 | `routes-affinity-shape` | `cache_affinity` set on a route where the pin cannot engage — the strategy is not `load-balance`, or the chain has fewer than 2 targets. The key parses and is then ignored, which is the silent state this check exists to prevent. |
+| 21 | `base-url-shape` | Parses with `reqwest::Url`; warns when an Anthropic-spec `base_url` ends in `/v1`, since turnpike appends the spec path itself. |
+| 22 | `config-perms` | Warns if an inline key is present and `mode & 0o077 != 0`. |
+| 23 | `backups` | Whether a config backup exists yet. |
+| 24 | `launchers` | Claude Code on `PATH` / installed, and whether the Claude Desktop gateway profile is applied. |
+| 25 | `gateway-detected` | `GET /_health` on the configured gateway address, expecting 204 + `x-turnpike-gateway: 1`. |
+| 26 | `gateway-shadows-config` | Compares the running gateway's `/v1/models` route ids against this config and warns on divergence. |
+| 27 | `provider-reach` | Live-only. `GET` the cheap endpoint per provider with injected auth and an 8s timeout. Any HTTP response means reachable; **only** a 401/403 escalates, and then doctor asks before a billed call. |
 
 ### Local probe vs live checks
 
@@ -572,7 +574,7 @@ Machine-readable, `--json`:
       "fix": "run `turnpike setup` → Keys, or export the env var shown below"
     }
   ],
-  "summary": { "warnings": 3, "failures": 0, "total": 26 }
+  "summary": { "warnings": 3, "failures": 0, "total": 27 }
 }
 ```
 

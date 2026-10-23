@@ -499,6 +499,17 @@ pub fn hydrate(cfg: &mut crate::config::Config, ctx: &StoreCtx) {
     cfg.search.store_status = status;
 }
 
+/// SHA-256 over `ring`. The one digest helper — the proxy's affinity
+/// fingerprint and the bridge's synthetic thinking signature both hash
+/// through it — and it sits beside the hex helpers its output usually feeds.
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use ring::digest;
+    let hash = digest::digest(&digest::SHA256, bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hash.as_ref());
+    out
+}
+
 /// Hex helpers. Hand-rolled rather than pulling `hex` in for forty lines.
 pub(crate) fn to_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";

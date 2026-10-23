@@ -88,8 +88,13 @@ Every POST handler funnels into `forward(gw, path, family, headers, body)`:
    the router).
 7. **Select.** For a strategy route, `Gateway::select_target()` picks one
    candidate from the route's target chain — round-robin for `load-balance`,
-   target 0 for `static` and `failover`. Resolution itself stays pure and always
-   means target 0; see [routing.md](routing.md).
+   target 0 for `static` and `failover`. A `load-balance` route with
+   `cache_affinity = true` pins the pick per conversation instead
+   (`select_affinity`) — it engages only with 2+ targets in the chain;
+   anything else keeps the strategy's own selection, and `doctor`'s
+   `routes-affinity-shape` warns when the key is set where it cannot engage.
+   Resolution itself stays pure and always means target 0; see
+   [routing.md](routing.md).
 8. **Key.** `provider_cfg.api_key()` resolves the provider credential (inline
    `api_key` first, then `api_key_env`). Failure → `401`. The **client's**
    credential is never used here.

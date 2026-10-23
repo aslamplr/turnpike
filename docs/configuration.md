@@ -149,6 +149,12 @@ is purely additive.
 parse error, not a silent fallback — a typo'd `"failoverr"` must not quietly
 turn failover off.
 
+`cache_affinity` is a route-level `bool` (default `false`) that opts a
+`load-balance` route into sticky per-conversation selection: one conversation
+keeps serving from one target, so the provider's prompt cache keeps hitting
+instead of every turn re-billing the full history at full price. The
+fingerprint, semantics and down-target behavior: [routing.md](routing.md).
+
 ## Model resolution
 
 `Config::resolve()` maps a client-requested model to a `{ provider, provider_cfg,

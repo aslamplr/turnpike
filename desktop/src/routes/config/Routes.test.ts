@@ -26,6 +26,7 @@ const provider = (id: string): ProviderView => ({
 const route = (over: Partial<RouteView> = {}): RouteView => ({
   id: "claude-sonnet-5",
   strategy: "static",
+  cache_affinity: false,
   display_name: null,
   context_tokens: null,
   targets: [
@@ -214,6 +215,18 @@ describe("Routes — no field invites the browser's autofill", () => {
 
     expectNoAutofill(screen.getByLabelText("id (the client-facing model)"));
     expectNoAutofill(screen.getByLabelText("model (upstream)"));
+  });
+});
+
+describe("Routes — the affinity knob badge", () => {
+  it("flags a route that opted into sticky selection", () => {
+    mount([route({ strategy: "load-balance", cache_affinity: true })]);
+    expect(screen.getByText("sticky")).toBeInTheDocument();
+  });
+
+  it("stays quiet on a plain route", () => {
+    mount([route()]);
+    expect(screen.queryByText("sticky")).not.toBeInTheDocument();
   });
 });
 

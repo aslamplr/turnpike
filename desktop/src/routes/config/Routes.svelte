@@ -149,6 +149,7 @@
         <div class="row-head">
           <b>{r.id}</b>
           <span class="badge">{r.strategy}</span>
+          {#if r.cache_affinity}<span class="badge">sticky</span>{/if}
           {#if r.display_name}<span class="sub grow">{r.display_name}</span>{/if}
           <span class="sub num">{r.context_tokens === null ? "—" : r.context_tokens.toLocaleString("en-US")}</span>
         </div>

@@ -11,3 +11,4 @@ config.toml
 *.swo
 *.swn
 *~
+*.bkp

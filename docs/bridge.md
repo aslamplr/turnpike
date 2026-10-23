@@ -196,6 +196,16 @@ paths diverge (see [proxy.rs](gateway.md)'s `bridge()` and
    difference is *when* the bytes arrive, and only the streaming path is
    incremental.
 
+Both paths sort their own `Attempt` for the failover walk
+([routing.md](routing.md)): a pre-first-byte failure — a single-shot error,
+the streaming loop's pre-stream contact, buffered-loop iteration 0 —
+classifies by the status the converted error preserves, so `429`/`5xx`
+/transport failures fail over; a mid-loop failure past iteration 0 stays
+fatal, because the searches are already spent on that target. The converted
+error keeps the upstream's status and body
+(`upstream_error_response`), so the relayed chain-walk error is the provider's
+own message.
+
 Three request-driven response behaviors sit on top of both paths, because the
 Anthropic contract makes the response depend on what the request asked for:
 

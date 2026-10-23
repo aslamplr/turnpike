@@ -46,6 +46,7 @@ const configView = (over: Partial<ConfigView> = {}): ConfigView => ({
 const route = (over: Partial<RouteView> = {}): RouteView => ({
   id: "claude-sonnet-5",
   strategy: "static",
+  cache_affinity: false,
   display_name: null,
   context_tokens: null,
   targets: [
