@@ -576,14 +576,56 @@ impl WizardState {
             return Ok(());
         }
 
-        if self.doc.route_targets(id).len() < 2 {
+        let enabled = self
+            .doc
+            .route_target_states(id)
+            .iter()
+            .filter(|(_, _, enabled)| *enabled)
+            .count();
+        if enabled < 2 {
             println!(
-                "  {choice:?} needs at least 2 targets to differ from \"static\" — \
-                 this route has 1; add another target first"
+                "  {choice:?} needs at least 2 enabled targets to differ from \"static\" — \
+                 this route has {enabled}; add or enable another target first"
             );
             return Ok(());
         }
         report(self.doc.set_route_scalar(id, "strategy", choice));
+        Ok(())
+    }
+
+    /// Flip a boolean route flag, removing the key when it returns to the
+    /// default (`false`) — the same omit-when-default rule `strategy =
+    /// "static"` follows.
+    ///
+    /// `respect_peak_hours` is refused on a route whose strategy already is
+    /// `peak-hours`: the strategy implies the flag, so writing it (or removing
+    /// it) would describe a state the gateway does not read from this key.
+    fn toggle_route_flag(&mut self, p: &mut dyn Prompter, id: &str, key: &str) -> Result<()> {
+        let route = crate::config::load_from_str(&self.doc.as_str())
+            .ok()
+            .and_then(|c| c.routes.get(id).cloned());
+        let (current, strategy) = match route {
+            Some(r) => (
+                match key {
+                    "cache_affinity" => r.cache_affinity,
+                    _ => r.respect_peak_hours,
+                },
+                r.strategy,
+            ),
+            None => (false, crate::config::Strategy::Static),
+        };
+        if key == "respect_peak_hours" && strategy == crate::config::Strategy::PeakHours {
+            println!(
+                "  strategy = \"peak-hours\" already implies this — switch the strategy first"
+            );
+            return Ok(());
+        }
+        let pick = p.choose(key, &["off", "on"], if current { 1 } else { 0 })?;
+        if pick == 1 {
+            report(self.doc.set_route_scalar(id, key, true));
+        } else if self.doc.remove_route_scalar_keeping_comment(id, key) {
+            println!("  {key} is off");
+        }
         Ok(())
     }
 
@@ -595,11 +637,19 @@ impl WizardState {
     /// needs at least one target.
     fn targets_menu(&mut self, p: &mut dyn Prompter, id: &str) -> Result<()> {
         loop {
-            let chain = self.doc.route_targets(id);
+            let states = self.doc.route_target_states(id);
             println!();
-            for (i, (prov, model)) in chain.iter().enumerate() {
-                let role = if i == 0 { " (primary)" } else { "" };
-                println!("  target {i}{role}  {prov}/{model}");
+            // The primary is the first *enabled* target, matching
+            // `RouteCfg::primary()` — so a disabled target 0 is not labelled
+            // primary just because it leads the chain.
+            let primary = states
+                .iter()
+                .position(|(_, _, enabled)| *enabled)
+                .unwrap_or(0);
+            for (i, (prov, model, enabled)) in states.iter().enumerate() {
+                let role = if i == primary { " (primary)" } else { "" };
+                let state = if *enabled { "" } else { "  [disabled]" };
+                println!("  target {i}{role}  {prov}/{model}{state}");
             }
             let action = p.choose(
                 "Targets:",
@@ -609,11 +659,12 @@ impl WizardState {
                     "Move up",
                     "Move down",
                     "Peak hours",
+                    "Enable/disable",
                     "Remove",
                     "Strategy",
                     "Back",
                 ],
-                7,
+                8,
             )?;
             match action {
                 0 => {
@@ -621,23 +672,27 @@ impl WizardState {
                         report(self.doc.add_route_target(id, &t));
                     }
                 }
-                1 => self.edit_target(p, id, &chain)?,
-                2 => self.move_target(p, id, &chain, true)?,
-                3 => self.move_target(p, id, &chain, false)?,
-                4 => self.edit_peak_hours(p, id, &chain)?,
-                5 => self.remove_target(p, id, &chain)?,
-                6 => self.set_strategy(p, id)?,
+                1 => self.edit_target(p, id, &states)?,
+                2 => self.move_target(p, id, &states, true)?,
+                3 => self.move_target(p, id, &states, false)?,
+                4 => self.edit_peak_hours(p, id, &states)?,
+                5 => self.toggle_target_enabled(p, id, &states)?,
+                6 => self.remove_target(p, id, &states)?,
+                7 => self.set_strategy(p, id)?,
                 _ => return Ok(()),
             }
         }
     }
 
     /// One chain entry as a menu label, shared by the sub-menu's pickers.
-    fn target_options(chain: &[(String, String)]) -> Vec<String> {
+    fn target_options(chain: &[(String, String, bool)]) -> Vec<String> {
         chain
             .iter()
             .enumerate()
-            .map(|(i, (prov, model))| format!("target {i} ({prov}/{model})"))
+            .map(|(i, (prov, model, enabled))| {
+                let state = if *enabled { "" } else { ", disabled" };
+                format!("target {i} ({prov}/{model}{state})")
+            })
             .collect()
     }
 
@@ -646,7 +701,7 @@ impl WizardState {
         &mut self,
         p: &mut dyn Prompter,
         id: &str,
-        chain: &[(String, String)],
+        chain: &[(String, String, bool)],
         up: bool,
     ) -> Result<()> {
         if chain.len() < 2 {
@@ -677,7 +732,7 @@ impl WizardState {
         &mut self,
         p: &mut dyn Prompter,
         id: &str,
-        chain: &[(String, String)],
+        chain: &[(String, String, bool)],
     ) -> Result<()> {
         if chain.is_empty() {
             println!("  this route has no targets");
@@ -701,7 +756,7 @@ impl WizardState {
         &mut self,
         p: &mut dyn Prompter,
         id: &str,
-        chain: &[(String, String)],
+        chain: &[(String, String, bool)],
     ) -> Result<()> {
         if chain.is_empty() {
             println!("  this route has no targets");
@@ -796,11 +851,44 @@ impl WizardState {
         Ok(())
     }
 
+    /// Flip one target in or out of service, then say where it stands.
+    fn toggle_target_enabled(
+        &mut self,
+        p: &mut dyn Prompter,
+        id: &str,
+        chain: &[(String, String, bool)],
+    ) -> Result<()> {
+        if chain.is_empty() {
+            println!("  this route has no targets");
+            return Ok(());
+        }
+        let opts = Self::target_options(chain);
+        let index = p.choose("Enable/disable which target?", &as_refs(&opts), 0)?;
+        let next = !chain[index].2;
+        if let Err(e) = self.doc.set_route_target_enabled(id, index, next) {
+            println!("  {e}");
+            return Ok(());
+        }
+        println!(
+            "  target {index} is now {}",
+            if next { "enabled" } else { "disabled" }
+        );
+        // Disabling can strand a non-`static` strategy below two enabled
+        // targets — the same state a removal creates, and one `set_strategy`
+        // refuses to create.
+        if self.doc.reset_stranded_strategy(id) {
+            println!(
+                "  the route no longer has 2 enabled targets, so the strategy was reset to \"static\""
+            );
+        }
+        Ok(())
+    }
+
     fn remove_target(
         &mut self,
         p: &mut dyn Prompter,
         id: &str,
-        chain: &[(String, String)],
+        chain: &[(String, String, bool)],
     ) -> Result<()> {
         if chain.len() < 2 {
             println!("  this route has one target; a route needs at least one — edit it instead");
@@ -808,25 +896,23 @@ impl WizardState {
         }
         let opts = Self::target_options(chain);
         let index = p.choose("Remove which target?", &as_refs(&opts), 0)?;
-        let (prov, model) = &chain[index];
+        let (prov, model, _) = &chain[index];
         if !p.confirm_default(&format!("Remove target {index} ({prov}/{model})?"), false)? {
             println!("  kept");
             return Ok(());
         }
         report(self.doc.remove_route_target(id, index));
 
-        // A strategy that no longer has 2 targets to choose between is the exact
-        // state `set_strategy` refuses to create, so removing a target can strand
-        // a route in it. Reset to `static` and say so, rather than leave the user
-        // with a file their own doctor warns about.
-        if self.doc.route_targets(id).len() < 2 {
-            let strategy = crate::config::load_from_str(&self.doc.as_str())
-                .ok()
-                .and_then(|c| c.routes.get(id).map(|r| r.strategy));
-            if matches!(strategy, Some(s) if s != crate::config::Strategy::Static) {
-                println!("  the route now has 1 target, so the strategy was reset to \"static\"");
-                self.doc.remove_route_scalar_keeping_comment(id, "strategy");
-            }
+        // A strategy that no longer has 2 **enabled** targets to choose
+        // between is the exact state `set_strategy` refuses to create, so
+        // removing a target can strand a route in it. Reset to `static` and
+        // say so, rather than leave the user with a file their own doctor
+        // warns about (the shared `Doc` definition keeps this in step with
+        // disabling a target).
+        if self.doc.reset_stranded_strategy(id) {
+            println!(
+                "  the route no longer has 2 enabled targets, so the strategy was reset to \"static\""
+            );
         }
         Ok(())
     }
@@ -848,11 +934,13 @@ impl WizardState {
                 "display_name",
                 "max_tokens",
                 "context_tokens",
+                "cache_affinity",
+                "respect_peak_hours",
                 "strategy",
                 "Targets",
                 "Back",
             ],
-            8,
+            10,
         )?;
         match field {
             0 => {
@@ -915,10 +1003,12 @@ impl WizardState {
                     Err(_) => println!("  not a number; unchanged"),
                 }
             }
-            6 => {
+            6 => self.toggle_route_flag(p, &id, "cache_affinity")?,
+            7 => self.toggle_route_flag(p, &id, "respect_peak_hours")?,
+            8 => {
                 self.set_strategy(p, &id)?;
             }
-            7 => {
+            9 => {
                 self.targets_menu(p, &id)?;
             }
             _ => {}
@@ -1989,7 +2079,7 @@ base_url = "https://opencode.ai/zen"
         // so "2" is chain position 1 — the one added above) and then a confirm,
         // which defaults to no.
         let mut p = ScriptedPrompt::new(&["2", "y"]);
-        let chain = state.doc.route_targets("claude-sonnet-5");
+        let chain = state.doc.route_target_states("claude-sonnet-5");
         state
             .remove_target(&mut p, "claude-sonnet-5", &chain)
             .unwrap();

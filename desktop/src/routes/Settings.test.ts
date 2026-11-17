@@ -48,10 +48,11 @@ const route = (over: Partial<RouteView> = {}): RouteView => ({
   id: "claude-sonnet-5",
   strategy: "static",
   cache_affinity: false,
+  respect_peak_hours: false,
   display_name: null,
   context_tokens: null,
   targets: [
-    { provider: "zen", model: "claude-sonnet-4-5", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+    { provider: "zen", model: "claude-sonnet-4-5", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
   ],
   ...over,
 });
@@ -524,8 +525,8 @@ describe("Settings — a supervised CLI from another release", () => {
             routes: [
               route({
                 targets: [
-                  { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
-                  { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+                  { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+                  { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
                 ],
               }),
             ],
@@ -564,8 +565,8 @@ describe("Settings — a supervised CLI from another release", () => {
             routes: [
               route({
                 targets: [
-                  { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
-                  { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+                  { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+                  { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
                 ],
               }),
             ],
@@ -581,6 +582,41 @@ describe("Settings — a supervised CLI from another release", () => {
 
     await waitFor(() => expect(lastCall("config_edit_apply")).not.toBeNull());
     expect(lastCall("config_edit_apply")).toMatchObject({ op: "move-target" });
+  });
+});
+
+describe("Settings — target enable/disable and the model picker", () => {
+  it("toggles a target through set-target-enabled", async () => {
+    await mount();
+    fake("config_edit_apply", () => session());
+    await openTab("Routes");
+
+    await userEvent.click(screen.getByLabelText("Target 0 enabled"));
+    await waitFor(() =>
+      expect(lastCall("config_edit_apply")).toMatchObject({
+        session: "s1",
+        op: "set-target-enabled",
+        args: { id: "claude-sonnet-5", index: 0, enabled: false },
+      }),
+    );
+  });
+
+  it("asks the CLI for the provider's models when the target form opens", async () => {
+    await mount(
+      session({
+        view: {
+          kind: "view",
+          view: configView({ providers: [provider()], routes: [route()] }),
+        },
+      }),
+    );
+    fake("provider_models", () => [{ id: "m1", display_name: null }]);
+    await openTab("Routes");
+
+    await userEvent.click(screen.getByRole("button", { name: "Add target" }));
+    await waitFor(() =>
+      expect(lastCall("provider_models")).toEqual({ provider: "zen" }),
+    );
   });
 });
 

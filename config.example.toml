@@ -60,14 +60,20 @@ max_tokens = 64000
 provider = "zen-go"
 model = "deepseek-v4-flash"
 
-# Peak-hours routing: when the primary pair is pricey — its provider's
-# published UTC windows — serve from the first target that is not in one of
-# its own windows. `peak_hours` takes several `"HH:MM-HH:MM"` windows per day
-# and wraps past midnight (`"22:00-02:00"`). A target with no windows is
-# always available; when every target is in peak, the first target serves.
+# Peak-hours routing: when a target is inside one of its provider's published
+# UTC windows, prefer the ones that are not. `peak_hours` takes several
+# `"HH:MM-HH:MM"` windows per day and wraps past midnight (`"22:00-02:00"`).
+# A target with no windows is always available; when every target is in peak,
+# the first enabled target serves.
+#
+# Peak awareness is a route-level modifier: `respect_peak_hours = true` makes
+# every strategy read the cheap targets first — load-balance rotates among
+# them, failover tries them first, static serves the first one outside its
+# window. `strategy = "peak-hours"` is the older spelling of the same thing.
 #
 # [routes."claude-sonnet-5"]
-# strategy = "peak-hours"
+# strategy = "load-balance"
+# respect_peak_hours = true
 #
 # [[routes."claude-sonnet-5".target]]
 # provider = "zen"
@@ -77,6 +83,17 @@ model = "deepseek-v4-flash"
 # [[routes."claude-sonnet-5".target]]
 # provider = "zen-go"
 # model = "deepseek-v4-flash"
+#
+# A target serves unless it says otherwise. `enabled = false` takes one out of
+# service (resolution, every strategy, and the context-window minimum skip it)
+# while keeping the block and its comments; it is also how a target is taken
+# offline temporarily. Disabling every target of a route takes the route
+# offline — requests to it answer 503.
+#
+# [[routes."claude-sonnet-5".target]]
+# provider = "lm-studio"
+# model = "qwen3.8"
+# enabled = false
 
 # Agentic middleware: turnpike executes web_search server-side (Ollama-style
 # loop) instead of forwarding the tool to the client. Providers are swapped

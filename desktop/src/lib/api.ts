@@ -3,6 +3,7 @@ import type {
   CheckView,
   CliStatus,
   Installed,
+  RemoteModel,
   SaveOutcome,
   SessionPayload,
   Status,
@@ -15,6 +16,12 @@ export const stop = () => invoke<void>("gateway_stop");
 export const restart = () => invoke<void>("gateway_restart");
 
 export const settingsConfigPath = () => invoke<string>("settings_config_path");
+
+/// The model ids a configured provider advertises, straight from the provider.
+/// Rejects with the CLI's own message when it cannot be fetched; the picker
+/// stays usable as free text either way.
+export const providerModels = (provider: string) =>
+  invoke<RemoteModel[]>("provider_models", { provider });
 
 export const autostartEnabled = () => invoke<boolean>("autostart_enabled");
 /** Returns the state that actually took effect, which may differ from the ask. */

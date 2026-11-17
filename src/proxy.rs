@@ -86,28 +86,73 @@ fn utc_minute_of_day() -> u32 {
         / 60) as u32
 }
 
-/// The `peak-hours` pick: the first target that is not inside one of its own
-/// windows. When every target is in peak the chain's first target serves — a
-/// request is never refused over price, and the choice stays deterministic.
-/// Pure, so the boundaries are testable without a clock.
-fn peak_pick(targets: &[crate::config::Resolved], minute: u32) -> usize {
+/// Whether this target is inside one of its own pricey windows.
+fn in_peak(t: &crate::config::Resolved, minute: u32) -> bool {
+    t.peak_hours.iter().any(|w| w.contains(minute))
+}
+
+/// The enabled targets outside their own windows, in chain order.
+fn free_indices(targets: &[crate::config::Resolved], minute: u32) -> Vec<usize> {
     targets
         .iter()
-        .position(|t| !t.peak_hours.iter().any(|w| w.contains(minute)))
-        .unwrap_or(0)
+        .enumerate()
+        .filter(|(_, t)| !in_peak(t, minute))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Free targets first, then the in-peak ones, each in chain order.
+///
+/// The order is what "peak awareness" means for every strategy that walks a
+/// chain: a cheap target is always tried before a pricey one, and the pricey
+/// ones stay in the tail as a last resort (a target in its peak window beats no
+/// answer at all).
+fn peak_order(targets: &[crate::config::Resolved], minute: u32) -> Vec<usize> {
+    let free = free_indices(targets, minute);
+    let mut order = free.clone();
+    order.extend((0..targets.len()).filter(|i| !free.contains(i)));
+    order
+}
+
+/// What `load-balance` rotates over under peak awareness: the free targets
+/// when there are any, else every target — price never refuses a request.
+fn serving_pool(res: &crate::config::RouteResolution, minute: u32) -> Vec<usize> {
+    if !res.peak_aware {
+        return (0..res.targets.len()).collect();
+    }
+    let free = free_indices(&res.targets, minute);
+    if free.is_empty() {
+        (0..res.targets.len()).collect()
+    } else {
+        free
+    }
+}
+
+/// The `peak-hours` head: the first target that is not inside one of its own
+/// windows. When every target is in peak the first target serves — a request
+/// is never refused over price, and the choice stays deterministic. Pure, so
+/// the boundaries are testable without a clock.
+fn peak_pick(targets: &[crate::config::Resolved], minute: u32) -> usize {
+    peak_order(targets, minute).first().copied().unwrap_or(0)
 }
 
 /// The attempt chain for a selection that moves one target to the front: that
-/// target first, then the rest in configured order. Shared by `cache_affinity`
-/// and `peak-hours`, so both policies walk — and fail over — through the same
-/// shape.
-fn chain_from(
-    targets: &[crate::config::Resolved],
-    index: usize,
-) -> Vec<(usize, &crate::config::Resolved)> {
-    let mut chain: Vec<(usize, &crate::config::Resolved)> = targets.iter().enumerate().collect();
-    let picked = chain.remove(index);
-    chain.insert(0, picked);
+/// target first, then the rest of the peak-aware order. Used by `cache_affinity`
+/// (its pin leads) so the retry walk still prefers cheap targets.
+fn chain_from_head<'a>(
+    order: &[usize],
+    targets: &'a [crate::config::Resolved],
+    head: usize,
+) -> Vec<(usize, &'a crate::config::Resolved)> {
+    let mut chain = Vec::with_capacity(order.len());
+    chain.push((head, &targets[head]));
+    chain.extend(
+        order
+            .iter()
+            .copied()
+            .filter(|i| *i != head)
+            .map(|i| (i, &targets[i])),
+    );
     chain
 }
 
@@ -136,54 +181,54 @@ impl Gateway {
         }
     }
 
-    /// Which target serves this request.
+    /// Which chain index serves this request.
     ///
     /// The only stateful half of routing, and the only reason this lives on
     /// `Gateway` rather than in `Config::resolve_route` — see that method's
-    /// doc comment for why the two are separate. `static` and `failover` both
-    /// answer target 0 (for `failover` the *ordering of attempts* is the
-    /// policy, so choosing among them is not a decision); `load-balance`
-    /// advances a per-route cursor.
-    fn select_target<'a>(
-        &self,
-        res: &'a crate::config::RouteResolution,
-    ) -> &'a crate::config::Resolved {
+    /// doc comment for why the two are separate. `static` and `failover` take
+    /// the head (for `failover` the *ordering of attempts* is the policy, so
+    /// choosing among them is not a decision); `load-balance` advances a
+    /// per-route cursor.
+    ///
+    /// Peak awareness is a modifier, not a strategy: a route sets it with
+    /// `respect_peak_hours = true` (any strategy), and `strategy = "peak-hours"`
+    /// is the older spelling of the same thing. When it is on, selection reads
+    /// the chain cheap-first — `static` and `failover` take the first target
+    /// outside its windows, and `load-balance` rotates among the cheap ones,
+    /// touching an in-peak target only when every target is in peak.
+    ///
+    /// The minute is a parameter so one request reads the clock once: a
+    /// per-attempt read could flip at a minute boundary and make the request's
+    /// own chain non-deterministic.
+    fn select_index_at(&self, res: &crate::config::RouteResolution, minute: u32) -> usize {
         use crate::config::Strategy;
-        let first = || {
-            res.targets
-                .first()
-                .expect("a RouteResolution always carries at least one target")
-        };
-        match res.strategy {
-            Strategy::Static | Strategy::Failover => first(),
-            Strategy::LoadBalance if res.targets.len() < 2 => first(),
-            Strategy::LoadBalance => {
-                let n = self.advance_cursor(&res.route_id, res.targets.len());
-                &res.targets[n]
+        let head = || {
+            if res.peak_aware {
+                peak_pick(&res.targets, minute)
+            } else {
+                0
             }
-            Strategy::PeakHours if res.targets.len() < 2 => first(),
-            Strategy::PeakHours => &res.targets[self.peak_target_index(res)],
+        };
+        let index = match res.strategy {
+            Strategy::Static | Strategy::Failover | Strategy::PeakHours => head(),
+            Strategy::LoadBalance => {
+                let pool = serving_pool(res, minute);
+                if pool.len() < 2 {
+                    pool.first().copied().unwrap_or(0)
+                } else {
+                    pool[self.advance_cursor(&res.route_id, pool.len())]
+                }
+            }
+        };
+        if res.peak_aware {
+            tracing::debug!(
+                route = %res.route_id,
+                minute,
+                index,
+                in_peak = res.targets.iter().filter(|t| in_peak(t, minute)).count(),
+                "peak-hours: target selected"
+            );
         }
-    }
-
-    /// Which target serves a `peak-hours` route right now: the first one
-    /// outside its own UTC windows, else the chain's first. Read once per
-    /// request — a clock read per attempt could flip at a minute boundary and
-    /// make one request's chain non-deterministic.
-    fn peak_target_index(&self, res: &crate::config::RouteResolution) -> usize {
-        let minute = utc_minute_of_day();
-        let index = peak_pick(&res.targets, minute);
-        tracing::debug!(
-            route = %res.route_id,
-            minute,
-            index,
-            in_peak = res
-                .targets
-                .iter()
-                .filter(|t| t.peak_hours.iter().any(|w| w.contains(minute)))
-                .count(),
-            "peak-hours: target selected"
-        );
         index
     }
 
@@ -214,10 +259,15 @@ impl Gateway {
     ///   on the miss that notices it — hits must stay cheap.
     ///
     /// Nested-lock order is fixed here: `affinity` before `round_robin`;
-    /// `select_target` takes the latter alone.
-    fn select_affinity(&self, res: &crate::config::RouteResolution, key: [u8; 32]) -> usize {
+    /// `select_index_at` takes the latter alone.
+    fn select_affinity(
+        &self,
+        res: &crate::config::RouteResolution,
+        key: [u8; 32],
+        pool: &[usize],
+    ) -> usize {
         let now = std::time::Instant::now();
-        let total = res.targets.len();
+        let total = pool.len();
         let mut pins = self.affinity.lock().unwrap();
         // The hit path answers straight off a borrow — no route-id clone, no
         // insert machinery; the `entry()` walk below only runs on a miss.
@@ -225,7 +275,11 @@ impl Gateway {
             .get_mut(&res.route_id)
             .and_then(|per| per.get_mut(&key))
         {
-            if now.duration_since(pin.last_seen) < AFFINITY_TTL && pin.index < total {
+            // A pin only answers while its target is still in the pool. Under
+            // peak awareness the pinned pair may have entered a pricey window,
+            // and steering the conversation back to it would defeat the
+            // schedule — such a pin is a miss, re-rolled from the cheap side.
+            if now.duration_since(pin.last_seen) < AFFINITY_TTL && pool.contains(&pin.index) {
                 pin.last_seen = now;
                 tracing::debug!(
                     route = %res.route_id,
@@ -235,27 +289,28 @@ impl Gateway {
                 );
                 return pin.index;
             }
-            // The TTL ran out, or the config shrank under the pin: the refill
-            // below removes the dead entry.
+            // The TTL ran out, the pin left the pool, or the config shrank
+            // under it: the refill below replaces the dead entry.
         }
         let per_route = pins.entry(res.route_id.clone()).or_default();
         per_route.remove(&key);
         let slot = self.advance_cursor(&res.route_id, total);
+        let index = pool.get(slot).copied().unwrap_or(0);
         per_route.retain(|_, p| now.duration_since(p.last_seen) < AFFINITY_TTL);
         per_route.insert(
             key,
             Affinity {
-                index: slot,
+                index,
                 last_seen: now,
             },
         );
         tracing::debug!(
             route = %res.route_id,
             key = %short_hex(&key),
-            index = slot,
+            index,
             "affinity: new pin"
         );
-        slot
+        index
     }
 
     /// Point a conversation's pin at the target that served it when a
@@ -319,10 +374,13 @@ async fn models(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
         return res;
     }
     let search = gw.search.is_some();
+    // A route whose every target is disabled cannot serve, so it is not in the
+    // catalog: advertising it would hand a client an id that answers 503.
     let data: Vec<Value> = gw
         .config
         .routes
         .iter()
+        .filter(|(_, route)| route.enabled_targets().next().is_some())
         .map(|(id, route)| model_entry(id, route, search))
         .collect();
     let first = data.first().and_then(|m| m.get("id")).cloned();
@@ -347,8 +405,12 @@ async fn model_by_id(
         return res;
     }
     match gw.config.routes.get(&id) {
-        Some(route) => Json(model_entry(&id, route, gw.search.is_some())).into_response(),
-        None => anthropic_error(StatusCode::NOT_FOUND, format!("model {id:?} not found")),
+        // The catalog omits a route with no enabled target; retrieve must
+        // agree, or one endpoint would describe a model the other does not have.
+        Some(route) if route.enabled_targets().next().is_some() => {
+            Json(model_entry(&id, route, gw.search.is_some())).into_response()
+        }
+        _ => anthropic_error(StatusCode::NOT_FOUND, format!("model {id:?} not found")),
     }
 }
 
@@ -380,7 +442,9 @@ fn model_entry(id: &str, route: &crate::config::RouteCfg, search_configured: boo
     // them in `detail` so the catalog is honest about what it will route to,
     // without inventing synthetic per-target ids (which would change what
     // Claude Desktop's picker lists).
-    let targets = route.targets();
+    // The catalog describes what can *serve*, so disabled targets are left out
+    // of the detail line as well as out of the chain.
+    let targets: Vec<&crate::config::TargetCfg> = route.enabled_targets().collect();
     let detail = if targets.len() > 1 {
         let models: Vec<&str> = targets.iter().map(|t| t.model.as_str()).collect();
         models.join(", ")
@@ -803,6 +867,9 @@ async fn forward(
 
     let route = match gw.config.resolve_route(&requested) {
         Ok(r) => r,
+        // `NoEnabledTarget` (a route whose every target is disabled) becomes a
+        // 503 inside `resolve_error`: 404 would misdescribe a route that
+        // exists but may not serve.
         Err(e) => return resolve_error(StatusCode::NOT_FOUND, &e, family),
     };
 
@@ -826,36 +893,50 @@ async fn forward(
     // the tertiary. Each attempt carries its position in the configured chain,
     // so a fallback serve can re-point the pin at the target that answered.
     let mut sticky: Option<[u8; 32]> = None;
+    // The clock is read once here: a per-attempt read could flip at a minute
+    // boundary and make one request's chain non-deterministic. Peak awareness
+    // reorders the chain (cheap targets first, in-peak ones as the tail) for
+    // every strategy, not just `peak-hours`.
+    let minute = utc_minute_of_day();
+    let order: Vec<usize> = if route.peak_aware {
+        peak_order(&route.targets, minute)
+    } else {
+        (0..route.targets.len()).collect()
+    };
     // The chain borrows the route's own target list: `attempt_target` takes
     // `&Resolved`, so per-request `ProviderCfg` clones would only feed a
     // borrow ("hits must stay cheap"). The single-attempt arms share one
     // lazily-called expression — their position is only ever consumed by a
     // sticky re-point, which a no-key turn (or a non-affinity strategy)
     // never performs.
-    let single = || vec![(0usize, gw.select_target(&route))];
+    let single = || {
+        let index = gw.select_index_at(&route, minute);
+        vec![(index, &route.targets[index])]
+    };
     let attempts: Vec<(usize, &crate::config::Resolved)> = match route.strategy {
-        crate::config::Strategy::Failover => route.targets.iter().enumerate().collect(),
+        crate::config::Strategy::Failover => {
+            order.iter().map(|i| (*i, &route.targets[*i])).collect()
+        }
         crate::config::Strategy::LoadBalance
             if route.cache_affinity && route.targets.len() >= 2 =>
         {
             match affinity_key(&payload) {
                 Some(key) => {
-                    // The pin's *position* is all the chain needs: the pinned
-                    // slot moves to the front as attempt 1; the rest keep the
-                    // configured order behind it.
-                    let index = gw.select_affinity(&route, key);
+                    // The pin leads; the rest of the peak-aware order follows,
+                    // so a fallback turn still prefers a cheap target.
+                    let pool = serving_pool(&route, minute);
+                    let index = gw.select_affinity(&route, key, &pool);
                     sticky = Some(key);
-                    chain_from(&route.targets, index)
+                    chain_from_head(&order, &route.targets, index)
                 }
                 None => single(),
             }
         }
-        // `peak-hours` gets the same shape for a different reason: the cheap
-        // pick leads, and a retryable failure still walks the rest — a target
-        // inside its peak window beats no answer at all.
+        // `peak-hours` keeps the walk: the cheap pick leads, and a retryable
+        // failure still walks the rest — a target inside its peak window beats
+        // no answer at all.
         crate::config::Strategy::PeakHours if route.targets.len() >= 2 => {
-            let index = gw.peak_target_index(&route);
-            chain_from(&route.targets, index)
+            order.iter().map(|i| (*i, &route.targets[*i])).collect()
         }
         _ => single(),
     };
@@ -2371,7 +2452,9 @@ fn filtered_request_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue
 
 /// Static per-provider headers from config (`extra_headers`), skipping any
 /// pair whose name or value is not valid header syntax.
-fn provider_extra_headers(cfg: &crate::config::ProviderCfg) -> Vec<(HeaderName, HeaderValue)> {
+pub(crate) fn provider_extra_headers(
+    cfg: &crate::config::ProviderCfg,
+) -> Vec<(HeaderName, HeaderValue)> {
     let mut out = Vec::new();
     for (name, value) in cfg.extra_header_pairs() {
         match (
@@ -2385,7 +2468,7 @@ fn provider_extra_headers(cfg: &crate::config::ProviderCfg) -> Vec<(HeaderName, 
     out
 }
 
-fn inject_auth(
+pub(crate) fn inject_auth(
     req: reqwest::RequestBuilder,
     spec: crate::config::Spec,
     key: &str,
@@ -2457,7 +2540,17 @@ fn spec_error(family: Family, status: StatusCode, msg: impl Into<String>) -> Res
     }
 }
 
+/// Emit a resolve failure in the client's wire shape.
+///
+/// `NoEnabledTarget` is always a 503, whatever status the caller passed: the
+/// route exists, so 404 ("unknown model") misdescribes it. Centralizing that
+/// here is what keeps `/v1/messages` and `/v1/messages/count_tokens` agreeing
+/// on the same all-disabled route instead of answering 503 and 404.
 fn resolve_error(status: StatusCode, e: &ResolveError, family: Family) -> Response {
+    let status = match e {
+        ResolveError::NoEnabledTarget(_) => StatusCode::SERVICE_UNAVAILABLE,
+        _ => status,
+    };
     spec_error(family, status, e.to_string())
 }
 
@@ -5139,6 +5232,215 @@ model = "m-b"
         );
         assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // -- peak awareness as a modifier for any strategy ------------------------
+
+    /// A two-target route with a chosen strategy and the peak-awareness flag.
+    /// `a` carries `a_windows`; `b` is always free.
+    fn peak_aware_gateway(
+        strategy: &str,
+        respect: bool,
+        a: &str,
+        b: &str,
+        a_windows: &str,
+    ) -> Arc<Gateway> {
+        let attr = if a_windows.is_empty() {
+            String::new()
+        } else {
+            format!("peak_hours = [\"{a_windows}\"]\n")
+        };
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "anthropic"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+strategy = "{strategy}"
+respect_peak_hours = {respect}
+
+[[routes."claude-sonnet-5".target]]
+provider = "a"
+model = "m-a"
+{attr}
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+"#
+        );
+        Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn peak_awareness_works_on_a_static_route() {
+        // The modifier is what makes the windows apply here: `static` alone
+        // would serve the configured primary.
+        let now = utc_minute_of_day();
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let gw = peak_aware_gateway("static", true, &a, &b, &window_containing(now));
+        assert_eq!(
+            reply_text(send(gw, "claude-sonnet-5").await).await,
+            "from-b"
+        );
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn peak_windows_are_ignored_without_the_flag() {
+        let now = utc_minute_of_day();
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let gw = peak_aware_gateway("static", false, &a, &b, &window_containing(now));
+        assert_eq!(
+            reply_text(send(gw, "claude-sonnet-5").await).await,
+            "from-a"
+        );
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn load_balance_with_peak_awareness_rotates_only_free_targets() {
+        let now = utc_minute_of_day();
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let gw = peak_aware_gateway("load-balance", true, &a, &b, &window_containing(now));
+        for _ in 0..3 {
+            assert_eq!(
+                reply_text(send(gw.clone(), "claude-sonnet-5").await).await,
+                "from-b"
+            );
+        }
+        assert_eq!(
+            a_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an in-peak target must not take a rotation slot while one is free"
+        );
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn failover_with_peak_awareness_tries_the_free_target_first() {
+        let now = utc_minute_of_day();
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        // Both healthy, so ordering decides: without the flag, failover would
+        // serve the configured primary `a` first.
+        let gw = peak_aware_gateway("failover", true, &a, &b, &window_containing(now));
+        assert_eq!(
+            reply_text(send(gw, "claude-sonnet-5").await).await,
+            "from-b"
+        );
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_affinity_pin_outside_the_pool_is_re_rolled() {
+        // A pin only answers while its target is in the eligible pool: under
+        // peak awareness a pinned pair can enter a pricey window, and steering
+        // the conversation back to it would defeat the schedule.
+        let gw = peak_aware_gateway(
+            "load-balance",
+            true,
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:2",
+            "",
+        );
+        let res = gw.config.resolve_route("claude-sonnet-5").unwrap();
+        let key = [7u8; 32];
+        assert_eq!(gw.select_affinity(&res, key, &[0, 1]), 0);
+        assert_eq!(
+            gw.select_affinity(&res, key, &[0, 1]),
+            0,
+            "a hit keeps the pin"
+        );
+        // The pinned target is now in peak: the pool no longer contains it.
+        assert_eq!(gw.select_affinity(&res, key, &[1]), 1);
+        assert_eq!(gw.select_affinity(&res, key, &[1]), 1, "the new pin sticks");
+    }
+
+    // -- disabled targets -----------------------------------------------------
+
+    /// A config whose only target is disabled: the route exists but nothing may
+    /// serve it.
+    fn no_enabled_target_gateway() -> Arc<Gateway> {
+        let cfg_text = r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "http://127.0.0.1:1"
+api_key = "k"
+
+[routes."r"]
+[[routes."r".target]]
+provider = "a"
+model = "m"
+enabled = false
+"#;
+        Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(cfg_text).unwrap(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn a_route_with_no_enabled_target_is_a_503() {
+        // A 404 ("unknown model") would misdescribe a route that exists; the
+        // gateway names the real reason instead.
+        let res = send(no_enabled_target_gateway(), "r").await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["type"], "error");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no enabled target"),
+            "{v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_catalog_omits_a_route_without_an_enabled_target() {
+        let gw = no_enabled_target_gateway();
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models")
+            .header("host", "127.0.0.1:8710")
+            .body(Body::empty())
+            .unwrap();
+        let res = tower::ServiceExt::oneshot(router(gw), req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["data"].as_array().unwrap().is_empty(),
+            "an unservable route must not be advertised: {v}"
+        );
     }
 
     #[test]

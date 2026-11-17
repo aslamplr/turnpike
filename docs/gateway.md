@@ -81,21 +81,26 @@ Every POST handler funnels into `forward(gw, path, family, headers, body)`:
 4. **Model required.** An empty or missing `model` → `400` "model is required".
 5. **Resolve.** `config.resolve(requested)` maps the model id to a
    `{ provider, provider_cfg, upstream_model }`. Unknown ids → `404` with the
-   resolve error body (see [configuration.md](configuration.md) for the match
-   order).
+   resolve error body; a route whose every target is disabled → `503`
+   (`NoEnabledTarget`), because the route exists but nothing may serve it (see
+   [configuration.md](configuration.md) for the match order).
 6. **Family check.** `family_for_path(path)` must agree with the handler's
    claimed family; a disagreement is a `500` (defensive — it can't happen via
    the router).
-7. **Select.** For a strategy route, `Gateway::select_target()` picks one
-   candidate from the route's target chain — round-robin for `load-balance`,
-   the first target outside its own UTC windows for `peak-hours`, the primary
-   for `static` and `failover`. A `load-balance` route with
+7. **Select.** For a strategy route, `Gateway::select_index_at()` picks one
+   candidate from the route's **enabled** target chain — round-robin for
+   `load-balance`, the primary for `static` and `failover`. When the route is
+   **peak-aware** (`respect_peak_hours = true`, or the older `peak-hours`
+   strategy), the chain is read cheap-first — outside-window targets, then the
+   in-peak ones — so `static`/`failover` take the first cheap target and
+   `load-balance` rotates only among the cheap ones. A `load-balance` route with
    `cache_affinity = true` pins the pick per conversation instead
-   (`select_affinity`) — it engages only with 2+ targets in the chain;
-   anything else keeps the strategy's own selection, and `doctor`'s
-   `routes-affinity-shape` warns when the key is set where it cannot engage.
-   Resolution itself stays pure and always means target 0; see
-   [routing.md](routing.md).
+   (`select_affinity`), and a pin whose target has entered a peak window is a
+   miss, re-rolled from the cheap side — it engages only with 2+ enabled targets
+   in the chain; `doctor`'s `routes-affinity-shape` warns when the key is set
+   where it cannot engage. Resolution itself stays pure and always means the
+   primary (the first enabled target); a route with every target disabled is a
+   `503` naming the route, not a `404`. See [routing.md](routing.md).
 8. **Key.** `provider_cfg.api_key()` resolves the provider credential (inline
    `api_key` first, then `api_key_env`). Failure → `401`. The **client's**
    credential is never used here.

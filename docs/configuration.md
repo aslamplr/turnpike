@@ -111,6 +111,7 @@ credentials) is decided here.
 | `family` | none | Claude family tier (`sonnet`/`opus`/`haiku`) shown in the Desktop picker and used to pick the default launch route. |
 | `strategy` | `"static"` | `static` / `load-balance` / `failover` / `peak-hours`; see [routing.md](routing.md). |
 | `cache_affinity` | `false` | Sticky per-conversation selection for `load-balance` routes; see [routing.md](routing.md#cache-affinity). |
+| `respect_peak_hours` | `false` | Order the targets by their own UTC `peak_hours` windows before the strategy picks — cheap first — for **any** strategy. `strategy = "peak-hours"` implies it. See [routing.md](routing.md#peak-hours). |
 
 **The route's model config lives on its targets, not here.** A route carries no
 `provider`/`model`: every upstream is a `[[routes.<id>.target]]` block, and the
@@ -139,17 +140,19 @@ to loopback.
 
 ### `[[routes.<id>.target]]`
 
-The route's candidate upstreams, in priority order. The **first block is the
-primary** — what `resolve()` answers — and there is no separate route-level
-`provider`/`model`. At least one block is required.
+The route's candidate upstreams, in priority order. The **first enabled block is
+the primary** — what `resolve()` answers — and there is no separate route-level
+`provider`/`model`. At least one block is required, and at least one must be
+enabled for anything to serve.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `provider` | — (required) | A `[providers.<id>]` id. An unknown one is a `validate` failure. |
 | `model` | — (required) | Upstream model id. |
 | `display_name` | none | Label for logs and `doctor` reports only. |
-| `context_tokens` | none | This target's window; feeds the route-level minimum. |
-| `peak_hours` | none | UTC windows in which this pair is pricey, e.g. `["01:00-04:00", "06:00-10:00"]`; wrap past midnight (`"22:00-02:00"`). Read only by `strategy = "peak-hours"`. |
+| `context_tokens` | none | This target's window; feeds the minimum over enabled targets. |
+| `peak_hours` | none | UTC windows in which this pair is pricey, e.g. `["01:00-04:00", "06:00-10:00"]`; wrap past midnight (`"22:00-02:00"`). Read by peak-aware routes — `respect_peak_hours = true` (any strategy), or `strategy = "peak-hours"`. |
+| `enabled` | `true` | `enabled = false` takes the pair out of service without deleting the block: resolution, selection and the context-window minimum skip it. A disabled target stays listed in the editor so it can be brought back. Disabling every target takes the route offline (`503`). |
 
 `strategy` belongs to the route, not the target: `static` (default),
 `load-balance` (round-robin), `failover` (try in order), `peak-hours` (serve the
@@ -170,24 +173,25 @@ upstream_model }`. Matching happens in this order:
 
 1. **Exact route id** — `"claude-sonnet-5"` matches a `[routes."claude-sonnet-5"]`.
 2. **Route target match** — requesting the upstream model id directly works if
-   any route targets it. This scans the whole target chain, not just the route's
-   flat `model`, so a request for a target's upstream id still resolves under a
-   strategy. Checked *before* provider/model splitting so ids that
-   themselves contain `/` or `:` (e.g. `"openai/gpt-5"`)
-   still resolve.
+   any route's **enabled** targets it. This scans the whole serving chain, not
+   just the primary, so a request for a target's upstream id still resolves
+   under a strategy. Checked *before* provider/model splitting so ids that
+   themselves contain `/` or `:` (e.g. `"openai/gpt-5"`) still resolve.
 3. **Explicit `provider/model` or `provider:model`** — `"zen-go/deepseek-v4-flash"`
    goes straight to that provider (still validating the provider exists).
 
-Anything else is `ResolveError::Unknown`.
+Anything else is `ResolveError::Unknown`. A route whose every target is disabled
+does not resolve at all (`ResolveError::NoEnabledTarget`): the gateway answers
+`503` naming the route, because it exists and nothing may serve it.
 
 Two helpers built on the same rules:
 
 - `resolve_launch_model(arg)` — accepts a route id, any upstream id targeted by
-  a route, or an explicit `provider/model`, and returns the value to hand the
-  client (env vars take it from there). Used by `turnpike launch`.
+  an **enabled** target, or an explicit `provider/model`, and returns the value
+  to hand the client (env vars take it from there). Used by `turnpike launch`.
 - `default_launch_route()` — the route `turnpike launch` uses when no `--model` was
   given: the route whose `family = "sonnet"` wins, else the first route in
-  sorted order.
+  sorted order that has an enabled target.
 
 ## Wire families
 

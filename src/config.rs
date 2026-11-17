@@ -228,6 +228,19 @@ pub struct TargetCfg {
     /// always available. Consulted only by [`Strategy::PeakHours`].
     #[serde(default)]
     pub peak_hours: Vec<PeakWindow>,
+    /// Whether this target may serve. `true` unless the block says otherwise,
+    /// so a config that never mentions it reads exactly as before. A disabled
+    /// target stays in the document — it is how a pair is taken out of service
+    /// without deleting it — but resolution and selection skip it.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+/// The default for [`TargetCfg::enabled`]: a target serves unless disabled.
+/// `#[serde(default)]` alone would default a `bool` to `false` and silently
+/// take every existing target out of service.
+fn default_enabled() -> bool {
+    true
 }
 
 /// How a route chooses among its targets, one per request.
@@ -238,7 +251,8 @@ pub struct TargetCfg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Strategy {
-    /// Target 0, every request. What a route with no `strategy` key means.
+    /// The primary (first enabled target), every request. What a route with no
+    /// `strategy` key means.
     #[default]
     Static,
     /// Round-robin across targets, one per request. With `cache_affinity`,
@@ -247,10 +261,14 @@ pub enum Strategy {
     LoadBalance,
     /// Try targets in order; on a retryable failure, move to the next.
     Failover,
-    /// Serve from the first target that is not inside one of its own
+    /// Serve from the first enabled target that is not inside one of its own
     /// `peak_hours` windows — the cheap pair outside its provider's pricey
-    /// hours. When every target is in peak, the first target in the chain
-    /// serves. See [`TargetCfg::peak_hours`].
+    /// hours. When every target is in peak, the first enabled target serves.
+    ///
+    /// Equivalent to `static` plus [`RouteCfg::respect_peak_hours`], except
+    /// that a retryable failure walks the rest of the chain. New configs that
+    /// want peak awareness alongside another strategy set `respect_peak_hours`
+    /// instead of switching strategy.
     PeakHours,
 }
 
@@ -283,7 +301,8 @@ pub struct RouteCfg {
     pub context_tokens: Option<u64>,
     /// Optional Claude family tier shown in Claude Desktop's picker.
     pub family: Option<String>,
-    /// Selection policy across [`RouteCfg::targets`]. Defaults to `Static`.
+    /// Selection policy across [`RouteCfg::enabled_targets`]. Defaults to
+    /// `Static`.
     pub strategy: Strategy,
     /// Sticky per-conversation selection for `load-balance` routes: turns of
     /// one conversation keep serving from the target that already holds the
@@ -291,29 +310,62 @@ pub struct RouteCfg {
     /// that must re-read the whole prompt at full price. Ignored on any other
     /// strategy — `doctor` lints that (`routes-affinity-shape`).
     pub cache_affinity: bool,
+    /// Opt into peak-hour awareness with **any** strategy.
+    ///
+    /// When true, the enabled targets are ordered by their own `peak_hours`
+    /// windows before the strategy picks: outside-window targets first, in
+    /// configured order, then the rest. `load-balance` rotates among the cheap
+    /// ones, `failover` tries them first, and `static` serves the first one
+    /// outside its windows. `strategy = "peak-hours"` implies this, which is
+    /// why a route written that way keeps working unchanged. Off by default,
+    /// so a route that never mentions it reads exactly as before.
+    pub respect_peak_hours: bool,
     /// The route's candidate upstreams, in priority order. Never empty.
     pub target: Vec<TargetCfg>,
 }
 
 impl RouteCfg {
-    /// The route's candidate targets, in priority order.
+    /// The route's candidates as written, in chain order — enabled or not.
     ///
-    /// The single definition of "what can serve this route", shared by
-    /// resolution, selection, the catalog detail, and the view.
+    /// The document truth, shared by the editor, the view and `doctor`'s
+    /// document-shaped checks. Anything that asks "what can serve *now*" wants
+    /// [`RouteCfg::enabled_targets`].
     pub fn targets(&self) -> &[TargetCfg] {
         &self.target
     }
 
-    /// The primary target, chain index 0 — what [`Config::resolve`] answers.
+    /// The targets that may serve, in priority order. Resolution, selection and
+    /// the context-window minimum all walk this, never the full list.
+    pub fn enabled_targets(&self) -> impl Iterator<Item = &TargetCfg> {
+        self.target.iter().filter(|t| t.enabled)
+    }
+
+    /// The primary serving target: the first enabled one.
+    ///
+    /// Falls back to the first block when every target is disabled, so display
+    /// code never panics; resolution reports that state instead of serving it.
     pub fn primary(&self) -> &TargetCfg {
         self.target
-            .first()
+            .iter()
+            .find(|t| t.enabled)
+            .or_else(|| self.target.first())
             .expect("a RouteCfg always carries at least one target")
     }
 
-    /// True when the route declares more than one candidate upstream.
+    /// True when more than one target **may serve** — the count a strategy
+    /// acts on. Disabled targets do not make a one-target route look balanced.
     pub fn has_multiple_targets(&self) -> bool {
-        self.target.len() > 1
+        self.enabled_targets().nth(1).is_some()
+    }
+
+    /// True when selection should read the targets' `peak_hours` windows: the
+    /// route-level `respect_peak_hours`, or the older `peak-hours` strategy,
+    /// which implies it.
+    ///
+    /// One definition, so resolution, the view and `doctor` cannot drift on
+    /// what "peak-aware" means.
+    pub fn is_peak_aware(&self) -> bool {
+        self.respect_peak_hours || self.strategy == Strategy::PeakHours
     }
 }
 
@@ -345,6 +397,8 @@ struct RouteCfgRaw {
     #[serde(default)]
     cache_affinity: bool,
     #[serde(default)]
+    respect_peak_hours: bool,
+    #[serde(default)]
     target: Vec<TargetCfg>,
 }
 
@@ -366,6 +420,7 @@ impl TryFrom<RouteCfgRaw> for RouteCfg {
                     display_name: None,
                     context_tokens: raw.context_tokens,
                     peak_hours: Vec::new(),
+                    enabled: true,
                 },
             ),
             (None, None) => {}
@@ -389,6 +444,7 @@ impl TryFrom<RouteCfgRaw> for RouteCfg {
             family: raw.family,
             strategy: raw.strategy,
             cache_affinity: raw.cache_affinity,
+            respect_peak_hours: raw.respect_peak_hours,
             target,
         })
     }
@@ -420,9 +476,9 @@ pub fn effective_context_tokens(route: &RouteCfg) -> Option<u64> {
         // only the explicit override.
         return route.primary().context_tokens;
     }
+    // Only targets that may serve can constrain the advertised window.
     route
-        .targets()
-        .iter()
+        .enabled_targets()
         .filter_map(|t| t.context_tokens)
         .min()
         .or(route.context_tokens)
@@ -572,6 +628,11 @@ pub struct RouteResolution {
     /// Whether the route opted into cache-affinity selection. Consumed by the
     /// gateway only — `resolve` stays pure, and selection is request-scoped.
     pub cache_affinity: bool,
+    /// Whether selection should order targets by their `peak_hours` windows
+    /// before the strategy picks. Derived at resolution time: the route's
+    /// `respect_peak_hours` key, or the `peak-hours` strategy, which implies
+    /// it. `resolve` stays pure; the clock is read by the gateway.
+    pub peak_aware: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -581,15 +642,17 @@ pub enum ResolveError {
     Unknown(String),
     #[error("unknown provider {0:?} referenced by route or request")]
     UnknownProvider(String),
+    #[error("route {0:?} has no enabled target")]
+    NoEnabledTarget(String),
 }
 
 impl Config {
     /// Resolve a client-requested model to a provider + upstream model.
     ///
-    /// Pure, and unchanged by routing strategies: always target 0 of whatever
-    /// [`Config::resolve_route`] finds, which for a static route is the only
-    /// target. Callers that need the candidate list or the policy want
-    /// `resolve_route`.
+    /// Pure, and unchanged by routing strategies: always the *primary*
+    /// (first enabled target) of whatever [`Config::resolve_route`] finds,
+    /// which for a static route is the only target. Callers that need the
+    /// candidate list or the policy want `resolve_route`.
     pub fn resolve(&self, requested: &str) -> Result<Resolved, ResolveError> {
         Ok(self
             .resolve_route(requested)?
@@ -625,7 +688,9 @@ impl Config {
         // Checked before provider/model splitting so ids that themselves
         // contain '/' or ':' (e.g. "openai/gpt-5") still resolve.
         for (id, route) in &self.routes {
-            if route.targets().iter().any(|t| t.model == requested) {
+            // Only a target that may serve can be addressed by its upstream id:
+            // a disabled pair is out of the chain entirely.
+            if route.enabled_targets().any(|t| t.model == requested) {
                 return self.resolution_for(id, route);
             }
         }
@@ -651,8 +716,9 @@ impl Config {
                     }],
                     strategy: Strategy::Static,
                     // Explicit provider/model routing: no route owns this
-                    // name, so there is no route-level knob to carry.
+                    // name, so there are no route-level knobs to carry.
                     cache_affinity: false,
+                    peak_aware: false,
                 });
             }
             return Err(ResolveError::UnknownProvider(prov.to_string()));
@@ -665,7 +731,7 @@ impl Config {
     /// provider config.
     fn resolution_for(&self, id: &str, route: &RouteCfg) -> Result<RouteResolution, ResolveError> {
         let mut targets = Vec::new();
-        for t in route.targets() {
+        for t in route.enabled_targets() {
             let provider_cfg = self
                 .providers
                 .get(&t.provider)
@@ -677,22 +743,37 @@ impl Config {
                 peak_hours: t.peak_hours.clone(),
             });
         }
+        if targets.is_empty() {
+            // A route the user disabled outright: every target is out of
+            // service. Selection has nothing to choose from, and a 404
+            // ("unknown model") would misdescribe a route that exists.
+            return Err(ResolveError::NoEnabledTarget(id.to_string()));
+        }
         Ok(RouteResolution {
             route_id: id.to_string(),
             targets,
             strategy: route.strategy,
             cache_affinity: route.cache_affinity,
+            // `peak-hours` is the older spelling of the same behavior; both
+            // reach selection as one flag.
+            peak_aware: route.is_peak_aware(),
         })
     }
 
     /// Route id launchers default to when no --model is given: the
     /// sonnet-family route if one exists, else the first route.
     pub fn default_launch_route(&self) -> Option<&String> {
+        let servable = |r: &RouteCfg| r.enabled_targets().next().is_some();
         self.routes
             .iter()
-            .find(|(_, r)| r.family.as_deref() == Some("sonnet"))
+            .find(|(_, r)| r.family.as_deref() == Some("sonnet") && servable(r))
             .map(|(id, _)| id)
-            .or_else(|| self.routes.keys().next())
+            .or_else(|| {
+                self.routes
+                    .iter()
+                    .find(|(_, r)| servable(r))
+                    .map(|(id, _)| id)
+            })
     }
 
     /// Accept a launcher `--model` argument in any of the forms the gateway
@@ -705,7 +786,10 @@ impl Config {
         if arg.is_empty() {
             anyhow::bail!("empty --model");
         }
-        if self.routes.contains_key(arg) {
+        if let Some(route) = self.routes.get(arg) {
+            if route.enabled_targets().next().is_none() {
+                anyhow::bail!("route {arg:?} has no enabled target — see `turnpike routes`");
+            }
             return Ok(arg.to_string());
         }
         if let Ok(resolved) = self.resolve(arg) {
@@ -958,12 +1042,14 @@ model = "openai/gpt-5"
                 family: Some("opus".into()),
                 strategy: Strategy::Static,
                 cache_affinity: false,
+                respect_peak_hours: false,
                 target: vec![TargetCfg {
                     provider: "zen".into(),
                     model: "claude-opus-4-5".into(),
                     display_name: None,
                     context_tokens: None,
                     peak_hours: Vec::new(),
+                    enabled: true,
                 }],
             },
         );
@@ -979,12 +1065,14 @@ model = "openai/gpt-5"
                 family: Some("haiku".into()),
                 strategy: Strategy::Static,
                 cache_affinity: false,
+                respect_peak_hours: false,
                 target: vec![TargetCfg {
                     provider: "zen".into(),
                     model: "claude-haiku-4-5".into(),
                     display_name: None,
                     context_tokens: None,
                     peak_hours: Vec::new(),
+                    enabled: true,
                 }],
             },
         );
@@ -1000,6 +1088,195 @@ model = "openai/gpt-5"
             r.family = Some("haiku".into());
         }
         assert_eq!(cfg2.default_launch_route().unwrap(), "claude-sonnet-5");
+    }
+
+    // -- enabled targets ------------------------------------------------------
+
+    /// A route whose second target is disabled: the shape every selection
+    /// rule has to treat as a one-target route.
+    fn config_with_a_disabled_target() -> Config {
+        toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[providers.local]
+spec = "openai"
+base_url = "http://127.0.0.1:11434"
+
+[routes."r"]
+strategy = "load-balance"
+
+[[routes."r".target]]
+provider = "zen"
+model = "primary"
+
+[[routes."r".target]]
+provider = "local"
+model = "backup"
+enabled = false
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_target_is_enabled_unless_it_says_otherwise() {
+        let cfg = config_with_a_disabled_target();
+        let route = &cfg.routes["r"];
+        assert!(route.targets()[0].enabled);
+        assert!(!route.targets()[1].enabled);
+    }
+
+    #[test]
+    fn a_disabled_target_is_not_in_the_resolved_chain() {
+        let cfg = config_with_a_disabled_target();
+        let res = cfg.resolve_route("r").unwrap();
+        assert_eq!(res.targets.len(), 1);
+        assert_eq!(res.targets[0].provider, "zen");
+        assert_eq!(cfg.resolve("r").unwrap().upstream_model, "primary");
+        // A disabled pair's upstream id no longer addresses the route.
+        assert!(matches!(
+            cfg.resolve_route("backup"),
+            Err(ResolveError::Unknown(_))
+        ));
+    }
+
+    #[test]
+    fn the_primary_is_the_first_enabled_target() {
+        let mut cfg = config_with_a_disabled_target();
+        let route = cfg.routes.get_mut("r").unwrap();
+        route.target[0].enabled = false;
+        route.target[1].enabled = true;
+        assert_eq!(route.primary().model, "backup");
+        assert_eq!(cfg.resolve("r").unwrap().upstream_model, "backup");
+    }
+
+    #[test]
+    fn a_route_with_every_target_disabled_does_not_resolve() {
+        let mut cfg = config_with_a_disabled_target();
+        for t in cfg.routes.get_mut("r").unwrap().target.iter_mut() {
+            t.enabled = false;
+        }
+        assert!(matches!(
+            cfg.resolve_route("r"),
+            Err(ResolveError::NoEnabledTarget(id)) if id == "r"
+        ));
+        assert!(matches!(
+            cfg.resolve("r"),
+            Err(ResolveError::NoEnabledTarget(_))
+        ));
+    }
+
+    #[test]
+    fn has_multiple_targets_counts_enabled_only() {
+        let mut cfg = config_with_a_disabled_target();
+        assert!(
+            !cfg.routes["r"].has_multiple_targets(),
+            "one target may serve"
+        );
+        cfg.routes.get_mut("r").unwrap().target[1].enabled = true;
+        assert!(cfg.routes["r"].has_multiple_targets());
+    }
+
+    #[test]
+    fn the_context_window_minimum_ignores_a_disabled_target() {
+        let mut cfg = config_with_a_disabled_target();
+        let route = cfg.routes.get_mut("r").unwrap();
+        route.target[0].context_tokens = Some(200_000);
+        route.target[1].context_tokens = Some(8_000);
+        assert_eq!(effective_context_tokens(route), Some(200_000));
+    }
+
+    #[test]
+    fn launch_defaults_skip_a_route_with_no_enabled_target() {
+        let mut cfg = test_config();
+        for t in cfg
+            .routes
+            .get_mut("claude-sonnet-5")
+            .unwrap()
+            .target
+            .iter_mut()
+        {
+            t.enabled = false;
+        }
+        assert_eq!(
+            cfg.default_launch_route().map(String::as_str),
+            Some("gpt"),
+            "the unservable route must not be the launch default"
+        );
+        let err = cfg.resolve_launch_model("claude-sonnet-5").unwrap_err();
+        assert!(err.to_string().contains("no enabled target"), "{err}");
+    }
+
+    // -- peak awareness as a route-level modifier -----------------------------
+
+    #[test]
+    fn respect_peak_hours_composes_with_any_strategy() {
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[routes."r"]
+strategy = "load-balance"
+respect_peak_hours = true
+
+[[routes."r".target]]
+provider = "zen"
+model = "m"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.routes["r"].respect_peak_hours);
+        assert!(cfg.resolve_route("r").unwrap().peak_aware);
+    }
+
+    #[test]
+    fn the_peak_hours_strategy_implies_peak_awareness() {
+        // The older spelling reaches selection as the same flag, so a route
+        // written before the modifier keeps its behavior unchanged.
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[routes."r"]
+strategy = "peak-hours"
+
+[[routes."r".target]]
+provider = "zen"
+model = "m"
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.routes["r"].respect_peak_hours);
+        assert!(cfg.resolve_route("r").unwrap().peak_aware);
+    }
+
+    #[test]
+    fn a_plain_route_is_not_peak_aware() {
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[routes."r"]
+[[routes."r".target]]
+provider = "zen"
+model = "m"
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.resolve_route("r").unwrap().peak_aware);
     }
 
     #[test]

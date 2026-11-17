@@ -100,7 +100,7 @@ impl ClaudeCode {
             config
                 .routes
                 .values()
-                .find(|r| r.targets().iter().any(|t| t.model == model))
+                .find(|r| r.enabled_targets().any(|t| t.model == model))
         }) {
             if let Some(max) = route.max_tokens {
                 env.push(("CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(), max.to_string()));

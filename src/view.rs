@@ -60,6 +60,9 @@ pub struct RouteView {
     /// (`cache_affinity = true`). Echoed as set even where the pin cannot
     /// engage — `doctor`'s `routes-affinity-shape` lint names that state.
     pub cache_affinity: bool,
+    /// Whether peak windows reorder this route's targets for **any** strategy
+    /// (`respect_peak_hours = true`, or the `peak-hours` strategy).
+    pub respect_peak_hours: bool,
     pub display_name: Option<String>,
     /// The window the route advertises, after [`effective_context_tokens`]
     /// (the route's own field when set, else the minimum over declaring
@@ -77,6 +80,9 @@ pub struct TargetView {
     /// UTC windows in which this target is pricey, rendered `HH:MM-HH:MM`.
     /// Empty means always available.
     pub peak_hours: Vec<String>,
+    /// Whether this target may serve. A disabled pair stays in the chain list
+    /// so the window can offer the toggle that brings it back.
+    pub enabled: bool,
     /// The target provider's wire spec, so the UI can mark the hop that gets
     /// bridged.
     pub spec: Option<String>,
@@ -167,6 +173,7 @@ fn route_view(id: &str, r: &RouteCfg, providers: &BTreeMap<String, ProviderCfg>)
         id: id.to_string(),
         strategy: r.strategy.as_str().to_string(),
         cache_affinity: r.cache_affinity,
+        respect_peak_hours: r.is_peak_aware(),
         display_name: r.display_name.clone(),
         context_tokens: config::effective_context_tokens(r),
         // The view shows the same chain resolution and selection walk: the
@@ -180,6 +187,7 @@ fn route_view(id: &str, r: &RouteCfg, providers: &BTreeMap<String, ProviderCfg>)
                 display_name: t.display_name.clone(),
                 context_tokens: t.context_tokens,
                 peak_hours: t.peak_hours.iter().map(|w| w.to_string()).collect(),
+                enabled: t.enabled,
                 // `validate` guarantees the provider exists, but the view must
                 // not panic on a config that got past it by another route.
                 spec: providers
@@ -434,6 +442,39 @@ model = "gemma3:27b"
     }
 
     #[test]
+    fn view_reports_a_disabled_target() {
+        // Disabled targets stay in the chain list so the window can offer the
+        // toggle that brings them back — this pins that they are rendered, and
+        // that the flag reaches the UI.
+        let view = build_from(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[providers.local]
+spec = "openai"
+base_url = "http://127.0.0.1:11434"
+
+[routes."claude-sonnet-5"]
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "primary"
+
+[[routes."claude-sonnet-5".target]]
+provider = "local"
+model = "backup"
+enabled = false
+"#,
+        );
+        let targets = &view.routes[0].targets;
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0].enabled);
+        assert!(!targets[1].enabled);
+    }
+
+    #[test]
     fn view_reports_peak_hours_and_the_strategy() {
         let view = build_from(
             r#"
@@ -460,6 +501,9 @@ model = "deepseek-v4-flash"
         );
         let route = &view.routes[0];
         assert_eq!(route.strategy, "peak-hours");
+        // The route-level flag is what the window's checkbox reads, and the
+        // older strategy spelling must report as on.
+        assert!(route.respect_peak_hours);
         assert_eq!(
             route.targets[0].peak_hours,
             vec!["01:00-04:00".to_string(), "22:00-02:00".to_string()]

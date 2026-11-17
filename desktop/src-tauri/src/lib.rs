@@ -178,6 +178,7 @@ pub fn run() {
             gateway_stop,
             gateway_restart,
             settings_config_path,
+            settings::provider_models,
             autostart_enabled,
             autostart_set,
             cli_status,

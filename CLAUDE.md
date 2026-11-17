@@ -40,6 +40,9 @@ turnpike config
 # What is wrong, and how to fix it (--json for scripting, --live to probe providers)
 turnpike doctor
 
+# Ask a configured provider which model ids it advertises (--json for the desktop picker)
+turnpike models --provider zen
+
 # Build / test (end users install the prebuilt binary — see install.sh / install.ps1)
 cargo build --release
 cargo test        # inline #[cfg(test)] modules per file
@@ -53,6 +56,7 @@ cargo test        # inline #[cfg(test)] modules per file
 - `src/translate/mod.rs` — Anthropic↔OpenAI request/response translation (edges only: system↔system, thinking↔reasoning_content, tool_use↔tool_calls, tool_result↔role:"tool", images↔image_url, `tool_choice` mapping).
 - `src/translate/stream.rs` — `StreamConverter`: stateful OpenAI SSE→Anthropic SSE (thinking_delta, fragmented tool-call args→`input_json_delta`, real usage from the final choices-less chunk split via `split_usage`, idempotent `finish()`, and the terminal `error` event that ends a stream whose upstream failed after streaming began).
 - `src/search/mod.rs` — `SearchProvider` trait + `ExaSearch` / `SearxSearch` implementations; `SearchManager::from_config` (exa needs an API key, searxng/searx keyless).
+- `src/models.rs` — `turnpike models --provider <id>`: asks the provider's own `GET /v1/models` with the same key resolution and header injection the proxy uses (`proxy::inject_auth` / `provider_extra_headers`), parses both the Anthropic and OpenAI list shapes, and prints the ids. The desktop Settings model picker drives it with `--json`.
 - `src/launch/claude_code.rs` — finds/installs the `claude` binary, spawns it with env vars routing every model tier to one route id.
 - `src/launch/claude_desktop.rs` — writes a third-party inference-gateway profile (`00000000-0000-5000-9000-000000000128.json`) into Claude Desktop's configLibrary, with backup/restore and a running-app safety check.
 - `src/secrets/` — encrypted key store (`~/.turnpike/`): `Secret`/`StoreCtx`, the pure `resolve_chain` precedence function, `open`/`hydrate`; `file.rs` is the AES-256-GCM `FileStore` (one master key, one `secrets.toml`, one namespace per config path); `memory.rs` is the test fake.
@@ -111,29 +115,39 @@ cargo test        # inline #[cfg(test)] modules per file
 - **Model resolution** (`Config::resolve()`): exact route id → route whose upstream model matches
   (ids containing `/` or `:` resolve here, before the provider split) → `provider/model` or
   `provider:model`. **`resolve()` stays pure** — `&self`, no I/O, no state — and always answers
-  target 0. "Which target serves *this* request, right now?" is stateful and request-scoped, so it
-  lives on `Gateway` (`select_target`); folding the two would make the launcher and `/v1/models`
+  the primary (the first *enabled* target). "Which target serves *this* request, right now?" is stateful and request-scoped, so it
+  lives on `Gateway` (`select_index_at`); folding the two would make the launcher and `/v1/models`
   advance round-robin counters, and "what does this name mean" would stop being deterministic.
 - **Per-route targets, array-only** (`docs/routing.md`): **every model is a
-  `[[routes.<id>.target]]` block** and a chain index **is** the `target` array index — target 0,
-  the primary, included. There is no route-level `provider`/`model` in the schema; a legacy flat
+  `[[routes.<id>.target]]` block** and a chain index **is** the `target` array index — target 0
+  included. There is no route-level `provider`/`model` in the schema; a legacy flat
   pair still *parses* through a private `RouteCfgRaw` + `#[serde(try_from)]` layer that turns it
   into target 0, and `turnpike serve` **migrates the file** at startup (`migrate_config_file`,
   comment-preserving via `toml_edit`, `<config>.bak` backup, warning and continuing in memory if
   the write fails). Writers normalize too (`setup::run_with`, `config-edit --load`/`save`), so
-  nothing new emits the old shape. `RouteCfg::targets()` is the single definition of "what can
-  serve this route", read by resolution, selection, the catalog detail, and `doctor`. Rule 2 of
-  resolution scans the **whole target chain**, or a request for a target's upstream id would
-  silently stop resolving. Round-robin counters are keyed by **route id, not index** (`routes` is
+  nothing new emits the old shape. `RouteCfg::targets()` is the document truth the editor reads;
+  `RouteCfg::enabled_targets()` is the single definition of "what can serve this route", read by
+  resolution, selection, the catalog detail, and `doctor`. Rule 2 of resolution scans the
+  **enabled targets**, or a request for a target's upstream id would silently stop resolving. Round-robin counters are keyed by **route id, not index** (`routes` is
   a `BTreeMap`, so iteration is alphabetical) and built **once** in `Gateway::new` — a
   per-request map degenerates to "always target 0". `strategy` is one of `static` (default),
   `load-balance` (round-robin), `failover` (in order), `peak-hours`. **Peak hours** are per-target
   UTC windows (`peak_hours = ["01:00-04:00", "06:00-10:00"]`, half-open, wrapping past midnight
-  when `end < start`); `peak_pick()` serves the first target *outside* its own windows, target 0
-  when every target is in peak, evaluated **once per request** (never per attempt) and the chain
-  becomes pick + the rest in configured order — so a peak-hours route also fails over. The
+  when `end < start`). Peak awareness is a **route-level modifier**: `respect_peak_hours = true`
+  (or the older `peak-hours` strategy, which implies it) makes `peak_order()` put outside-window
+  targets first, `select_index_at` read that order for every strategy, `serving_pool()` restrict
+  `load-balance` to the cheap ones, and `select_affinity` re-pin a target that enters a window.
+  The minute is read **once per request** (never per attempt).
+  **`enabled = false`** takes a target out of service without deleting the block: resolution,
+  `select_index_at`, `peak_pick`, the round-robin count and `effective_context_tokens` all walk
+  `RouteCfg::enabled_targets()`, never `targets()`, and `resolve_route` answers
+  `ResolveError::NoEnabledTarget` (mapped to `503`) when a route has none. `primary()` and
+  `has_multiple_targets()` are the first/≥2 *enabled* entries. Doctor's `routes-no-enabled-target`
+  warns; `validate` still checks every target, disabled ones included, so a dangling provider
+  reference cannot hide until re-enable. The
   wizard's target UI and the desktop Routes panel treat the chain uniformly: Add / Edit / Move
-  up / Move down / Peak hours / Remove / Strategy, every op taking the array index. They refuse a
+  up / Move down / Peak hours / Enable/disable / Remove / Strategy, every op taking the array
+  index; the route edit menu also toggles `cache_affinity` and `respect_peak_hours`. They refuse a
   non-`static` strategy on a 1-target route (the state `routes-strategy` lints) and reset a
   stranded strategy to `static` when a removal leaves one target. `cache_affinity = true` opts a
   `load-balance` route into **sticky per-conversation selection** — a SHA-256 pin over the

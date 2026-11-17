@@ -141,7 +141,7 @@ impl Reply {
 /// One flat enum of *every* operation rather than a nested subcommand tree: the
 /// caller sends a JSON object either way, and a flat list keeps the desktop
 /// side's dispatch table and this one lined up one-to-one.
-pub const OPS: [&str; 20] = [
+pub const OPS: [&str; 21] = [
     "add-provider",
     "remove-provider",
     "set-provider",
@@ -155,6 +155,7 @@ pub const OPS: [&str; 20] = [
     "remove-target",
     "move-target",
     "set-target",
+    "set-target-enabled",
     "set-peak-hours",
     "set-search",
     "remove-search",
@@ -275,6 +276,14 @@ struct MoveTarget {
     /// indexes: every model is a `[[routes.<id>.target]]` block.
     from: usize,
     to: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetTargetEnabled {
+    id: String,
+    /// Chain index, as everywhere else.
+    index: usize,
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -549,9 +558,10 @@ pub fn apply(op: &str, session: &Session, args: &str) -> Result<Reply> {
             match doc.remove_route_target(&a.id, a.index) {
                 Ok(()) => {
                     // Removing a target can strand a non-`static` strategy on a
-                    // one-target route — the state `doctor`'s `routes-strategy`
-                    // lints. The wizard resets it; so does this.
-                    reset_stranded_strategy(&mut doc, &a.id);
+                    // one-enabled-target route — the state `doctor`'s
+                    // `routes-strategy` lints. The wizard resets it; so does
+                    // this (one definition on `Doc`).
+                    doc.reset_stranded_strategy(&a.id);
                     None
                 }
                 Err(e) => Some(e.to_string()),
@@ -578,6 +588,18 @@ pub fn apply(op: &str, session: &Session, args: &str) -> Result<Reply> {
             let a: MoveTarget = parse_args(args)?;
             match doc.move_route_target(&a.id, a.from, a.to) {
                 Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            }
+        }
+        "set-target-enabled" => {
+            let a: SetTargetEnabled = parse_args(args)?;
+            match doc.set_route_target_enabled(&a.id, a.index, a.enabled) {
+                Ok(()) => {
+                    // Disabling the second enabled target strands a
+                    // non-`static` strategy exactly like a removal does.
+                    doc.reset_stranded_strategy(&a.id);
+                    None
+                }
                 Err(e) => Some(e.to_string()),
             }
         }
@@ -674,8 +696,10 @@ fn save(session: &Session) -> Result<()> {
 
 /// The wizard's `set_strategy`, minus the prompts.
 ///
-/// The 2-target rule is reproduced rather than delegated: `Doc` has no opinion
-/// about strategies, so the rule lives with whoever holds the target count.
+/// The 2-**enabled**-target rule is reproduced rather than delegated: `Doc`
+/// has no opinion about strategies, so the rule lives with whoever holds the
+/// target count. Counting enabled entries (not blocks) is what makes this
+/// agree with the wizard, the desktop and `doctor`.
 fn set_strategy(doc: &mut Doc, id: &str, strategy: &str) -> Option<String> {
     if strategy == "static" {
         // Static is the schema default, so it is written by *removing* the key.
@@ -688,28 +712,20 @@ fn set_strategy(doc: &mut Doc, id: &str, strategy: &str) -> Option<String> {
             super::edit::STRATEGIES.join(", ")
         ));
     }
-    if doc.route_targets(id).len() < 2 {
+    let enabled = doc
+        .route_target_states(id)
+        .iter()
+        .filter(|(_, _, enabled)| *enabled)
+        .count();
+    if enabled < 2 {
         return Some(format!(
-            "{strategy:?} needs at least 2 targets to differ from \"static\" — \
-             this route has 1; add another target first"
+            "{strategy:?} needs at least 2 enabled targets to differ from \"static\" — \
+             this route has {enabled}; add or enable another target first"
         ));
     }
     match doc.set_route_scalar(id, "strategy", strategy) {
         Ok(()) => None,
         Err(e) => Some(e.to_string()),
-    }
-}
-
-/// Reset a strategy the route can no longer justify, the way the wizard does
-/// after a target removal.
-fn reset_stranded_strategy(doc: &mut Doc, id: &str) {
-    if doc.route_targets(id).len() < 2 {
-        let strategy = crate::config::load_from_str(&doc.as_str())
-            .ok()
-            .and_then(|c| c.routes.get(id).map(|r| r.strategy));
-        if matches!(strategy, Some(s) if s != crate::config::Strategy::Static) {
-            doc.remove_route_scalar_keeping_comment(id, "strategy");
-        }
     }
 }
 
@@ -1102,6 +1118,32 @@ model = "claude-sonnet-4-5"
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[1].peak_hours.len(), 1);
         assert_eq!(chain[1].peak_hours[0].to_string(), "22:00-02:00");
+    }
+
+    #[test]
+    fn set_target_enabled_round_trips() {
+        let session = starter_session("target-enabled");
+        let session = chain(
+            &session,
+            &[(
+                "set-target-enabled",
+                r#"{"id":"claude-sonnet-5","index":0,"enabled":false}"#,
+            )],
+        );
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        assert!(!cfg.routes["claude-sonnet-5"].targets()[0].enabled);
+
+        // Enabling removes the key: it is the schema's default.
+        let session = chain(
+            &session,
+            &[(
+                "set-target-enabled",
+                r#"{"id":"claude-sonnet-5","index":0,"enabled":true}"#,
+            )],
+        );
+        assert!(!session.doc.contains("enabled"), "{}", session.doc);
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        assert!(cfg.routes["claude-sonnet-5"].targets()[0].enabled);
     }
 
     #[test]

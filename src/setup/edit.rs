@@ -844,11 +844,33 @@ base_url = "http://localhost:8888"
             .with_context(|| format!("route {id:?} has no targets"))
     }
 
-    /// The full target chain as `provider/model` strings, in chain order.
+    /// Take one target in or out of service. `index` is the chain index.
     ///
-    /// Parsed back through the config layer rather than read out of the
-    /// document, so the list the user sees is the list the gateway will honor.
-    pub fn route_targets(&self, id: &str) -> Vec<(String, String)> {
+    /// A target serves unless it says otherwise, so enabling **removes** the
+    /// key rather than writing `enabled = true` — the same omit-when-default
+    /// discipline `strategy = "static"` follows. Disabling writes
+    /// `enabled = false` and leaves the block (with its comments) in place.
+    /// Every target may be disabled: that is how a route is taken offline.
+    pub fn set_route_target_enabled(
+        &mut self,
+        id: &str,
+        index: usize,
+        enabled: bool,
+    ) -> Result<()> {
+        self.refuse_legacy_target_op(id)?;
+        let entry = self.target_table_mut(id, index)?;
+        if enabled {
+            entry.remove("enabled");
+        } else {
+            entry.insert("enabled", toml_edit::value(false));
+        }
+        Ok(())
+    }
+
+    /// The full target chain with each entry's enabled flag, in chain order.
+    ///
+    /// `route_targets` is the same list without the flag; one parse feeds both.
+    pub fn route_target_states(&self, id: &str) -> Vec<(String, String, bool)> {
         let Ok(cfg) = crate::config::load_from_str(&self.as_str()) else {
             return Vec::new();
         };
@@ -857,10 +879,52 @@ base_url = "http://localhost:8888"
             .map(|r| {
                 r.targets()
                     .iter()
-                    .map(|t| (t.provider.clone(), t.model.clone()))
+                    .map(|t| (t.provider.clone(), t.model.clone(), t.enabled))
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The full target chain as `provider/model` strings, in chain order.
+    ///
+    /// Parsed back through the config layer rather than read out of the
+    /// document, so the list the user sees is the list the gateway will honor.
+    /// A test-only view of [`Doc::route_target_states`] without the flag:
+    /// production callers that mutate a chain want the enabled bit.
+    #[cfg(test)]
+    pub fn route_targets(&self, id: &str) -> Vec<(String, String)> {
+        self.route_target_states(id)
+            .into_iter()
+            .map(|(provider, model, _)| (provider, model))
+            .collect()
+    }
+
+    /// Reset a non-`static` strategy the route can no longer justify: fewer
+    /// than two **enabled** targets is the state `set_strategy` refuses to
+    /// create and `doctor`'s `routes-strategy` lints.
+    ///
+    /// One definition for every chain mutation that can strand a strategy —
+    /// remove, disable, or a legacy reorder — so they agree with each other and
+    /// with `set_strategy` instead of each counting the chain differently.
+    ///
+    /// Returns whether it removed the key, so the caller can say what it did.
+    pub fn reset_stranded_strategy(&mut self, id: &str) -> bool {
+        let enabled = self
+            .route_target_states(id)
+            .iter()
+            .filter(|(_, _, enabled)| *enabled)
+            .count();
+        if enabled >= 2 {
+            return false;
+        }
+        let strategy = crate::config::load_from_str(&self.as_str())
+            .ok()
+            .and_then(|c| c.routes.get(id).map(|r| r.strategy));
+        if matches!(strategy, Some(s) if s != crate::config::Strategy::Static) {
+            self.remove_route_scalar_keeping_comment(id, "strategy");
+            return true;
+        }
+        false
     }
 
     /// Routes that reference a provider, with the upstream model, so error
@@ -1985,6 +2049,64 @@ model = "claude-sonnet-4-5"
 
         // An unknown route is an empty chain, not a panic.
         assert!(doc.route_targets("nope").is_empty());
+    }
+
+    /// A target serves unless it says otherwise, so enabling **removes** the
+    /// key rather than writing `enabled = true` — the omit-when-default rule.
+    #[test]
+    fn set_route_target_enabled_round_trips_and_omits_the_default() {
+        let mut doc = fixture();
+        doc.set_route_target_enabled("claude-sonnet-5", 0, false)
+            .unwrap();
+        assert!(doc.as_str().contains("enabled = false"), "{}", doc.as_str());
+        let cfg = doc.validated().unwrap();
+        assert!(!cfg.routes["claude-sonnet-5"].targets()[0].enabled);
+
+        doc.set_route_target_enabled("claude-sonnet-5", 0, true)
+            .unwrap();
+        assert!(
+            !doc.as_str().contains("enabled"),
+            "enabling should drop the key:\n{}",
+            doc.as_str()
+        );
+        let cfg = doc.validated().unwrap();
+        assert!(cfg.routes["claude-sonnet-5"].targets()[0].enabled);
+    }
+
+    #[test]
+    fn route_target_states_reports_the_flag_in_chain_order() {
+        let mut doc = fixture();
+        doc.add_route_target("claude-sonnet-5", &draft("zen-go", "backup"))
+            .unwrap();
+        doc.set_route_target_enabled("claude-sonnet-5", 1, false)
+            .unwrap();
+        assert_eq!(
+            doc.route_target_states("claude-sonnet-5"),
+            vec![
+                ("zen".to_string(), "claude-sonnet-4-5".to_string(), true),
+                ("zen-go".to_string(), "backup".to_string(), false),
+            ]
+        );
+        // The plain listing stays the same shape, without the flag.
+        assert_eq!(
+            doc.route_targets("claude-sonnet-5"),
+            vec![
+                ("zen".to_string(), "claude-sonnet-4-5".to_string()),
+                ("zen-go".to_string(), "backup".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_legacy_route_refuses_the_enabled_toggle() {
+        let mut doc = legacy_doc();
+        let before = doc.as_str().to_string();
+        let err = doc
+            .set_route_target_enabled("claude-sonnet-5", 0, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("legacy"), "got: {err}");
+        assert_eq!(doc.as_str(), before);
     }
 
     /// The strategy write path is `set_route_scalar`, and the unset path drops

@@ -10,6 +10,7 @@ mod config;
 mod config_edit;
 mod doctor;
 mod launch;
+mod models;
 mod proxy;
 mod search;
 mod secrets;
@@ -80,6 +81,22 @@ enum Commands {
     Routes {
         #[arg(long)]
         config: Option<PathBuf>,
+    },
+    /// Ask a configured provider which model ids it advertises.
+    ///
+    /// This reaches the provider, spending nothing on a list call for the
+    /// providers that implement it; the desktop Settings window's model picker
+    /// drives it with `--json`.
+    Models {
+        /// Path to config.toml (default: $TURNPIKE_CONFIG or ~/.config/turnpike/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Provider id from `[providers.*]`.
+        #[arg(long)]
+        provider: String,
+        /// Machine-readable output for the desktop shell.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the loaded config, with key tiers and never key values.
     ///
@@ -160,6 +177,11 @@ async fn main() -> Result<()> {
             &args,
         ),
         Commands::Routes { config } => routes(config),
+        Commands::Models {
+            config,
+            provider,
+            json,
+        } => models(config, &provider, json).await,
         Commands::Config(args) => show_config(args),
         // Both take their config path straight through rather than going via
         // `resolve_config`: with no config they start from the starter text in
@@ -207,6 +229,7 @@ fn default_log_filter(command: &Commands) -> &'static str {
         Commands::Serve { .. }
         | Commands::Launch { .. }
         | Commands::Routes { .. }
+        | Commands::Models { .. }
         | Commands::Config(_) => "info",
     }
 }
@@ -346,7 +369,14 @@ fn launch(
             let model = match model {
                 Some(m) => cfg.resolve_launch_model(&m)?,
                 None => cfg.default_launch_route().cloned().ok_or_else(|| {
-                    anyhow::anyhow!("config defines no [routes.*] to launch with")
+                    if cfg.routes.is_empty() {
+                        anyhow::anyhow!("config defines no [routes.*] to launch with")
+                    } else {
+                        anyhow::anyhow!(
+                            "every route has all its targets disabled — enable one in \
+                             `turnpike setup`, or name a route with --model"
+                        )
+                    }
                 })?,
             };
             launch::claude_code::ClaudeCode.run(&cfg, &model, args, install)
@@ -376,6 +406,42 @@ fn routes(config_path: Option<PathBuf>) -> Result<()> {
             .map(|p| p.spec.as_str())
             .unwrap_or("?");
         println!("{:<32} {:<12} {} [{}]", id, p.provider, p.model, spec);
+    }
+    Ok(())
+}
+
+/// `turnpike models --provider <id>` — what the upstream itself lists.
+///
+/// Reads the same hydrated config as `serve`, so a key held only in the
+/// encrypted store is found; the provider is named in every error so a typo in
+/// `--provider` says which ids do exist.
+async fn models(config_path: Option<PathBuf>, provider: &str, json: bool) -> Result<()> {
+    let loaded = resolve_config(config_path, ConfigMode::Required)?;
+    let cfg = loaded.cfg.providers.get(provider).with_context(|| {
+        let known: Vec<&str> = loaded.cfg.providers.keys().map(String::as_str).collect();
+        format!(
+            "no provider {provider:?} in {} (configured: {})",
+            loaded.path.display(),
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        )
+    })?;
+    let list = models::fetch(provider, cfg).await?;
+    if json {
+        println!("{}", serde_json::to_string(&list)?);
+    } else if list.models.is_empty() {
+        println!("{provider}: the upstream listed no models");
+    } else {
+        println!("{provider} ({}):", list.spec);
+        for m in &list.models {
+            match &m.display_name {
+                Some(d) if d != &m.id => println!("  {}  {d}", m.id),
+                _ => println!("  {}", m.id),
+            }
+        }
     }
     Ok(())
 }

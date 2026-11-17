@@ -42,6 +42,10 @@ pub struct RouteView {
     /// still deserializes instead of failing the whole settings read.
     #[serde(default)]
     pub cache_affinity: bool,
+    /// Defaulted so an older supervised CLI (whose view predates the knob)
+    /// still deserializes instead of failing the whole settings read.
+    #[serde(default)]
+    pub respect_peak_hours: bool,
     pub display_name: Option<String>,
     pub context_tokens: Option<u64>,
     pub targets: Vec<TargetView>,
@@ -57,7 +61,16 @@ pub struct TargetView {
     /// still deserializes instead of failing the whole settings read.
     #[serde(default)]
     pub peak_hours: Vec<String>,
+    /// Whether this target may serve. Defaulted to `true` so a view that
+    /// predates the key describes every target as serving, which is what the
+    /// gateway did before the key existed.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub spec: Option<String>,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +84,61 @@ pub struct SearchView {
     /// showing as absent: the key editor is the only way out of that state.
     pub running: bool,
     pub key: KeyView,
+}
+
+/// One model id a provider advertises, as `turnpike models --json` prints it.
+///
+/// Not a config value: this is what the *upstream* lists, which is why the
+/// picker can stay free text for ids the provider does not advertise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteModel {
+    pub id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// The `turnpike models --json` envelope. Only `models` is read.
+#[derive(Debug, Deserialize)]
+struct ModelsReply {
+    #[serde(default)]
+    models: Vec<RemoteModel>,
+}
+
+/// Ask the provider itself which models it advertises.
+///
+/// The CLI does the work (`turnpike models`), because it is the only place that
+/// holds the hydrated provider config and the key resolution; this side only
+/// moves the answer across the process boundary. `spawn_blocking`, like every
+/// command here that runs a child process.
+#[tauri::command]
+pub async fn provider_models(provider: String) -> Result<Vec<RemoteModel>, String> {
+    let Some(bin) = resolve::resolve_binary() else {
+        return Err("could not find the `turnpike` binary — set TURNPIKE_BIN to its path".into());
+    };
+    let path = resolve::resolve_config_path().display().to_string();
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new(&bin)
+            .args([
+                "models",
+                "--provider",
+                &provider,
+                "--json",
+                "--config",
+                &path,
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+    })
+    .await
+    .map_err(|e| format!("the model list did not finish: {e}"))?
+    .map_err(|e| format!("running turnpike models: {e}"))?;
+
+    if !out.status.success() {
+        return Err(message_from_stderr(&out.stderr));
+    }
+    let reply: ModelsReply = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("could not parse the model list: {e}"))?;
+    Ok(reply.models)
 }
 
 /// Which tier answered a key lookup — and nothing else. There is no `value`

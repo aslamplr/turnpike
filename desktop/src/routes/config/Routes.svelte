@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ProviderView, RouteView } from "../../lib/types";
+  import type { ProviderView, RemoteModel, RouteView } from "../../lib/types";
   import { noAutofill } from "./kit.svelte";
 
   /// Routes, including the target chain.
@@ -8,16 +8,17 @@
   /// re-derived:
   ///
   /// 1. **Every model is a `[[routes.<id>.target]]` block**, so a chain index is
-  ///    also the `target` array index — including 0. The first entry is the
-  ///    route's primary; there is no route-level `provider`/`model` to edit.
-  /// 2. **A non-`static` strategy is only offered at 2+ targets.** The CLI
-  ///    refuses that combination with a message; the UI must not be able to ask
-  ///    for it in the first place, so the options are `disabled`, not rejected
-  ///    after the fact.
+  ///    also the `target` array index — including 0. The first *enabled* entry
+  ///    is the route's primary; there is no route-level `provider`/`model` to
+  ///    edit.
+  /// 2. **A non-`static` strategy is only offered at 2+ enabled targets.** The
+  ///    CLI refuses that combination with a message; the UI must not be able to
+  ///    ask for it in the first place, so the options are `disabled`, not
+  ///    rejected after the fact.
   ///
   /// Target indices: the chain shows index *i* for the target at array index
-  /// *i*, which is exactly what `move-target`/`remove-target`/`set-peak-hours`
-  /// expect.
+  /// *i*, which is exactly what `move-target`/`remove-target`/
+  /// `set-target-enabled`/`set-peak-hours` expect.
   let {
     routes,
     providers,
@@ -31,6 +32,10 @@
     onRemoveTarget,
     onMoveTarget,
     onPeakHours,
+    onSetTargetEnabled,
+    onFetchModels,
+    onSetAffinity,
+    onSetPeakAware,
     error,
   }: {
     routes: RouteView[];
@@ -51,6 +56,16 @@
     onRemoveTarget: (id: string, index: number) => Promise<boolean>;
     onMoveTarget: (id: string, from: number, to: number) => Promise<boolean>;
     onPeakHours: (id: string, index: number, windows: string[]) => Promise<boolean>;
+    /// Take one chain entry in or out of service. `false` is a refusal, and the
+    /// row re-asserts its checkbox from that answer.
+    onSetTargetEnabled: (id: string, index: number, enabled: boolean) => Promise<boolean>;
+    /// The provider's advertised model ids, for the picker. Rejects when the
+    /// list cannot be fetched; the input stays free text either way.
+    onFetchModels: (provider: string) => Promise<RemoteModel[]>;
+    /// Boolean route flags. `false` is a refusal, and the checkbox re-asserts
+    /// itself from that answer.
+    onSetAffinity: (id: string, enabled: boolean) => Promise<boolean>;
+    onSetPeakAware: (id: string, enabled: boolean) => Promise<boolean>;
     error: string | null;
   } = $props();
 
@@ -71,17 +86,52 @@
   let peakFor = $state<{ id: string; index: number } | null>(null);
   let peakText = $state("");
 
+  /// Advertised model ids per provider, plus the note a failed fetch leaves.
+  ///
+  /// Fetched once per provider and cached for the session: the list is a
+  /// convenience layered over a free-text input, never a gate, so a provider
+  /// that cannot be reached simply leaves the field as it was.
+  let modelOptions = $state<Record<string, RemoteModel[]>>({});
+  let modelNote = $state<Record<string, string | null>>({});
+  let modelFetching = $state<Record<string, boolean>>({});
+
+  async function ensureModels(provider: string) {
+    if (!provider || modelOptions[provider] || modelFetching[provider]) return;
+    modelFetching[provider] = true;
+    modelNote[provider] = null;
+    try {
+      const list = await onFetchModels(provider);
+      modelOptions[provider] = list;
+      if (list.length === 0) {
+        modelNote[provider] = "the provider listed no models — type the id";
+      }
+    } catch (e) {
+      modelNote[provider] = `${String(e)} — type the id instead`;
+    } finally {
+      modelFetching[provider] = false;
+    }
+  }
+
   /// Which route's scalars are open for editing.
   let editing = $state<string | null>(null);
   let draft = $state({ display_name: "", context_tokens: "" });
 
-  /// The chain length, which is what gates the strategy options. `targets`
-  /// always includes target 0, so its length is the count the rule cares about.
+  /// The chain length, for row actions and the append label.
   const chainLen = (r: RouteView) => r.targets.length;
+
+  /// How many entries may actually serve. The strategy options gate on this,
+  /// not on the chain length: a route with three targets and two disabled has
+  /// nothing to balance across, which is exactly what the CLI refuses.
+  const enabledLen = (r: RouteView) => r.targets.filter((t) => t.enabled).length;
+
+  /// The primary is the first *enabled* target, as resolution defines it — not
+  /// simply index 0, which may be the one the user switched off.
+  const primaryIndex = (r: RouteView) => r.targets.findIndex((t) => t.enabled);
 
   function openAdd(provider: string) {
     adding = true;
     newProvider = provider || (providers[0]?.id ?? "");
+    void ensureModels(newProvider);
   }
 
   async function submitAdd() {
@@ -138,6 +188,7 @@
     tProvider = providers[0]?.id ?? "";
     tModel = "";
     tPeak = "";
+    void ensureModels(tProvider);
   }
 
   async function submitTarget(id: string) {
@@ -182,6 +233,37 @@
   async function removeTarget(id: string, index: number) {
     if (await onRemoveTarget(id, index)) closePeak();
   }
+
+  /// Toggle a target and re-assert the box from the CLI's answer.
+  ///
+  /// The click flips the DOM checkbox before the write is answered, and
+  /// Svelte re-applies `checked={}` only when the expression *changes* — so a
+  /// refused write (a legacy-shaped route the writer refuses to touch) would
+  /// leave the box lying about the document. Put it back from the answer.
+  async function toggleTarget(
+    id: string,
+    index: number,
+    enabled: boolean,
+    el: HTMLInputElement,
+  ) {
+    const ok = await onSetTargetEnabled(id, index, enabled);
+    if (!ok) el.checked = !enabled;
+  }
+
+  /// Toggle a route-level boolean flag, re-asserting the box from the answer
+  /// for the same reason `toggleTarget` does.
+  async function toggleFlag(
+    id: string,
+    which: "affinity" | "peak",
+    enabled: boolean,
+    el: HTMLInputElement,
+  ) {
+    const ok =
+      which === "affinity"
+        ? await onSetAffinity(id, enabled)
+        : await onSetPeakAware(id, enabled);
+    if (!ok) el.checked = !enabled;
+  }
 </script>
 
 {#if error}
@@ -202,18 +284,73 @@
         <div class="row-head">
           <b>{r.id}</b>
           <span class="badge">{r.strategy}</span>
-          {#if r.cache_affinity}<span class="badge">sticky</span>{/if}
           {#if r.display_name}<span class="sub grow">{r.display_name}</span>{/if}
           <span class="sub num">{r.context_tokens === null ? "—" : r.context_tokens.toLocaleString("en-US")}</span>
         </div>
 
+        <div class="flags">
+          <label class="switch" title="Sticky per conversation: one conversation keeps hitting the provider's prompt cache. Engages under load-balance with 2+ enabled targets.">
+            <input
+              type="checkbox"
+              checked={r.cache_affinity}
+              disabled={busy}
+              aria-label="Cache affinity for {r.id}"
+              onchange={(e) =>
+                toggleFlag(
+                  r.id,
+                  "affinity",
+                  (e.currentTarget as HTMLInputElement).checked,
+                  e.currentTarget as HTMLInputElement,
+                )}
+            />
+            <span class="sub">sticky</span>
+          </label>
+          <label
+            class="switch"
+            title={r.strategy === "peak-hours"
+              ? "The peak-hours strategy already implies this"
+              : "Peak hours: order this route's targets by their own UTC windows before the strategy picks — works with every strategy."}
+          >
+            <input
+              type="checkbox"
+              checked={r.respect_peak_hours}
+              disabled={busy || r.strategy === "peak-hours"}
+              aria-label="Peak hours for {r.id}"
+              onchange={(e) =>
+                toggleFlag(
+                  r.id,
+                  "peak",
+                  (e.currentTarget as HTMLInputElement).checked,
+                  e.currentTarget as HTMLInputElement,
+                )}
+            />
+            <span class="sub">peak hours</span>
+          </label>
+        </div>
+
         <div class="chain">
           {#each r.targets as t, i (i)}
-            <div class="link">
+            <div class="link" class:off={!t.enabled}>
               <span class="mark">{i}</span>
+              <label class="switch" title={t.enabled ? "Enabled — uncheck to take it out of service" : "Disabled — check to serve from it again"}>
+                <input
+                  type="checkbox"
+                  checked={t.enabled}
+                  disabled={busy}
+                  aria-label="Target {i} enabled"
+                  onchange={(e) =>
+                    toggleTarget(
+                      r.id,
+                      i,
+                      (e.currentTarget as HTMLInputElement).checked,
+                      e.currentTarget as HTMLInputElement,
+                    )}
+                />
+              </label>
               <span class="mono">{t.provider}/{t.model}</span>
               {#if t.spec}<span class="badge">{t.spec}</span>{/if}
-              {#if i === 0}<span class="badge">primary</span>{/if}
+              {#if !t.enabled}<span class="badge warn">disabled</span>{/if}
+              {#if i === primaryIndex(r)}<span class="badge">primary</span>{/if}
               {#each t.peak_hours as w, j (j)}<span class="badge warn">{w}</span>{/each}
               <span class="row-actions">
                 <button
@@ -264,8 +401,9 @@
                 </div>
                 <div class="sub">
                   Comma-separated HH:MM-HH:MM windows in which this target is
-                  pricey; empty means always available. Only the peak-hours
-                  strategy consults them.
+                  pricey; empty means always available. They apply when the
+                  route is peak-aware — the peak-hours checkbox, or the
+                  `peak-hours` strategy.
                 </div>
                 <div class="actions">
                   <button onclick={submitPeak} disabled={busy}>Save</button>
@@ -285,8 +423,8 @@
             onchange={(e) => onStrategy(r.id, (e.currentTarget as HTMLSelectElement).value)}
           >
             {#each STRATEGIES as s}
-              <option value={s} disabled={s !== "static" && chainLen(r) < 2}>
-                {s}{s !== "static" && chainLen(r) < 2 ? " — needs 2+ targets" : ""}
+              <option value={s} disabled={s !== "static" && enabledLen(r) < 2}>
+                {s}{s !== "static" && enabledLen(r) < 2 ? " — needs 2+ enabled targets" : ""}
               </option>
             {/each}
           </select>
@@ -336,7 +474,12 @@
           <div class="edit">
             <div class="edit-fields">
               <label for="tp-{r.id}">provider</label>
-              <select id="tp-{r.id}" bind:value={tProvider} disabled={busy}>
+              <select
+                id="tp-{r.id}"
+                bind:value={tProvider}
+                disabled={busy}
+                onchange={(e) => ensureModels((e.currentTarget as HTMLSelectElement).value)}
+              >
                 {#each providers as p (p.id)}<option value={p.id}>{p.id}</option>{/each}
               </select>
               <label for="tm-{r.id}">model</label>
@@ -345,8 +488,14 @@
                 bind:value={tModel}
                 placeholder="claude-opus-4-5"
                 disabled={busy}
+                list="tm-models-{r.id}"
                 {...noAutofill}
               />
+              <datalist id="tm-models-{r.id}">
+                {#each modelOptions[tProvider] ?? [] as m (m.id)}
+                  <option value={m.id}>{m.display_name ?? m.id}</option>
+                {/each}
+              </datalist>
               <label for="tph-{r.id}">peak hours (UTC)</label>
               <input
                 id="tph-{r.id}"
@@ -356,6 +505,16 @@
                 {...noAutofill}
               />
             </div>
+            {#if modelFetching[tProvider]}
+              <div class="sub">loading models from {tProvider}…</div>
+            {:else if modelNote[tProvider]}
+              <div class="sub note">{modelNote[tProvider]}</div>
+            {:else if (modelOptions[tProvider] ?? []).length > 0}
+              <div class="sub">
+                {modelOptions[tProvider].length} model(s) advertised by {tProvider} — or type
+                any id.
+              </div>
+            {/if}
             <div class="sub">
               Appended to the chain as target {chainLen(r)}. Which one serves a
               request depends on the strategy above.
@@ -384,7 +543,12 @@
           {...noAutofill}
         />
         <label for="nr-p">provider</label>
-        <select id="nr-p" bind:value={newProvider} disabled={busy}>
+        <select
+          id="nr-p"
+          bind:value={newProvider}
+          disabled={busy}
+          onchange={(e) => ensureModels((e.currentTarget as HTMLSelectElement).value)}
+        >
           {#each providers as p (p.id)}<option value={p.id}>{p.id}</option>{/each}
         </select>
         <label for="nr-m">model (upstream)</label>
@@ -393,9 +557,20 @@
           bind:value={newModel}
           placeholder="claude-sonnet-4-5"
           disabled={busy}
+          list="nr-models"
           {...noAutofill}
         />
+        <datalist id="nr-models">
+          {#each modelOptions[newProvider] ?? [] as m (m.id)}
+            <option value={m.id}>{m.display_name ?? m.id}</option>
+          {/each}
+        </datalist>
       </div>
+      {#if modelFetching[newProvider]}
+        <div class="sub">loading models from {newProvider}…</div>
+      {:else if modelNote[newProvider]}
+        <div class="sub note">{modelNote[newProvider]}</div>
+      {/if}
       <div class="actions">
         <button onclick={submitAdd} disabled={busy || !newId.trim() || !newProvider || !newModel.trim()}>
           Add route
@@ -444,6 +619,23 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    flex-wrap: wrap;
+  }
+  /* A disabled target stays on the chain so it can be brought back, but it
+     must not read as a candidate. */
+  .link.off {
+    opacity: 0.55;
+  }
+  .switch {
+    display: inline-flex;
+    align-items: center;
+  }
+  .switch input {
+    margin: 0;
+  }
+  .flags {
+    display: flex;
+    gap: 16px;
     flex-wrap: wrap;
   }
   .mark {

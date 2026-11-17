@@ -249,6 +249,7 @@
     "remove-target",
     "move-target",
     "set-target",
+    "set-target-enabled",
     "set-peak-hours",
   ]);
 
@@ -468,6 +469,34 @@
   const setPeakHours = (id: string, index: number, windows: string[]) =>
     apply("set-peak-hours", { id, index, windows }, "Routes");
 
+  /// Boolean route flags, through the generic scalar op.
+  ///
+  /// `set-route` takes its value as a string, and the CLI's `value_for` turns
+  /// `"true"`/`"false"` into TOML booleans; `null` removes the key, which is how
+  /// both flags express "off" — their schema default.
+  const setRouteFlag = (id: string, key: string, enabled: boolean) =>
+    apply("set-route", { id, key, value: enabled ? "true" : null }, "Routes");
+
+  /// Sticky per conversation (engages under `load-balance` with 2+ enabled
+  /// targets; `doctor`'s `routes-affinity-shape` names anywhere else).
+  const setAffinity = (id: string, enabled: boolean) =>
+    setRouteFlag(id, "cache_affinity", enabled);
+
+  /// Peak awareness for **any** strategy: the targets are ordered by their own
+  /// UTC windows before the strategy picks.
+  const setPeakAware = (id: string, enabled: boolean) =>
+    setRouteFlag(id, "respect_peak_hours", enabled);
+
+  /// Take one chain entry in or out of service. The **chain** index, like
+  /// `remove-target`; enabling removes the key (the default), disabling writes
+  /// `enabled = false`.
+  const setTargetEnabled = (id: string, index: number, enabled: boolean) =>
+    apply("set-target-enabled", { id, index, enabled }, "Routes");
+
+  /// The provider's advertised model ids for the picker. A failure is the
+  /// picker's own note, never the panel's: the field stays free text.
+  const fetchModels = (provider: string) => api.providerModels(provider);
+
   /// `[search]`'s document scalars — provider, base_url, max_loops, api_key_env.
   const setSearch = (args: Record<string, unknown>) =>
     apply("set-search", args, "Search");
@@ -653,6 +682,10 @@
         onRemoveTarget={removeTarget}
         onMoveTarget={moveTarget}
         onPeakHours={setPeakHours}
+        onSetTargetEnabled={setTargetEnabled}
+        onFetchModels={fetchModels}
+        onSetAffinity={setAffinity}
+        onSetPeakAware={setPeakAware}
         error={null}
       />
     {:else if tab === "Doctor"}

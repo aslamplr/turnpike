@@ -33,13 +33,23 @@ export interface TargetView {
   context_tokens: number | null;
   /** UTC windows in which this target is pricey, `HH:MM-HH:MM`. Empty = always available. */
   peak_hours: string[];
+  /** Whether this target may serve. A disabled pair stays listed so it can be re-enabled. */
+  enabled: boolean;
   spec: string | null;
+}
+
+/** One model id a provider advertises, as `provider_models` returns it. */
+export interface RemoteModel {
+  id: string;
+  display_name: string | null;
 }
 
 export interface RouteView {
   id: string;
   strategy: string;
   cache_affinity: boolean;
+  /** Peak windows reorder this route's targets for any strategy. */
+  respect_peak_hours: boolean;
   display_name: string | null;
   context_tokens: number | null;
   targets: TargetView[];

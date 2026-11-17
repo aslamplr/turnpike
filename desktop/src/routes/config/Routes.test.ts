@@ -27,6 +27,7 @@ const route = (over: Partial<RouteView> = {}): RouteView => ({
   id: "claude-sonnet-5",
   strategy: "static",
   cache_affinity: false,
+  respect_peak_hours: false,
   display_name: null,
   context_tokens: null,
   targets: [
@@ -36,6 +37,7 @@ const route = (over: Partial<RouteView> = {}): RouteView => ({
       display_name: null,
       context_tokens: null,
       peak_hours: [],
+      enabled: true,
       spec: null,
     },
   ],
@@ -62,6 +64,12 @@ function mount(
       onStrategy: async () => true,
       onAddTarget: async () => true,
       onRemoveTarget: async () => true,
+      onMoveTarget: async () => true,
+      onPeakHours: async () => true,
+      onSetTargetEnabled: async () => true,
+      onFetchModels: async () => [],
+      onSetAffinity: async () => true,
+      onSetPeakAware: async () => true,
       ...handlers,
     },
   });
@@ -100,15 +108,15 @@ describe("Routes — the strategy gate", () => {
     expect(options.find((o) => o.value === "peak-hours")?.disabled).toBe(true);
     // The disabled reason is rendered, not just implied.
     expect(options.find((o) => o.value === "failover")?.textContent).toContain(
-      "needs 2+ targets",
+      "needs 2+ enabled targets",
     );
   });
 
   it("enables them once a second target exists", () => {
     const two = route({
       targets: [
-        { provider: "zen", model: "claude-sonnet-4-5", display_name: null, context_tokens: null, peak_hours: [], spec: null },
-        { provider: "zen-go", model: "kimi-k2", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen", model: "claude-sonnet-4-5", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+        { provider: "zen-go", model: "kimi-k2", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
       ],
     });
     mount([two]);
@@ -145,9 +153,9 @@ describe("Routes — the target chain", () => {
     const seen: Array<[string, number]> = [];
     const three = route({
       targets: [
-        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
-        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
-        { provider: "zen", model: "c", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+        { provider: "zen", model: "c", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
       ],
     });
     mount([three], {
@@ -176,9 +184,9 @@ describe("Routes — the target chain", () => {
     const seen: Array<[string, number, number]> = [];
     const three = route({
       targets: [
-        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
-        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
-        { provider: "zen", model: "c", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+        { provider: "zen", model: "c", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
       ],
     });
     mount([three], {
@@ -215,6 +223,7 @@ describe("Routes — the target chain", () => {
           display_name: null,
           context_tokens: null,
           peak_hours: ["01:00-04:00"],
+          enabled: true,
           spec: null,
         },
       ],
@@ -245,8 +254,8 @@ describe("Routes — the target chain", () => {
     // it — leaving it open would submit the windows to a different target.
     const two = route({
       targets: [
-        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
-        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
       ],
     });
     mount([two], {
@@ -268,8 +277,8 @@ describe("Routes — the target chain", () => {
     // and the draft the user typed is still theirs to submit.
     const two = route({
       targets: [
-        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
-        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
       ],
     });
     mount([two], {
@@ -332,15 +341,59 @@ describe("Routes — no field invites the browser's autofill", () => {
   });
 });
 
-describe("Routes — the affinity knob badge", () => {
-  it("flags a route that opted into sticky selection", () => {
+describe("Routes — the affinity and peak flags", () => {
+  it("reflects the route's affinity flag on its checkbox", () => {
     mount([route({ strategy: "load-balance", cache_affinity: true })]);
-    expect(screen.getByText("sticky")).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Cache affinity for claude-sonnet-5"),
+    ).toBeChecked();
   });
 
-  it("stays quiet on a plain route", () => {
+  it("shows both flags off by default", () => {
     mount([route()]);
-    expect(screen.queryByText("sticky")).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Cache affinity for claude-sonnet-5"),
+    ).not.toBeChecked();
+    expect(
+      screen.getByLabelText("Peak hours for claude-sonnet-5"),
+    ).not.toBeChecked();
+  });
+
+  it("sends each toggle to its own prop", async () => {
+    const seen: Array<[string, string, boolean]> = [];
+    mount([route()], {
+      onSetAffinity: async (id: string, enabled: boolean) => {
+        seen.push([id, "affinity", enabled]);
+        return true;
+      },
+      onSetPeakAware: async (id: string, enabled: boolean) => {
+        seen.push([id, "peak", enabled]);
+        return true;
+      },
+    });
+
+    await userEvent.click(
+      screen.getByLabelText("Cache affinity for claude-sonnet-5"),
+    );
+    await userEvent.click(
+      screen.getByLabelText("Peak hours for claude-sonnet-5"),
+    );
+    expect(seen).toEqual([
+      ["claude-sonnet-5", "affinity", true],
+      ["claude-sonnet-5", "peak", true],
+    ]);
+  });
+
+  it("puts a flag checkbox back when the write is refused", async () => {
+    // Same DOM-before-answer problem as the target toggle: the box flips on
+    // click, and Svelte only re-applies `checked={}` when the expression moves.
+    mount([route()], { onSetPeakAware: async () => false });
+    const box = screen.getByLabelText(
+      "Peak hours for claude-sonnet-5",
+    ) as HTMLInputElement;
+
+    await userEvent.click(box);
+    await waitFor(() => expect(box.checked).toBe(false));
   });
 });
 
@@ -373,8 +426,111 @@ describe("Routes — empty and refusal states", () => {
         onStrategy: async () => true,
         onAddTarget: async () => true,
         onRemoveTarget: async () => true,
+        onMoveTarget: async () => true,
+        onPeakHours: async () => true,
+        onSetTargetEnabled: async () => true,
+        onFetchModels: async () => [],
+        onSetAffinity: async () => true,
+        onSetPeakAware: async () => true,
       },
     });
     expect(screen.getByRole("button", { name: "Add target" })).toBeDisabled();
+  });
+});
+
+describe("Routes — target enable/disable", () => {
+  it("sends the chain index and the state the box now shows", async () => {
+    const seen: Array<[string, number, boolean]> = [];
+    mount([route()], {
+      onSetTargetEnabled: async (id: string, index: number, enabled: boolean) => {
+        seen.push([id, index, enabled]);
+        return true;
+      },
+    });
+
+    await userEvent.click(screen.getByLabelText("Target 0 enabled"));
+    expect(seen).toEqual([["claude-sonnet-5", 0, false]]);
+  });
+
+  it("puts the box back when the write is refused", async () => {
+    // The click flips the DOM box before the answer, and Svelte re-applies
+    // `checked={}` only when the expression changes. A refusal means the
+    // document did not move, so the box must be re-asserted from the answer.
+    mount([route()], { onSetTargetEnabled: async () => false });
+    const box = screen.getByLabelText("Target 0 enabled") as HTMLInputElement;
+    expect(box.checked).toBe(true);
+
+    await userEvent.click(box);
+    await waitFor(() => expect(box.checked).toBe(true));
+  });
+
+  it("marks the first enabled target as primary, and flags the disabled one", () => {
+    const r = route({
+      targets: [
+        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], enabled: false, spec: null },
+        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+      ],
+    });
+    mount([r]);
+    expect(screen.getByText("primary")).toBeInTheDocument();
+    expect(screen.getByText("disabled")).toBeInTheDocument();
+  });
+
+  it("gates a non-static strategy on enabled targets, not chain length", () => {
+    // Two blocks, one disabled: nothing to balance across, which is the state
+    // the CLI refuses to create.
+    const r = route({
+      targets: [
+        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], enabled: true, spec: null },
+        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], enabled: false, spec: null },
+      ],
+    });
+    mount([r]);
+    const select = screen.getByLabelText("strategy") as HTMLSelectElement;
+    const failover = Array.from(select.options).find((o) => o.value === "failover");
+    expect(failover?.disabled).toBe(true);
+    expect(failover?.textContent).toContain("needs 2+ enabled targets");
+  });
+});
+
+describe("Routes — the provider model picker", () => {
+  it("fills a datalist from the provider and still accepts a custom id", async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    mount([route()], {
+      onFetchModels: async () => [
+        { id: "a-model", display_name: "A Model" },
+        { id: "b-model", display_name: null },
+      ],
+      onAddTarget: async (_id: string, args: Record<string, unknown>) => {
+        seen.push(args);
+        return true;
+      },
+    });
+
+    const addButtons = () => screen.getAllByRole("button", { name: "Add target" });
+    await userEvent.click(addButtons()[0]); // open the form
+    await screen.findByText(/2 model\(s\) advertised by zen/);
+
+    const options = Array.from(
+      document.querySelectorAll("#tm-models-claude-sonnet-5 option"),
+    ).map((o) => (o as HTMLOptionElement).value);
+    expect(options).toEqual(["a-model", "b-model"]);
+
+    // The list is a convenience: an id the provider does not advertise is
+    // still typed in and submitted as-is.
+    await userEvent.type(screen.getByLabelText("model"), "custom-id");
+    await userEvent.click(addButtons()[1]); // submit
+    expect(seen[0]).toMatchObject({ provider: "zen", model: "custom-id" });
+  });
+
+  it("says so when the list cannot be fetched, without blocking the field", async () => {
+    mount([route()], {
+      onFetchModels: async () => {
+        throw new Error("provider unreachable");
+      },
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Add target" }));
+    await screen.findByText(/provider unreachable — type the id instead/);
+    expect(screen.getByLabelText("model")).toBeEnabled();
   });
 });

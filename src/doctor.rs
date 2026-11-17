@@ -78,6 +78,7 @@ const KNOWN_FAMILIES: [&str; 4] = ["sonnet", "opus", "haiku", "other"];
 /// saying out loud.
 fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
     let mut provider_problems = Vec::new();
+    let mut no_enabled_problems = Vec::new();
     let mut strategy_problems = Vec::new();
     let mut duplicate_problems = Vec::new();
     let mut spec_problems = Vec::new();
@@ -87,11 +88,15 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
     let mut peak_problems = Vec::new();
 
     for (id, route) in &cfg.routes {
-        let targets = route.targets();
+        // "What can serve" — the chain every strategy and resolver walks.
+        // Disabled targets are not part of it.
+        let enabled: Vec<&crate::config::TargetCfg> = route.enabled_targets().collect();
 
         // 1. Every target's provider must exist. `validate` already refuses to
         // serve such a config, so this repeats its finding in the report the
-        // user actually reads — and it is the only `Fail` here.
+        // user actually reads — and it is the only `Fail` here. Checked on all
+        // targets, disabled ones included: a dangling reference is a latent
+        // break the moment the target is re-enabled.
         for (i, t) in route.target.iter().enumerate() {
             if !cfg.providers.contains_key(&t.provider) {
                 provider_problems.push(format!(
@@ -101,21 +106,38 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
             }
         }
 
-        // 2. A strategy with fewer than two targets is indistinguishable from
-        // `static`: there is nothing to balance across and nothing to fail over
-        // to. Not an error — just a strategy that cannot do what it says.
-        if route.strategy != config::Strategy::Static && !route.has_multiple_targets() {
+        // 2. A route with every target disabled exists but cannot serve: a
+        // request for it is a 503, not a 404. Deliberately not a `Fail`
+        // (other routes work, and disabling a target is a legitimate way to
+        // take a pair out of service), but the user should hear about a route
+        // they have switched off entirely.
+        if enabled.is_empty() {
+            no_enabled_problems.push(format!(
+                "{id:?} has {} target(s) and all of them are disabled, so every \
+                 request to it fails",
+                route.target.len()
+            ));
+        }
+
+        // 3. A strategy with fewer than two *enabled* targets is
+        // indistinguishable from `static`: there is nothing to balance across
+        // and nothing to fail over to. Not an error — just a strategy that
+        // cannot do what it says.
+        // Zero enabled targets is `routes-no-enabled-target`'s story (every
+        // request 503s); only the 1-enabled case is a strategy that silently
+        // collapses into `static`.
+        if route.strategy != config::Strategy::Static && enabled.len() == 1 {
             strategy_problems.push(format!(
-                "{id:?} is {:?} with 1 target, which behaves exactly like \"static\"",
+                "{id:?} is {:?} with 1 enabled target, which behaves exactly like \"static\"",
                 route.strategy.as_str()
             ));
         }
 
-        // 3. The same upstream twice in one chain. Harmless under `static`,
-        // but under `load-balance` it silently skews the rotation and under
-        // `failover` a retry lands on the provider that just failed.
+        // 4. The same upstream twice in the serving chain. Harmless under
+        // `static`, but under `load-balance` it silently skews the rotation and
+        // under `failover` a retry lands on the provider that just failed.
         let mut seen = std::collections::BTreeMap::new();
-        for (i, t) in targets.iter().enumerate() {
+        for (i, t) in route.target.iter().enumerate().filter(|(_, t)| t.enabled) {
             if let Some(prev) = seen.insert((t.provider.clone(), t.model.clone()), i) {
                 duplicate_problems.push(format!(
                     "{id:?} lists {}/{} at positions {prev} and {i}",
@@ -124,12 +146,12 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
             }
         }
 
-        // 4. A chain that mixes wire specs. Legal — the translation path is
+        // 5. A chain that mixes wire specs. Legal — the translation path is
         // chosen per attempt from the target's own spec, which is exactly why
         // failover across specs works — but it means the same route id streams
         // through two different code paths depending on which target answered.
         let mut specs: Vec<&'static str> = Vec::new();
-        for t in targets {
+        for t in &enabled {
             if let Some(p) = cfg.providers.get(&t.provider) {
                 let s = p.spec.as_str();
                 if !specs.contains(&s) {
@@ -143,40 +165,37 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
             spec_problems.push(format!("{id:?} mixes {} targets", sorted.join(" and ")));
         }
 
-        // 5. Mixed context-window declaration under a strategy. `min()` runs
-        // over the targets that declare one, so a silent target is simply not
-        // counted — which is optimistic. The realistic silent target is a local
-        // `ollama-local` with a *larger* window, but that is a guess, and this
-        // warning is what stops it being a silent one.
+        // 6. Mixed context-window declaration under a strategy. `min()` runs
+        // over the enabled targets that declare one, so a silent target is
+        // simply not counted — which is optimistic. The realistic silent target
+        // is a local `ollama-local` with a *larger* window, but that is a
+        // guess, and this warning is what stops it being a silent one.
         if route.has_multiple_targets() && route.context_tokens.is_none() {
-            let declared = route
-                .target
+            let declared = enabled
                 .iter()
                 .filter(|t| t.context_tokens.is_some())
                 .count();
-            if declared != 0 && declared != route.target.len() {
+            if declared != 0 && declared != enabled.len() {
                 context_problems.push(format!(
-                    "{id:?}: {declared} of {} targets declare context_tokens; the rest are \
-                     ignored when computing the advertised window",
-                    route.target.len()
+                    "{id:?}: {declared} of {} enabled targets declare context_tokens; the rest \
+                     are ignored when computing the advertised window",
+                    enabled.len()
                 ));
             }
         }
 
-        // 6. A `failover` chain that does not diversify. Every target behind
-        // one provider means a provider-wide outage — the case failover exists
-        // for — still takes the route down.
+        // 7. A `failover` chain that does not diversify. Every enabled target
+        // behind one provider means a provider-wide outage — the case failover
+        // exists for — still takes the route down.
         if route.strategy == config::Strategy::Failover && route.has_multiple_targets() {
-            let mut providers: Vec<&str> =
-                route.target.iter().map(|t| t.provider.as_str()).collect();
+            let mut providers: Vec<&str> = enabled.iter().map(|t| t.provider.as_str()).collect();
             providers.sort_unstable();
             providers.dedup();
             if providers.len() == 1 {
                 // Name the targets the way the user wrote them — the per-target
                 // `display_name` is the label that makes a log line or a report
                 // entry identifiable when several targets share a provider.
-                let named: Vec<String> = route
-                    .target
+                let named: Vec<String> = enabled
                     .iter()
                     .map(|t| match &t.display_name {
                         Some(d) => format!("{} ({d})", t.model),
@@ -184,46 +203,58 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
                     })
                     .collect();
                 failover_problems.push(format!(
-                    "{id:?}: all {} targets are on {:?} [{}], so a {0}-wide outage still \
-                     takes the route down",
-                    targets.len(),
+                    "{id:?}: all {} enabled targets are on {:?} [{}], so a {0}-wide outage \
+                     still takes the route down",
+                    enabled.len(),
                     providers[0],
                     named.join(", ")
                 ));
             }
         }
 
-        // 7. A `cache_affinity` pin only engages under `load-balance` with two
-        // or more targets: the conversation key has no other consumer, so
-        // anywhere else it is a key the config layer parses and the gateway
+        // 8. A `cache_affinity` pin only engages under `load-balance` with two
+        // or more enabled targets: the conversation key has no other consumer,
+        // so anywhere else it is a key the config layer parses and the gateway
         // ignores — the exact shape of a typo'd expectation, worth one line.
         if route.cache_affinity
             && (route.strategy != config::Strategy::LoadBalance || !route.has_multiple_targets())
         {
             affinity_problems.push(format!(
-                "{id:?} sets cache_affinity on a {:?} route with {} target(s); the pin \
+                "{id:?} sets cache_affinity on a {:?} route with {} enabled target(s); the pin \
                  only engages under \"load-balance\" with 2+",
                 route.strategy.as_str(),
-                targets.len()
+                enabled.len()
             ));
         }
 
-        // 8. Peak windows only mean something under `peak-hours`, and a
-        // `peak-hours` route with no window declared anywhere has nothing to
-        // switch away from — it behaves exactly like `static`.
-        if route.strategy != config::Strategy::PeakHours {
-            if route.targets().iter().any(|t| !t.peak_hours.is_empty()) {
+        // 9. Peak awareness is enabled two ways: the route-level
+        // `respect_peak_hours` (works with any strategy) or the older
+        // `peak-hours` strategy, which implies it. Windows on a route that sets
+        // neither are parsed and then ignored; a peak-aware route with no
+        // windows, or with no second target to switch to, behaves like
+        // `static`.
+        // A fully-disabled route is `routes-no-enabled-target`'s story; none of
+        // the peak statements below are true of it (nothing serves at all), so
+        // the whole lint is scoped to routes that still have something to pick.
+        if !enabled.is_empty() {
+            let peak_aware = route.is_peak_aware();
+            let windows = enabled.iter().any(|t| !t.peak_hours.is_empty());
+            if !peak_aware && windows {
                 peak_problems.push(format!(
-                    "{id:?} declares peak_hours but its strategy is {:?}; the windows \
-                     are ignored",
-                    route.strategy.as_str()
+                    "{id:?} declares peak_hours but neither `respect_peak_hours` nor \
+                     `strategy = \"peak-hours\"` is set; the windows are ignored"
+                ));
+            } else if peak_aware && !windows {
+                peak_problems.push(format!(
+                    "{id:?} is peak-aware but no enabled target declares peak_hours, so it \
+                     behaves exactly like \"static\""
+                ));
+            } else if peak_aware && enabled.len() == 1 {
+                peak_problems.push(format!(
+                    "{id:?} is peak-aware with 1 enabled target, so there is nothing to \
+                     switch to"
                 ));
             }
-        } else if !route.targets().iter().any(|t| !t.peak_hours.is_empty()) {
-            peak_problems.push(format!(
-                "{id:?} is \"peak-hours\" but no target declares peak_hours, so it \
-                 behaves exactly like \"static\""
-            ));
         }
     }
 
@@ -238,10 +269,17 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
             Status::Fail,
         ),
         lint_or_ok(
+            "routes-no-enabled-target",
+            &no_enabled_problems,
+            "a route has every target disabled, so nothing may serve it",
+            "enable a target (`enabled = true`, the default) or remove the route",
+            Status::Warn,
+        ),
+        lint_or_ok(
             "routes-strategy",
             &strategy_problems,
-            "a strategy route has fewer than 2 targets, so it behaves as `static`",
-            "add a second `[[routes.\"<id>\".target]]` block, or drop the `strategy` key",
+            "a strategy route has fewer than 2 enabled targets, so it behaves as `static`",
+            "add a second enabled `[[routes.\"<id>\".target]]` block, or drop the `strategy` key",
             Status::Warn,
         ),
         lint_or_ok(
@@ -289,10 +327,10 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
         lint_or_ok(
             "routes-peak-hours",
             &peak_problems,
-            "`peak_hours` is set where it cannot apply, or a `peak-hours` route \
-             declares no windows",
-            "set `peak_hours = [\"HH:MM-HH:MM\"]` on the targets that are pricey, and put \
-             `strategy = \"peak-hours\"` on the route",
+            "peak windows are set where they cannot apply, or peak awareness has no \
+             windows or no alternate",
+            "put `peak_hours = [\"HH:MM-HH:MM\"]` on the targets that are pricey, and turn \
+             on `respect_peak_hours` (with any strategy) or `strategy = \"peak-hours\"`",
             Status::Warn,
         ),
     ]
@@ -421,7 +459,7 @@ pub struct DoctorOptions {
 /// build), and the constant is the thing it asserts against. `cargo build` sees
 /// no reader; the test profile does.
 #[allow(dead_code)]
-pub const CHECK_IDS: [&str; 29] = [
+pub const CHECK_IDS: [&str; 30] = [
     "config-found",
     "config-parse",
     "validate",
@@ -437,6 +475,7 @@ pub const CHECK_IDS: [&str; 29] = [
     "routes-shape",
     "routes-legacy-shape",
     "routes-target-provider",
+    "routes-no-enabled-target",
     "routes-strategy",
     "routes-target-duplicate",
     "routes-mixed-spec",
@@ -962,6 +1001,7 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
             "routes-shape",
             "routes-legacy-shape",
             "routes-target-provider",
+            "routes-no-enabled-target",
             "routes-strategy",
             "routes-target-duplicate",
             "routes-mixed-spec",
@@ -1242,7 +1282,16 @@ async fn probe_checks(ctx: &Ctx) -> Vec<Check> {
     // A gateway whose route set differs from this config's is the single most
     // confusing failure mode there is: requests succeed, but against routes the
     // user is not looking at, because the running server read a different file.
-    let mut ours: Vec<&String> = cfg.routes.keys().collect();
+    // The gateway's catalog omits a route whose every target is disabled
+    // (proxy.rs:383), so compare against the servable set — otherwise a route
+    // the user deliberately took offline looks like "the server read a
+    // different config". `routes-no-enabled-target` is what reports it instead.
+    let mut ours: Vec<&String> = cfg
+        .routes
+        .iter()
+        .filter(|(_, r)| r.enabled_targets().next().is_some())
+        .map(|(id, _)| id)
+        .collect();
     let mut theirs: Vec<&String> = routes.iter().collect();
     ours.sort();
     theirs.sort();
@@ -1975,6 +2024,142 @@ model = "claude-sonnet-4-5"
     }
 
     #[tokio::test]
+    async fn a_route_with_every_target_disabled_is_warned() {
+        let raw = array_route(
+            "static",
+            r#"
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "primary"
+enabled = false
+"#,
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-no-enabled-target")
+            .expect("the check runs");
+        assert_eq!(c.status, Status::Warn, "{c:?}");
+        assert!(c.detail.as_deref().unwrap().contains("disabled"), "{c:?}");
+    }
+
+    #[tokio::test]
+    async fn a_route_with_one_enabled_target_is_quiet_on_that_check() {
+        let raw = array_route(
+            "static",
+            r#"
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "primary"
+
+[[routes."claude-sonnet-5".target]]
+provider = "local"
+model = "secondary"
+enabled = false
+"#,
+        );
+        let path = write_config(&raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-no-enabled-target")
+            .expect("the check runs");
+        assert_eq!(c.status, Status::Ok, "{c:?}");
+    }
+
+    #[tokio::test]
+    async fn peak_awareness_with_windows_is_quiet() {
+        // The route-level modifier with a window and an alternate: valid.
+        let raw = format!(
+            r#"{TWO_PROVIDERS}
+[routes."claude-sonnet-5"]
+strategy = "static"
+respect_peak_hours = true
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "primary"
+peak_hours = ["01:00-04:00"]
+
+[[routes."claude-sonnet-5".target]]
+provider = "local"
+model = "secondary"
+"#
+        );
+        let path = write_config_tagged("peak-aware-good", &raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-peak-hours")
+            .expect("the check runs");
+        assert_eq!(c.status, Status::Ok, "{c:?}");
+    }
+
+    #[tokio::test]
+    async fn peak_awareness_without_windows_is_warned() {
+        let raw = format!(
+            r#"{TWO_PROVIDERS}
+[routes."claude-sonnet-5"]
+strategy = "static"
+respect_peak_hours = true
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "primary"
+
+[[routes."claude-sonnet-5".target]]
+provider = "local"
+model = "secondary"
+"#
+        );
+        let path = write_config_tagged("peak-aware-no-windows", &raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-peak-hours")
+            .expect("the check runs");
+        assert_eq!(c.status, Status::Warn, "{c:?}");
+        assert!(
+            c.detail
+                .as_deref()
+                .unwrap()
+                .contains("behaves exactly like"),
+            "{c:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peak_awareness_with_one_enabled_target_is_warned() {
+        let raw = format!(
+            r#"{TWO_PROVIDERS}
+[routes."claude-sonnet-5"]
+strategy = "static"
+respect_peak_hours = true
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "primary"
+peak_hours = ["01:00-04:00"]
+"#
+        );
+        let path = write_config_tagged("peak-aware-one", &raw);
+        let checks = diagnose_with(path, &raw, memory_store()).await;
+        let c = checks
+            .iter()
+            .find(|c| c.id == "routes-peak-hours")
+            .expect("the check runs");
+        assert_eq!(c.status, Status::Warn, "{c:?}");
+        assert!(
+            c.detail
+                .as_deref()
+                .unwrap()
+                .contains("nothing to switch to"),
+            "{c:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_missing_config_is_a_failure_with_a_fix() {
         let dir = temp_root("doctor-missing");
         // `diagnose_with` rather than `diagnose`: the point of this test is a
@@ -2377,7 +2562,10 @@ model = "secondary"
         let checks = diagnose_with(path, &raw, memory_store()).await;
         let c = checks.iter().find(|c| c.id == "routes-strategy").unwrap();
         assert_eq!(c.status, Status::Warn);
-        assert!(c.detail.as_deref().unwrap().contains("1 target"), "{c:?}");
+        assert!(
+            c.detail.as_deref().unwrap().contains("1 enabled target"),
+            "{c:?}"
+        );
     }
 
     #[tokio::test]

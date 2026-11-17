@@ -503,17 +503,28 @@ rules of equal specificity over one class is a coin toss on which stylesheet lan
   are the only way out of that state. Only a genuinely absent `[search]` table, or a
   provider the `<select>` cannot render, reads as "Off".
 - **Routes** — all four strategies. The target chain renders every entry
-  uniformly: index 0 carries a `primary` badge, and every entry (the primary
-  included) has Move up / Move down / Peak hours / Remove buttons. A chain
-  index **is** the `target` array index — `move-target`, `remove-target` and
-  `set-peak-hours` all take it. The edge Move buttons are disabled, Remove is
-  disabled at one target (a route needs one), and the peak-hours editor is a
-  per-row form whose Save sends the comma-separated windows, blank clearing
-  them. The strategy select **disables** the non-`static` options below two
-  targets, so the window cannot ask for the state `set_strategy` refuses. A
-  route with `cache_affinity = true` carries a `sticky` badge beside its
-  strategy badge; the view echoes the flag wherever it is set, and `doctor`'s
-  `routes-affinity-shape` is the lint that names a set-but-unengaging one.
+  uniformly: the first enabled entry carries a `primary` badge, a disabled one a
+  `disabled` badge, and every entry (the primary included) has an enable/disable
+  checkbox plus Move up / Move down / Peak hours / Remove buttons. A chain index
+  **is** the `target` array index — `move-target`, `remove-target`,
+  `set-target-enabled` and `set-peak-hours` all take it. The edge Move buttons
+  are disabled, Remove is disabled at one target (a route needs one), and the
+  peak-hours editor is a per-row form whose Save sends the comma-separated
+  windows, blank clearing them. The strategy select **disables** the non-`static`
+  options below two *enabled* targets, so the window cannot ask for the state
+  `set_strategy` refuses. The model field offers the provider's own advertised
+  ids through a `datalist` (fetched once per provider via `turnpike models
+  --provider <id> --json`) while staying free text for an id the provider does
+  not list; a failed fetch is a note beside the field, not a blocked form. A
+  checkbox refusal re-asserts itself from the CLI's answer, since Svelte only
+  re-applies `checked={}` when the expression changes. Two route-level
+  checkboxes sit under the row head: **sticky** (`cache_affinity`, which engages
+  under `load-balance` with 2+ enabled targets) and **peak hours**
+  (`respect_peak_hours`, which orders the targets by their own UTC windows for
+  every strategy and is disabled on a `peak-hours` route, where the strategy
+  already implies it). Both write through `set-route` — `"true"` to set, `null`
+  to remove, since `false` is the schema default — and `doctor`'s
+  `routes-affinity-shape` and `routes-peak-hours` name a set-but-unengaging one.
 - **Doctor** — `turnpike doctor --json`, read-only, `Fail` toned `bad` and `Warn`
   toned `warn`. Advisory: a failure here is an empty list, never a broken window.
 
