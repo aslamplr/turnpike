@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { get } from "svelte/store";
   import * as api from "../lib/api";
+  import { cli } from "../lib/stores";
   import type {
     CheckView,
     ConfigView,
@@ -234,6 +236,22 @@
     }
   }
 
+  /// The ops that write a route's `target` chain. Their `index` argument is a
+  /// **chain** index — the `target` array index including 0 — and that meaning
+  /// arrived with the array-only shape. An older supervised CLI reads the same
+  /// argument relative to an array that *excluded* target 0, so a
+  /// `remove-target` would act on a different upstream than the user pointed
+  /// at, and an `add-target`'s `peak_hours` would be silently dropped. The app
+  /// already detects that version skew and offers a Reinstall; `apply` refuses
+  /// these rather than letting one land somewhere the user did not mean.
+  const CHAIN_OPS = new Set([
+    "add-target",
+    "remove-target",
+    "move-target",
+    "set-target",
+    "set-peak-hours",
+  ]);
+
   /// Every edit goes through here: one op, the whole new session back.
   ///
   /// A refusal arrives as a **resolved** payload with `error` set and the
@@ -255,6 +273,17 @@
     panel: Panel,
   ): Promise<boolean> {
     if (!session) return false;
+    // See `CHAIN_OPS`: a known version mismatch means the binary's index
+    // semantics are not this window's, and there is no way to translate between
+    // them. An *unknown* version stays `ready`, so this only fires on skew the
+    // app is sure about.
+    if (CHAIN_OPS.has(op)) {
+      const s = get(cli);
+      if (s?.state === "versionMismatch") {
+        problem = `The turnpike CLI here is ${s.found}, but this app needs ${s.expected} — reinstall it before editing a route's targets.`;
+        return false;
+      }
+    }
     busy = true;
     problem = null;
     try {
@@ -425,10 +454,19 @@
   const addTarget = (id: string, args: Record<string, unknown>) =>
     apply("add-target", { id, ...args }, "Routes");
 
-  /// The **array** index: the chain's target 0 is the route's flat
-  /// provider/model and is not in the array, so chain index `i` is array `i-1`.
+  /// The **chain** index, which is the `target` array index: every model is a
+  /// `[[routes.<id>.target]]` block, target 0 included.
   const removeTarget = (id: string, index: number) =>
     apply("remove-target", { id, index }, "Routes");
+
+  /// Reorder the chain. Both positions are chain indexes; the block moves whole,
+  /// so a comment above its header travels with it.
+  const moveTarget = (id: string, from: number, to: number) =>
+    apply("move-target", { id, from, to }, "Routes");
+
+  /// One target's UTC peak windows. An empty list clears the key.
+  const setPeakHours = (id: string, index: number, windows: string[]) =>
+    apply("set-peak-hours", { id, index, windows }, "Routes");
 
   /// `[search]`'s document scalars — provider, base_url, max_loops, api_key_env.
   const setSearch = (args: Record<string, unknown>) =>
@@ -613,6 +651,8 @@
         onStrategy={setStrategy}
         onAddTarget={addTarget}
         onRemoveTarget={removeTarget}
+        onMoveTarget={moveTarget}
+        onPeakHours={setPeakHours}
         error={null}
       />
     {:else if tab === "Doctor"}

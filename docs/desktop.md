@@ -502,15 +502,18 @@ rules of equal specificity over one class is a coin toss on which stylesheet lan
   and the panel must keep the `<select>` and the key editor reachable, because those
   are the only way out of that state. Only a genuinely absent `[search]` table, or a
   provider the `<select>` cannot render, reads as "Off".
-- **Routes** — all three strategies. The target chain renders target 0 as the
-  route's own flat `provider`/`model` with **no remove button** (removing it is
-  "edit the route," and `targets()` synthesizes it); chain index `i` removes
-  **array index `i - 1`**, which is the argument the CLI takes. The strategy select
-  **disables** the non-`static` options below two targets, so the window cannot ask
-  for the state `set_strategy` refuses. A route with `cache_affinity = true` carries
-  a `sticky` badge beside its strategy badge; the view echoes the flag wherever it
-  is set, and `doctor`'s `routes-affinity-shape` is the lint that names a
-  set-but-unengaging one.
+- **Routes** — all four strategies. The target chain renders every entry
+  uniformly: index 0 carries a `primary` badge, and every entry (the primary
+  included) has Move up / Move down / Peak hours / Remove buttons. A chain
+  index **is** the `target` array index — `move-target`, `remove-target` and
+  `set-peak-hours` all take it. The edge Move buttons are disabled, Remove is
+  disabled at one target (a route needs one), and the peak-hours editor is a
+  per-row form whose Save sends the comma-separated windows, blank clearing
+  them. The strategy select **disables** the non-`static` options below two
+  targets, so the window cannot ask for the state `set_strategy` refuses. A
+  route with `cache_affinity = true` carries a `sticky` badge beside its
+  strategy badge; the view echoes the flag wherever it is set, and `doctor`'s
+  `routes-affinity-shape` is the lint that names a set-but-unengaging one.
 - **Doctor** — `turnpike doctor --json`, read-only, `Fail` toned `bad` and `Warn`
   toned `warn`. Advisory: a failure here is an empty list, never a broken window.
 
@@ -852,7 +855,8 @@ a suite starts passing for the wrong reason.
 
 Covered today, seven suites: `kit.svelte`'s `keyTone`/`windows` and the shape of the
 `noAutofill` opt-out every editor field spreads; `Doctor.svelte`'s `notable` filter
-and its fail/warn tallies; `Routes.svelte`'s strategy gate, the `i - 1` array index
+and its fail/warn tallies; `Routes.svelte`'s strategy gate, the chain-index
+remove/move buttons and the peak-hours editor
 its remove buttons send, and a `noAutofill` assertion per text field; each panel's
 `unsaved` marker rendering from its own flag and not its sibling's; `Settings.svelte`'s
 session lifecycle — the `dirty`-and-`touched`-only-on-success rule (a refusal comes

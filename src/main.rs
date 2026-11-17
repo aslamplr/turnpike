@@ -245,6 +245,7 @@ pub(crate) struct Loaded {
 /// `setup` and the desktop window are the two ways to make a first config, and
 /// both gather real details. `serve` on a machine with no config is not a
 /// third: it cannot ask, so it points at the ones that can.
+#[derive(Clone, Copy)]
 enum ConfigMode {
     /// `serve`: worded as a next step, since starting the gateway is the thing
     /// the user wanted and this is the only thing in the way.
@@ -276,6 +277,13 @@ fn resolve_config(path: Option<PathBuf>, mode: ConfigMode) -> Result<Loaded> {
         );
     }
 
+    // The one-time route-shape migration happens where the gateway takes
+    // ownership of the file: starting to serve. Read-only commands never
+    // rewrite it, and the parser accepts the legacy shape either way.
+    if matches!(mode, ConfigMode::Serve) {
+        crate::setup::migrate_config_file(&path);
+    }
+
     let mut cfg = config::load(&path)?;
     // Open once, hydrate once. `Config::resolve()` clones the provider config,
     // so the keys ride along to the proxy with nothing downstream changed.
@@ -303,7 +311,13 @@ async fn serve(config_path: Option<PathBuf>, listen: Option<String>) -> Result<(
         .map_err(|e| anyhow::anyhow!("binding {}: {e}", cfg.server.listen))?;
     println!("turnpike gateway on http://{} — routes:", cfg.server.listen);
     for (id, r) in &cfg.routes {
-        println!("  {id} -> {}/{} ({})", id, r.provider, r.model);
+        let p = r.primary();
+        println!(
+            "  {id} -> {}/{} ({})",
+            p.provider,
+            p.model,
+            r.strategy.as_str()
+        );
     }
     if search_enabled {
         println!(
@@ -355,12 +369,13 @@ fn routes(config_path: Option<PathBuf>) -> Result<()> {
     let header = "upstream model";
     println!("{:<32} {:<12} {header}", "client id", "provider");
     for (id, r) in &cfg.routes {
+        let p = r.primary();
         let spec = cfg
             .providers
-            .get(&r.provider)
+            .get(&p.provider)
             .map(|p| p.spec.as_str())
             .unwrap_or("?");
-        println!("{:<32} {:<12} {} [{}]", id, r.provider, r.model, spec);
+        println!("{:<32} {:<12} {} [{}]", id, p.provider, p.model, spec);
     }
     Ok(())
 }

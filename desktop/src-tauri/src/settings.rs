@@ -53,6 +53,10 @@ pub struct TargetView {
     pub model: String,
     pub display_name: Option<String>,
     pub context_tokens: Option<u64>,
+    /// Defaulted so an older supervised CLI (whose view predates the key)
+    /// still deserializes instead of failing the whole settings read.
+    #[serde(default)]
+    pub peak_hours: Vec<String>,
     pub spec: Option<String>,
 }
 

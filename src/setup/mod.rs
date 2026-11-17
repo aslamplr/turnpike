@@ -143,7 +143,12 @@ pub(crate) fn run_with(
     } else {
         crate::config::default_config_text()
     };
-    let doc = Doc::parse(&raw).context("parsing the existing config")?;
+    let mut doc = Doc::parse(&raw).context("parsing the existing config")?;
+    // Writers emit only the array shape: a legacy flat provider/model pair is
+    // normalized before the first prompt, so even an untouched save migrates.
+    if let Err(e) = doc.migrate_legacy_routes() {
+        tracing::warn!("not migrating the config's route shape: {e:#}");
+    }
 
     // The store is opened here and must be usable: `setup` writes into it, and
     // a store that cannot be opened means any key the user types would be
@@ -523,6 +528,7 @@ impl WizardState {
             model: p.ask("Target upstream model id")?,
             display_name: None,
             context_tokens: None,
+            peak_hours: Vec::new(),
         };
         let disp = p.ask_default("Target display name (blank to omit)", "")?;
         if !disp.trim().is_empty() {
@@ -532,6 +538,11 @@ impl WizardState {
         if let Ok(n) = ct.trim().parse::<u64>() {
             t.context_tokens = Some(n);
         }
+        let ph = p.ask_default(
+            "Peak hours, UTC, comma-separated HH:MM-HH:MM (blank for none)",
+            "",
+        )?;
+        t.peak_hours = split_peak_hours(&ph);
         Ok(Some(t))
     }
 
@@ -576,27 +587,33 @@ impl WizardState {
         Ok(())
     }
 
-    /// The Targets sub-menu: list the chain, then add / edit / remove / back.
+    /// The Targets sub-menu: list the chain, then add / edit / reorder /
+    /// remove.
     ///
-    /// Target 0 is listed but has no Edit/Remove of its own — it is the route's
-    /// own flat `provider`/`model`, edited through the route's `provider` and
-    /// `model` fields. Rewriting it here would give `targets()` two entries
-    /// claiming to be target 0.
+    /// Every chain entry is a real `[[routes.<id>.target]]` block, so every one
+    /// is editable, movable and removable — the last excepted, since a route
+    /// needs at least one target.
     fn targets_menu(&mut self, p: &mut dyn Prompter, id: &str) -> Result<()> {
         loop {
             let chain = self.doc.route_targets(id);
             println!();
             for (i, (prov, model)) in chain.iter().enumerate() {
-                if i == 0 {
-                    println!("  target 0 (the route's own pair)  {prov}/{model}");
-                } else {
-                    println!("  target {i}  {prov}/{model}");
-                }
+                let role = if i == 0 { " (primary)" } else { "" };
+                println!("  target {i}{role}  {prov}/{model}");
             }
             let action = p.choose(
                 "Targets:",
-                &["Add", "Edit", "Remove", "Strategy", "Back"],
-                4,
+                &[
+                    "Add",
+                    "Edit",
+                    "Move up",
+                    "Move down",
+                    "Peak hours",
+                    "Remove",
+                    "Strategy",
+                    "Back",
+                ],
+                7,
             )?;
             match action {
                 0 => {
@@ -605,11 +622,79 @@ impl WizardState {
                     }
                 }
                 1 => self.edit_target(p, id, &chain)?,
-                2 => self.remove_target(p, id, &chain)?,
-                3 => self.set_strategy(p, id)?,
+                2 => self.move_target(p, id, &chain, true)?,
+                3 => self.move_target(p, id, &chain, false)?,
+                4 => self.edit_peak_hours(p, id, &chain)?,
+                5 => self.remove_target(p, id, &chain)?,
+                6 => self.set_strategy(p, id)?,
                 _ => return Ok(()),
             }
         }
+    }
+
+    /// One chain entry as a menu label, shared by the sub-menu's pickers.
+    fn target_options(chain: &[(String, String)]) -> Vec<String> {
+        chain
+            .iter()
+            .enumerate()
+            .map(|(i, (prov, model))| format!("target {i} ({prov}/{model})"))
+            .collect()
+    }
+
+    /// Move one chain entry up or down by one position.
+    fn move_target(
+        &mut self,
+        p: &mut dyn Prompter,
+        id: &str,
+        chain: &[(String, String)],
+        up: bool,
+    ) -> Result<()> {
+        if chain.len() < 2 {
+            println!("  a single-target route has nothing to reorder");
+            return Ok(());
+        }
+        let opts = Self::target_options(chain);
+        let from = p.choose("Move which target?", &as_refs(&opts), 0)?;
+        let to = if up {
+            from.checked_sub(1)
+        } else if from + 1 < chain.len() {
+            Some(from + 1)
+        } else {
+            None
+        };
+        match to {
+            Some(to) => report(self.doc.move_route_target(id, from, to)),
+            None => println!(
+                "  target {from} is already {}",
+                if up { "first" } else { "last" }
+            ),
+        }
+        Ok(())
+    }
+
+    /// Set or clear one target's UTC peak windows, without the full field menu.
+    fn edit_peak_hours(
+        &mut self,
+        p: &mut dyn Prompter,
+        id: &str,
+        chain: &[(String, String)],
+    ) -> Result<()> {
+        if chain.is_empty() {
+            println!("  this route has no targets");
+            return Ok(());
+        }
+        let opts = Self::target_options(chain);
+        let index = p.choose("Peak hours for which target?", &as_refs(&opts), 0)?;
+        let raw = p.ask_default(
+            "Peak hours, UTC, comma-separated HH:MM-HH:MM (blank to clear)",
+            "",
+        )?;
+        let windows = split_peak_hours(&raw);
+        report(self.doc.set_route_target_peak_hours(id, index, &windows));
+        if windows.is_empty() {
+            println!("  peak hours cleared for target {index}");
+        }
+        Ok(())
     }
 
     fn edit_target(
@@ -618,21 +703,12 @@ impl WizardState {
         id: &str,
         chain: &[(String, String)],
     ) -> Result<()> {
-        if chain.len() < 2 {
-            println!(
-                "  this route has no extra targets to edit — target 0 is the route's own pair"
-            );
+        if chain.is_empty() {
+            println!("  this route has no targets");
             return Ok(());
         }
-        // Index 0 is target 0, which is not editable here.
-        let opts: Vec<String> = chain
-            .iter()
-            .skip(1)
-            .enumerate()
-            .map(|(i, (prov, model))| format!("target {} ({prov}/{model})", i + 1))
-            .collect();
-        let pick = p.choose("Edit which target?", &as_refs(&opts), 0)?;
-        let index = pick;
+        let opts = Self::target_options(chain);
+        let index = p.choose("Edit which target?", &as_refs(&opts), 0)?;
 
         let key = p.choose(
             "Which field?",
@@ -641,9 +717,10 @@ impl WizardState {
                 "model",
                 "display_name",
                 "context_tokens",
+                "peak_hours",
                 "Back",
             ],
-            4,
+            5,
         )?;
         match key {
             0 => {
@@ -703,6 +780,17 @@ impl WizardState {
                     }
                 }
             }
+            4 => {
+                let v = p.ask_default(
+                    "Peak hours, UTC, comma-separated HH:MM-HH:MM (blank to clear)",
+                    "",
+                )?;
+                let windows = split_peak_hours(&v);
+                report(self.doc.set_route_target_peak_hours(id, index, &windows));
+                if windows.is_empty() {
+                    println!("  cleared peak_hours");
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -715,24 +803,13 @@ impl WizardState {
         chain: &[(String, String)],
     ) -> Result<()> {
         if chain.len() < 2 {
-            println!(
-                "  this route has no extra targets to remove — target 0 is the route's own pair"
-            );
+            println!("  this route has one target; a route needs at least one — edit it instead");
             return Ok(());
         }
-        let opts: Vec<String> = chain
-            .iter()
-            .skip(1)
-            .enumerate()
-            .map(|(i, (prov, model))| format!("target {} ({prov}/{model})", i + 1))
-            .collect();
-        let pick = p.choose("Remove which target?", &as_refs(&opts), 0)?;
-        let index = pick;
-        let (prov, model) = &chain[index + 1];
-        if !p.confirm_default(
-            &format!("Remove target {} ({prov}/{model})?", index + 1),
-            false,
-        )? {
+        let opts = Self::target_options(chain);
+        let index = p.choose("Remove which target?", &as_refs(&opts), 0)?;
+        let (prov, model) = &chain[index];
+        if !p.confirm_default(&format!("Remove target {index} ({prov}/{model})?"), false)? {
             println!("  kept");
             return Ok(());
         }
@@ -765,8 +842,8 @@ impl WizardState {
         let field = p.choose(
             "Which field?",
             &[
-                "model",
-                "provider",
+                "model (target 0)",
+                "provider (target 0)",
                 "family",
                 "display_name",
                 "max_tokens",
@@ -780,7 +857,10 @@ impl WizardState {
         match field {
             0 => {
                 let v = p.ask("Upstream model id")?;
-                report(self.doc.set_route_scalar(&id, "model", v.as_str()));
+                report(
+                    self.doc
+                        .set_route_target_scalar(&id, 0, "model", v.as_str()),
+                );
             }
             1 => {
                 let providers = self.doc.provider_ids();
@@ -790,7 +870,10 @@ impl WizardState {
                 }
                 let pidx = p.choose("Upstream provider?", &as_refs(&providers), 0)?;
                 let v = providers[pidx].clone();
-                report(self.doc.set_route_scalar(&id, "provider", v.as_str()));
+                report(
+                    self.doc
+                        .set_route_target_scalar(&id, 0, "provider", v.as_str()),
+                );
             }
             2 => {
                 let fam = p.choose(
@@ -1190,7 +1273,7 @@ fn validate_now(state: &WizardState, _p: &mut dyn Prompter) -> Result<()> {
 /// the old file or the new one, never a truncated one. The rename changes the
 /// inode, which breaks hardlinks and an editor holding the file open; crash
 /// safety is worth more, and `docs/` promises neither.
-fn write_atomic(path: &Path, body: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, body: &str) -> Result<()> {
     use std::io::Write;
 
     let parent = path
@@ -1204,15 +1287,132 @@ fn write_atomic(path: &Path, body: &str) -> Result<()> {
     let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
 
     {
-        let mut file =
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        // Create with the replaced file's mode, so the bytes are never
+        // world-readable even for the instant between create and rename.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(path) {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            opts.mode(meta.permissions().mode());
+        }
+        let mut file = opts
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
         file.write_all(body.as_bytes())?;
         file.sync_all()?;
     }
+    // Belt: also covers the case where the temp already existed with other
+    // permissions.
+    copy_mode(path, &tmp);
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         anyhow::anyhow!("installing {}: {e}", path.display())
     })
+}
+
+/// Copy `from`'s permission bits onto `to`, when `from` exists.
+///
+/// Best-effort on purpose: a mode we cannot copy is not a reason to refuse a
+/// write that matters more.
+#[cfg(unix)]
+fn copy_mode(from: &Path, to: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(from) {
+        let _ = std::fs::set_permissions(
+            to,
+            std::fs::Permissions::from_mode(meta.permissions().mode()),
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn copy_mode(_from: &Path, _to: &Path) {}
+
+/// Rewrite a legacy-shaped config file in place, once, at gateway startup.
+///
+/// Read-compat lives in the parser, so nothing *needs* this to serve; it is the
+/// shape change the file itself gets. Every failure is a warning, not an error:
+/// a read-only or unparsable file keeps serving the legacy shape in memory.
+///
+/// The path is canonicalized first so a symlinked config stays a symlink — the
+/// atomic rename would otherwise replace the link with a regular file. The
+/// backup is a sibling `<config>.bak` carrying the original bytes and the
+/// original mode, because it may hold inline keys.
+pub(crate) fn migrate_config_file(path: &Path) -> bool {
+    let Ok(real) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(&real) else {
+        return false;
+    };
+    let Ok(mut doc) = edit::Doc::parse(&raw) else {
+        return false;
+    };
+    if !doc.has_legacy_routes() {
+        return false;
+    }
+    match doc.migrate_legacy_routes() {
+        Ok(false) => return false,
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(config = %real.display(), "not migrating the config: {e:#}");
+            return false;
+        }
+    }
+
+    let backup = real.with_extension("toml.bak");
+    if let Err(e) = write_private(&backup, raw.as_bytes()) {
+        tracing::warn!(
+            config = %real.display(),
+            "not migrating the config: writing {}: {e}",
+            backup.display()
+        );
+        return false;
+    }
+    copy_mode(&real, &backup);
+    if let Err(e) = write_atomic(&real, &doc.as_str()) {
+        tracing::warn!(config = %real.display(), "not migrating the config: {e:#}");
+        return false;
+    }
+    tracing::info!(
+        config = %real.display(),
+        backup = %backup.display(),
+        "migrated the config to the [[routes.<id>.target]] shape"
+    );
+    true
+}
+
+/// Write `bytes` to `path`, creating it 0600 first and letting `copy_mode`
+/// widen it afterwards.
+///
+/// The backup is a config and may hold inline keys, so it must never exist
+/// world-readable — not even for the instant between a create and a chmod,
+/// which is what `std::fs::write` + `set_permissions` leaves open.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// Split a comma-separated peak-hours answer into window strings.
+///
+/// Syntax is validated where the document is written, so one bad window names
+/// itself instead of being silently dropped here.
+fn split_peak_hours(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// `&[String]` as `&[&str]`, for `choose`'s option list.
@@ -1647,6 +1847,7 @@ base_url = "https://opencode.ai/zen"
                     model: "deepseek-v4-flash".into(),
                     display_name: None,
                     context_tokens: None,
+                    peak_hours: Vec::new(),
                 },
             )
             .unwrap();
@@ -1664,8 +1865,8 @@ base_url = "https://opencode.ai/zen"
     fn targets_menu_add_writes_a_block() {
         let mut state = target_state();
         // Add (0) -> provider menu (1-based, so "2" is `zen-go`) -> model ->
-        // display name -> context_tokens -> Back (5).
-        let mut p = ScriptedPrompt::new(&["1", "2", "deepseek-v4-flash", "", "", "5"]);
+        // display name -> context_tokens -> peak hours -> Back (8).
+        let mut p = ScriptedPrompt::new(&["1", "2", "deepseek-v4-flash", "", "", "", "8"]);
         state.targets_menu(&mut p, "claude-sonnet-5").unwrap();
 
         let written = state.doc.as_str();
@@ -1698,6 +1899,7 @@ base_url = "https://opencode.ai/zen"
                     model: "deepseek-v4-flash".into(),
                     display_name: None,
                     context_tokens: None,
+                    peak_hours: Vec::new(),
                 },
             )
             .unwrap();
@@ -1736,7 +1938,7 @@ base_url = "https://opencode.ai/zen"
         let path = temp_path("commit-target");
         let mut state = target_state();
 
-        let mut p = ScriptedPrompt::new(&["1", "2", "deepseek-v4-flash", "", "", "5"]);
+        let mut p = ScriptedPrompt::new(&["1", "2", "deepseek-v4-flash", "", "", "", "8"]);
         state.targets_menu(&mut p, "claude-sonnet-5").unwrap();
         let mut p = ScriptedPrompt::new(&["3"]); // failover
         state.set_strategy(&mut p, "claude-sonnet-5").unwrap();
@@ -1774,6 +1976,7 @@ base_url = "https://opencode.ai/zen"
                     model: "deepseek-v4-flash".into(),
                     display_name: None,
                     context_tokens: None,
+                    peak_hours: Vec::new(),
                 },
             )
             .unwrap();
@@ -1782,18 +1985,22 @@ base_url = "https://opencode.ai/zen"
             .set_route_scalar("claude-sonnet-5", "strategy", "failover")
             .unwrap();
 
-        // `remove_target` asks twice: which target (the list skips target 0, so
-        // "1" is its only row) and then a confirm, which defaults to no.
-        let mut p = ScriptedPrompt::new(&["1", "y"]);
+        // `remove_target` asks twice: which target (every chain entry is listed,
+        // so "2" is chain position 1 — the one added above) and then a confirm,
+        // which defaults to no.
+        let mut p = ScriptedPrompt::new(&["2", "y"]);
         let chain = state.doc.route_targets("claude-sonnet-5");
         state
             .remove_target(&mut p, "claude-sonnet-5", &chain)
             .unwrap();
 
         let written = state.doc.as_str();
-        assert!(
-            !written.contains("[[routes.\"claude-sonnet-5\".target]]"),
-            "the target block survived:\n{written}"
+        assert_eq!(
+            written
+                .matches("[[routes.\"claude-sonnet-5\".target]]")
+                .count(),
+            1,
+            "the primary block must survive:\n{written}"
         );
         let cfg = crate::config::load_from_str(&written).unwrap();
         let r = cfg.routes.get("claude-sonnet-5").unwrap();

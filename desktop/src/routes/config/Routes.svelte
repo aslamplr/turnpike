@@ -7,17 +7,17 @@
   /// Two rules that come straight from the wizard and are reproduced, not
   /// re-derived:
   ///
-  /// 1. **Target 0 is the route's flat `provider`/`model`** and is edited as a
-  ///    route scalar, never as a target. The chain renders it first, labelled,
-  ///    with no remove button — removing it is "edit the route", not "remove a
-  ///    target", and there is no `target` array entry behind it to remove.
+  /// 1. **Every model is a `[[routes.<id>.target]]` block**, so a chain index is
+  ///    also the `target` array index — including 0. The first entry is the
+  ///    route's primary; there is no route-level `provider`/`model` to edit.
   /// 2. **A non-`static` strategy is only offered at 2+ targets.** The CLI
   ///    refuses that combination with a message; the UI must not be able to ask
   ///    for it in the first place, so the options are `disabled`, not rejected
   ///    after the fact.
   ///
-  /// Target array indices: the chain shows index *i*+1 for the target at array
-  /// index *i*, which is exactly what `add-target`/`remove-target` expect.
+  /// Target indices: the chain shows index *i* for the target at array index
+  /// *i*, which is exactly what `move-target`/`remove-target`/`set-peak-hours`
+  /// expect.
   let {
     routes,
     providers,
@@ -29,6 +29,8 @@
     onStrategy,
     onAddTarget,
     onRemoveTarget,
+    onMoveTarget,
+    onPeakHours,
     error,
   }: {
     routes: RouteView[];
@@ -47,10 +49,12 @@
     onStrategy: (id: string, strategy: string) => Promise<boolean>;
     onAddTarget: (id: string, args: Record<string, unknown>) => Promise<boolean>;
     onRemoveTarget: (id: string, index: number) => Promise<boolean>;
+    onMoveTarget: (id: string, from: number, to: number) => Promise<boolean>;
+    onPeakHours: (id: string, index: number, windows: string[]) => Promise<boolean>;
     error: string | null;
   } = $props();
 
-  const STRATEGIES = ["static", "load-balance", "failover"] as const;
+  const STRATEGIES = ["static", "load-balance", "failover", "peak-hours"] as const;
 
   let adding = $state(false);
   let newId = $state("");
@@ -61,6 +65,11 @@
   let targetFor = $state<string | null>(null);
   let tProvider = $state("");
   let tModel = $state("");
+  let tPeak = $state("");
+
+  /// Which target's peak-hours editor is open, and its draft text.
+  let peakFor = $state<{ id: string; index: number } | null>(null);
+  let peakText = $state("");
 
   /// Which route's scalars are open for editing.
   let editing = $state<string | null>(null);
@@ -117,17 +126,61 @@
     editing = null;
   }
 
+  /// Split the comma-separated peak-hours field into window strings.
+  const peakWindows = (raw: string) =>
+    raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
   function openTarget(id: string) {
     targetFor = id;
     tProvider = providers[0]?.id ?? "";
     tModel = "";
+    tPeak = "";
   }
 
   async function submitTarget(id: string) {
     if (!tProvider || !tModel.trim()) return;
-    if (!(await onAddTarget(id, { provider: tProvider, model: tModel.trim() }))) return;
+    const args: Record<string, unknown> = { provider: tProvider, model: tModel.trim() };
+    const windows = peakWindows(tPeak);
+    if (windows.length > 0) args.peak_hours = windows;
+    if (!(await onAddTarget(id, args))) return;
     tModel = "";
+    tPeak = "";
     targetFor = null;
+  }
+
+  function openPeak(id: string, index: number, current: string[]) {
+    peakFor = { id, index };
+    peakText = current.join(", ");
+  }
+
+  function closePeak() {
+    peakFor = null;
+    peakText = "";
+  }
+
+  async function submitPeak() {
+    if (!peakFor) return;
+    const ok = await onPeakHours(peakFor.id, peakFor.index, peakWindows(peakText));
+    if (!ok) return;
+    closePeak();
+  }
+
+  /// Chain edits go through these wrappers so the peak-hours editor closes on
+  /// the same success the chain actually moved on.
+  ///
+  /// The editor addresses a **position**, and a move or a removal re-points
+  /// every position after it — an editor left open across one would submit its
+  /// windows to a different target than the user opened. A refusal leaves the
+  /// chain as it was, so the editor stays open with what was typed.
+  async function moveTarget(id: string, from: number, to: number) {
+    if (await onMoveTarget(id, from, to)) closePeak();
+  }
+
+  async function removeTarget(id: string, index: number) {
+    if (await onRemoveTarget(id, index)) closePeak();
   }
 </script>
 
@@ -157,22 +210,69 @@
         <div class="chain">
           {#each r.targets as t, i (i)}
             <div class="link">
-              <span class="mark">{i === 0 ? "0" : i}</span>
+              <span class="mark">{i}</span>
               <span class="mono">{t.provider}/{t.model}</span>
               {#if t.spec}<span class="badge">{t.spec}</span>{/if}
-              {#if i === 0}
-                <span class="sub">the route's own provider/model</span>
-              {:else}
+              {#if i === 0}<span class="badge">primary</span>{/if}
+              {#each t.peak_hours as w, j (j)}<span class="badge warn">{w}</span>{/each}
+              <span class="row-actions">
+                <button
+                  class="ghost tiny"
+                  onclick={() => moveTarget(r.id, i, i - 1)}
+                  disabled={busy || i === 0}
+                  title="Move this target up"
+                >
+                  ↑
+                </button>
+                <button
+                  class="ghost tiny"
+                  onclick={() => moveTarget(r.id, i, i + 1)}
+                  disabled={busy || i === chainLen(r) - 1}
+                  title="Move this target down"
+                >
+                  ↓
+                </button>
+                <button
+                  class="ghost tiny"
+                  onclick={() => openPeak(r.id, i, t.peak_hours)}
+                  disabled={busy}
+                  title="Edit this target's peak hours"
+                >
+                  Peak hours
+                </button>
                 <button
                   class="ghost bad tiny"
-                  onclick={() => onRemoveTarget(r.id, i - 1)}
-                  disabled={busy}
+                  onclick={() => removeTarget(r.id, i)}
+                  disabled={busy || chainLen(r) < 2}
                   title="Remove this target"
                 >
                   Remove
                 </button>
-              {/if}
+              </span>
             </div>
+            {#if peakFor?.id === r.id && peakFor?.index === i}
+              <div class="edit">
+                <div class="edit-fields">
+                  <label for="pk-{r.id}-{i}">peak hours (UTC)</label>
+                  <input
+                    id="pk-{r.id}-{i}"
+                    bind:value={peakText}
+                    placeholder="01:00-04:00, 06:00-10:00"
+                    disabled={busy}
+                    {...noAutofill}
+                  />
+                </div>
+                <div class="sub">
+                  Comma-separated HH:MM-HH:MM windows in which this target is
+                  pricey; empty means always available. Only the peak-hours
+                  strategy consults them.
+                </div>
+                <div class="actions">
+                  <button onclick={submitPeak} disabled={busy}>Save</button>
+                  <button class="ghost" onclick={closePeak} disabled={busy}>Cancel</button>
+                </div>
+              </div>
+            {/if}
           {/each}
         </div>
 
@@ -244,6 +344,14 @@
                 id="tm-{r.id}"
                 bind:value={tModel}
                 placeholder="claude-opus-4-5"
+                disabled={busy}
+                {...noAutofill}
+              />
+              <label for="tph-{r.id}">peak hours (UTC)</label>
+              <input
+                id="tph-{r.id}"
+                bind:value={tPeak}
+                placeholder="01:00-04:00 (optional)"
                 disabled={busy}
                 {...noAutofill}
               />
@@ -353,6 +461,12 @@
   .tiny {
     font-size: 11px;
     padding: 2px 6px;
+  }
+  .row-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
   }
   .refusal {
     color: var(--bad, #b4453c);

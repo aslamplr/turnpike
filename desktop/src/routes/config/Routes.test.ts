@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/svelte";
+import { render, screen, waitFor } from "@testing-library/svelte";
 import { userEvent } from "@testing-library/user-event";
 import Routes from "./Routes.svelte";
 import type { ProviderView, RouteView } from "../../lib/types";
@@ -10,9 +10,9 @@ import type { ProviderView, RouteView } from "../../lib/types";
 /// 1. A non-`static` strategy is *disabled* below two targets, because the CLI
 ///    refuses that combination — the window must not be able to ask for a state
 ///    the writer rejects.
-/// 2. The chain shows target 0 first with no remove button (it is the route's
-///    flat `provider`/`model`, not an array entry), and every later link's
-///    remove button sends array index `i - 1`, not `i`.
+/// 2. **A chain index is the `target` array index, target 0 included.** Every
+///    link can be removed (down to one), and every op — move, remove, peak
+///    hours — sends `i`, never `i - 1`.
 
 const provider = (id: string): ProviderView => ({
   id,
@@ -35,6 +35,7 @@ const route = (over: Partial<RouteView> = {}): RouteView => ({
       model: "claude-sonnet-4-5",
       display_name: null,
       context_tokens: null,
+      peak_hours: [],
       spec: null,
     },
   ],
@@ -96,6 +97,7 @@ describe("Routes — the strategy gate", () => {
     expect(options.find((o) => o.value === "static")?.disabled).toBe(false);
     expect(options.find((o) => o.value === "load-balance")?.disabled).toBe(true);
     expect(options.find((o) => o.value === "failover")?.disabled).toBe(true);
+    expect(options.find((o) => o.value === "peak-hours")?.disabled).toBe(true);
     // The disabled reason is rendered, not just implied.
     expect(options.find((o) => o.value === "failover")?.textContent).toContain(
       "needs 2+ targets",
@@ -105,8 +107,8 @@ describe("Routes — the strategy gate", () => {
   it("enables them once a second target exists", () => {
     const two = route({
       targets: [
-        { provider: "zen", model: "claude-sonnet-4-5", display_name: null, context_tokens: null, spec: null },
-        { provider: "zen-go", model: "kimi-k2", display_name: null, context_tokens: null, spec: null },
+        { provider: "zen", model: "claude-sonnet-4-5", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen-go", model: "kimi-k2", display_name: null, context_tokens: null, peak_hours: [], spec: null },
       ],
     });
     mount([two]);
@@ -130,21 +132,22 @@ describe("Routes — the strategy gate", () => {
 });
 
 describe("Routes — the target chain", () => {
-  it("renders target 0 as the route's own provider/model with no remove button", () => {
+  it("marks target 0 as the primary and still offers Remove", () => {
     mount([route()]);
     expect(screen.getByText("zen/claude-sonnet-4-5")).toBeInTheDocument();
-    expect(screen.getByText("the route's own provider/model")).toBeInTheDocument();
-    // Nothing to remove behind target 0, so there is no Remove control.
-    expect(screen.queryByTitle("Remove this target")).not.toBeInTheDocument();
+    expect(screen.getByText("primary")).toBeInTheDocument();
+    // Every chain entry is a real array block now, so target 0 has a Remove
+    // button too — disabled only because this route still has one target.
+    expect(screen.getByTitle("Remove this target")).toBeDisabled();
   });
 
-  it("sends array index i-1 for the target at chain position i", async () => {
+  it("sends the chain index for each target's remove button", async () => {
     const seen: Array<[string, number]> = [];
     const three = route({
       targets: [
-        { provider: "zen", model: "a", display_name: null, context_tokens: null, spec: null },
-        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, spec: null },
-        { provider: "zen", model: "c", display_name: null, context_tokens: null, spec: null },
+        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen", model: "c", display_name: null, context_tokens: null, peak_hours: [], spec: null },
       ],
     });
     mount([three], {
@@ -153,20 +156,131 @@ describe("Routes — the target chain", () => {
       },
     });
 
-    // Three links: target 0 has no button, positions 1 and 2 do.
+    // Every link is an array entry now — all three carry a Remove button.
     const removes = screen.getAllByTitle("Remove this target");
-    expect(removes).toHaveLength(2);
+    expect(removes).toHaveLength(3);
 
-    // The *first* remove button is chain position 1 → array index 0. Getting
-    // this wrong shifts every removal and takes out the wrong upstream.
+    // The chain index *is* the array index. Getting this wrong removes the
+    // wrong upstream.
     await userEvent.click(removes[0]);
     expect(seen).toEqual([["claude-sonnet-5", 0]]);
 
-    await userEvent.click(removes[1]);
+    await userEvent.click(removes[2]);
     expect(seen).toEqual([
       ["claude-sonnet-5", 0],
-      ["claude-sonnet-5", 1],
+      ["claude-sonnet-5", 2],
     ]);
+  });
+
+  it("moves a target and disables the edge directions", async () => {
+    const seen: Array<[string, number, number]> = [];
+    const three = route({
+      targets: [
+        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen", model: "c", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+      ],
+    });
+    mount([three], {
+      onMoveTarget: async (id: string, from: number, to: number) => {
+        seen.push([id, from, to]);
+        return true;
+      },
+    });
+
+    const ups = screen.getAllByTitle("Move this target up");
+    const downs = screen.getAllByTitle("Move this target down");
+    expect(ups).toHaveLength(3);
+    // The edges cannot move further out.
+    expect(ups[0]).toBeDisabled();
+    expect(downs[2]).toBeDisabled();
+
+    await userEvent.click(downs[0]);
+    expect(seen).toEqual([["claude-sonnet-5", 0, 1]]);
+
+    await userEvent.click(ups[2]);
+    expect(seen).toEqual([
+      ["claude-sonnet-5", 0, 1],
+      ["claude-sonnet-5", 2, 1],
+    ]);
+  });
+
+  it("edits a target's peak hours", async () => {
+    const seen: Array<[string, number, string[]]> = [];
+    const withPeak = route({
+      targets: [
+        {
+          provider: "zen",
+          model: "claude-sonnet-4-5",
+          display_name: null,
+          context_tokens: null,
+          peak_hours: ["01:00-04:00"],
+          spec: null,
+        },
+      ],
+    });
+    mount([withPeak], {
+      onPeakHours: async (id: string, index: number, windows: string[]) => {
+        seen.push([id, index, windows]);
+        return true;
+      },
+    });
+
+    expect(screen.getByText("01:00-04:00")).toBeInTheDocument();
+    await userEvent.click(screen.getByText("Peak hours"));
+
+    const input = screen.getByLabelText("peak hours (UTC)");
+    expect(input).toHaveValue("01:00-04:00");
+    await userEvent.clear(input);
+    await userEvent.type(input, "22:00-02:00, 06:00-10:00");
+    await userEvent.click(screen.getByText("Save"));
+
+    expect(seen).toEqual([
+      ["claude-sonnet-5", 0, ["22:00-02:00", "06:00-10:00"]],
+    ]);
+  });
+
+  it("closes an open peak editor when a move renumbers the chain", async () => {
+    // The editor addresses a position, and a move re-points every position after
+    // it — leaving it open would submit the windows to a different target.
+    const two = route({
+      targets: [
+        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+      ],
+    });
+    mount([two], {
+      onMoveTarget: async () => true,
+      onPeakHours: async () => true,
+    });
+
+    await userEvent.click(screen.getAllByText("Peak hours")[0]);
+    expect(screen.getByLabelText("peak hours (UTC)")).toBeInTheDocument();
+
+    await userEvent.click(screen.getAllByTitle("Move this target down")[0]);
+    await waitFor(() =>
+      expect(screen.queryByLabelText("peak hours (UTC)")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("keeps the peak editor open when the chain edit is refused", async () => {
+    // A refusal changed nothing, so the index still addresses the same target
+    // and the draft the user typed is still theirs to submit.
+    const two = route({
+      targets: [
+        { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+        { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+      ],
+    });
+    mount([two], {
+      onRemoveTarget: async () => false,
+      onPeakHours: async () => true,
+    });
+
+    await userEvent.click(screen.getAllByText("Peak hours")[0]);
+    await userEvent.click(screen.getAllByTitle("Remove this target")[0]);
+
+    expect(screen.getByLabelText("peak hours (UTC)")).toBeInTheDocument();
   });
 
   it("renders exactly the targets it is handed, synthesizing nothing", () => {

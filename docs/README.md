@@ -11,11 +11,11 @@ disagree, the doc is wrong.
 | [configuration.md](configuration.md) | Full config reference: `[server]`, `[providers.*]`, `[routes.*]`, `[search]`; resolution rules; defaults |
 | [gateway.md](gateway.md) | The proxy: HTTP surface, forwarding pipeline, model remapping, security posture, error shapes |
 | [anthropic-compat.md](anthropic-compat.md) | The Anthropic API as an outside client sees it: what the compatibility probe asserts, the divergences it once recorded and how each was closed, and how to re-run it |
-| [routing.md](routing.md) | Per-route targets: the `[[…target]]` array, `static` / `load-balance` / `failover`, what is retryable, the context-window order |
+| [routing.md](routing.md) | Per-route targets: the `[[…target]]` array, `static` / `load-balance` / `failover` / `peak-hours`, what is retryable, the context-window order |
 | [bridge.md](bridge.md) | The Anthropic ↔ OpenAI spec bridge: request, response, and streaming translation |
 | [search.md](search.md) | Agentic search middleware: `SearchProvider` trait, Exa, SearXNG, the closed-loop mechanics |
 | [secrets.md](secrets.md) | The encrypted key store: layout, crypto, the precedence chain, what it does and does not protect |
-| [setup-and-doctor.md](setup-and-doctor.md) | `turnpike setup` (the wizard, comment preservation, the migration invariant), `turnpike config` (the redacted view), and `turnpike doctor` (the 27 checks, `--json`), plus the stdout/stderr prompt discipline |
+| [setup-and-doctor.md](setup-and-doctor.md) | `turnpike setup` (the wizard, comment preservation, the migration invariant), `turnpike config` (the redacted view), and `turnpike doctor` (the 29 checks, `--json`), plus the stdout/stderr prompt discipline |
 | [launchers.md](launchers.md) | `turnpike launch`: Claude Code env vars, Claude Desktop gateway profile, model resolution |
 | [desktop.md](desktop.md) | The desktop shell: the supervisor state machine over `turnpike serve`, the tray, autostart, the settings window that edits the config, the CLI it bundles and installs to `PATH`, the auto-updater, and the release pipeline |
 

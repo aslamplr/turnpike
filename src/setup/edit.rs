@@ -151,23 +151,30 @@ api_key = "or-key"
 # ---- routes ----------------------------------------------------------------
 
 [routes."claude-sonnet-5"]
+family = "sonnet"
+
+[[routes."claude-sonnet-5".target]]
 provider = "zen"
 model = "claude-sonnet-4-5"
-family = "sonnet"
 
 # A commented-out example, kept commented.
 # [routes."claude-haiku-4-5"]
+# family = "haiku"
+#
+# [[routes."claude-haiku-4-5".target]]
 # provider = "zen"
 # model = "claude-haiku-4-5"
-# family = "haiku"
 
 [routes."claude-opus-5"]
-provider = "zen"
-model = "claude-opus-4-1"
 family = "opus"
 context_tokens = 200000
 
-[routes.fast]
+[[routes."claude-opus-5".target]]
+provider = "zen"
+model = "claude-opus-4-1"
+context_tokens = 200000
+
+[[routes.fast.target]]
 provider = "zen-go"
 model = "grok-code-fast-1"
 
@@ -508,8 +515,6 @@ base_url = "http://localhost:8888"
         }
 
         let mut t = Table::new();
-        t["provider"] = toml_edit::value(route.provider.as_str());
-        t["model"] = toml_edit::value(route.model.as_str());
         if let Some(v) = &route.display_name {
             t["display_name"] = toml_edit::value(v.as_str());
         }
@@ -519,9 +524,19 @@ base_url = "http://localhost:8888"
         if let Some(v) = route.max_tokens {
             t["max_tokens"] = toml_edit::value(v as i64);
         }
+        // The upstream pair is the route's first target, not a route-level key:
+        // every model is a `[[routes.<id>.target]]` block. `context_tokens`
+        // goes on the target and **only** there — a second copy at route level
+        // would shadow every later edit of the target's window.
+        let mut first = Table::new();
+        first["provider"] = toml_edit::value(route.provider.as_str());
+        first["model"] = toml_edit::value(route.model.as_str());
         if let Some(v) = route.context_tokens {
-            t["context_tokens"] = toml_edit::value(v as i64);
+            first["context_tokens"] = toml_edit::value(v as i64);
         }
+        let mut targets = ArrayOfTables::new();
+        targets.push(first);
+        t["target"] = Item::ArrayOfTables(targets);
         // Same reasoning as `add_provider` on both counts: the parent must exist
         // as a real table (or the new route renders as an inline `routes = { … }`
         // at the top of a document that had no routes yet), and the new table
@@ -573,10 +588,9 @@ base_url = "http://localhost:8888"
 
     /// Append one `[[routes.<id>.target]]` block.
     ///
-    /// This writes target 1..N only. **Target 0 is the route's own flat
-    /// `provider`/`model`** and is never touched here — `targets()` synthesizes
-    /// it, so writing a block for it would give the route two target 0s and
-    /// change what `resolve()` answers.
+    /// The block becomes the last entry of the route's chain. Every model is an
+    /// array item, so this is the only way a target is added — target 0 is not
+    /// a special route-level pair.
     ///
     /// Validation runs before any mutation, per `add_route`: a wizard error must
     /// leave the document byte-identical, or a failed add becomes a half-add.
@@ -599,6 +613,14 @@ base_url = "http://localhost:8888"
         }
         if let Some(v) = t.context_tokens {
             table["context_tokens"] = toml_edit::value(v as i64);
+        }
+        if !t.peak_hours.is_empty() {
+            let windows = parse_peak_hours(&t.peak_hours)?;
+            let mut arr = Array::new();
+            for w in &windows {
+                arr.push(w.to_string());
+            }
+            table["peak_hours"] = toml_edit::value(arr);
         }
 
         let routes = self
@@ -632,54 +654,93 @@ base_url = "http://localhost:8888"
         Ok(())
     }
 
-    /// Remove target 1..N by its position **in the `target` array** — so the
-    /// wizard's "target 1" is index 0 here, and target 0 is not removable
-    /// because it is not in the array.
+    /// Remove the target at chain position `index`.
+    ///
+    /// The chain index **is** the `target` array index — every model is a
+    /// `[[routes.<id>.target]]` block, target 0 included. The last remaining
+    /// target is refused: a route with no upstream is not servable, and the
+    /// document would not parse.
     ///
     /// A comment introducing a `[[…target]]` block lives in that *table's*
-    /// prefix decor, and `ArrayOfTables::remove` drops it with the block.
-    /// `comment_above` cannot reach a target header — it is scoped to
-    /// `[routes.<id>]` and stops at the first `\n[`. That loss is accepted and
-    /// documented rather than half-fixed: the rule `remove_scalar_keeping_comment`
-    /// exists for (`api_key` is the key a user annotates by hand) does not hold
-    /// for a generated target block.
+    /// prefix decor, and `ArrayOfTables::remove` drops it with the block — the
+    /// same accepted loss `move_route_target` avoids by moving the table whole.
     pub fn remove_route_target(&mut self, id: &str, index: usize) -> Result<()> {
-        let routes = self
-            .doc
-            .get_mut("routes")
-            .and_then(|r| r.as_table_like_mut())
-            .with_context(|| format!("no [routes] section to edit for {id:?}"))?;
-        let route = routes
-            .get_mut(id)
-            .and_then(|r| r.as_table_like_mut())
-            .with_context(|| format!("no route named {id:?}"))?;
-        let aot = route
-            .get_mut("target")
-            .and_then(|i| i.as_array_of_tables_mut())
-            .with_context(|| format!("route {id:?} has no targets"))?;
-
-        if index >= aot.len() {
+        self.refuse_legacy_target_op(id)?;
+        let aot = self.target_aot_mut(id)?;
+        let len = aot.len();
+        if index >= len {
+            anyhow::bail!("route {id:?} has {len} target(s); there is no target {index}");
+        }
+        if len <= 1 {
             anyhow::bail!(
-                "route {id:?} has {} target(s); there is no target {}",
-                aot.len(),
-                index + 1
+                "route {id:?} has one target; a route needs at least one — \
+                 edit it instead of removing it"
             );
         }
         aot.remove(index);
+        Ok(())
+    }
 
-        // Emptying the array drops the key outright. A bare `target = []` is
-        // valid TOML that means the same thing, but it is a key the wizard
-        // invented and `default_config_text()` never writes, so leaving it would
-        // show up as a diff against a fresh config for no reason.
-        if aot.is_empty() {
-            route.remove("target");
+    /// Move the target at chain position `from` to position `to`.
+    ///
+    /// Both are chain indexes, and every index is a real `[[…target]]` block.
+    /// The block moves whole, so its decor — including a comment written above
+    /// its header — travels with it.
+    pub fn move_route_target(&mut self, id: &str, from: usize, to: usize) -> Result<()> {
+        self.refuse_legacy_target_op(id)?;
+        let aot = self.target_aot_mut(id)?;
+        let len = aot.len();
+        if from >= len || to >= len {
+            anyhow::bail!("route {id:?} has {len} target(s); cannot move {from} to {to}");
+        }
+        if from == to {
+            return Ok(());
+        }
+        let table = aot.remove(from);
+        aot.insert(to, table);
+        // `toml_edit` renders tables sorted by `Table::position`, *not* by the
+        // array's own order (encode.rs: `tables.sort_by_key(… position …)`), so
+        // moving the vec alone would render the document unchanged and this op
+        // would silently no-op. Clearing the positions makes each block inherit
+        // the route table's, where the encoder's stable sort keeps them in
+        // array order.
+        for t in aot.iter_mut() {
+            t.set_position(None);
         }
         Ok(())
     }
 
+    /// Replace a target's UTC peak windows. `index` is the chain index.
+    ///
+    /// Every window is parsed before anything is written — an invalid one is a
+    /// refusal that names it, and the document stays byte-identical. An empty
+    /// list removes the key: a target with no windows is always available,
+    /// which is the schema's default.
+    pub fn set_route_target_peak_hours(
+        &mut self,
+        id: &str,
+        index: usize,
+        windows: &[String],
+    ) -> Result<()> {
+        let parsed = parse_peak_hours(windows)?;
+        self.refuse_legacy_target_op(id)?;
+        // Existence first, so a bad index is an error even when the list is
+        // empty and there is nothing to remove.
+        self.target_table_mut(id, index)?;
+        if parsed.is_empty() {
+            self.remove_route_target_scalar(id, index, "peak_hours");
+            return Ok(());
+        }
+        let mut arr = Array::new();
+        for w in &parsed {
+            arr.push(w.to_string());
+        }
+        self.set_route_target_scalar(id, index, "peak_hours", arr)
+    }
+
     /// Replace one scalar inside `[[routes.<id>.target]]` entry `index`.
     ///
-    /// `index` is the **array** index, as in `remove_route_target`. This does
+    /// `index` is the chain index, as in `remove_route_target`. This does
     /// not go through `set_scalar`/`table_mut`, which walk a path of *tables*:
     /// `target` is an array of tables, so a numeric path segment does not
     /// address its entries. The lookup is spelled out here instead, and the
@@ -692,6 +753,11 @@ base_url = "http://localhost:8888"
         key: &str,
         value: impl Into<Value>,
     ) -> Result<()> {
+        // On a route the migration could not rewrite, target 0 is the route's
+        // flat pair — edit that, not the first declared block.
+        if index == 0 && self.route_is_legacy(id) {
+            return self.set_route_scalar(id, key, value);
+        }
         let entry = self.target_table_mut(id, index)?;
         let new = match entry.get_mut(key).and_then(|i| i.as_value_mut()) {
             Some(slot) => {
@@ -714,45 +780,74 @@ base_url = "http://localhost:8888"
     /// table's prefix decor, not above the individual key, so there is nothing
     /// for `comment_above` to find here.
     pub fn remove_route_target_scalar(&mut self, id: &str, index: usize, key: &str) -> bool {
+        // Same split as the write path: index 0 on a legacy route is the
+        // route-level pair.
+        if index == 0 && self.route_is_legacy(id) {
+            return self.remove_route_scalar_keeping_comment(id, key);
+        }
         self.target_table_mut(id, index)
             .ok()
             .and_then(|t| t.remove(key))
             .is_some()
     }
 
+    /// Whether this route still carries the legacy flat `provider`/`model`
+    /// pair — a route whose migration could not rewrite it (an inline table).
+    /// Target 0 then lives in route-level keys, not in `target[0]`.
+    pub fn route_is_legacy(&self, id: &str) -> bool {
+        self.doc
+            .get("routes")
+            .and_then(|r| r.as_table_like())
+            .and_then(|r| r.get(id))
+            .and_then(|r| r.as_table_like())
+            .map(|t| t.contains_key("provider") || t.contains_key("model"))
+            .unwrap_or(false)
+    }
+
+    /// Chain-index operations cannot address a legacy route's target 0 — the
+    /// value lives in route-level keys, so removing or moving "index 0" would
+    /// silently act on the first declared block instead.
+    fn refuse_legacy_target_op(&self, id: &str) -> Result<()> {
+        if self.route_is_legacy(id) {
+            anyhow::bail!(
+                "route {id:?} still uses the legacy flat `provider`/`model` shape, so its \
+                 chain cannot be reordered or shortened here — save it from `turnpike setup` \
+                 (or start `turnpike serve`) to migrate it first"
+            );
+        }
+        Ok(())
+    }
+
     /// The `index`-th `[[routes.<id>.target]]` table, or an error naming why not.
     fn target_table_mut(&mut self, id: &str, index: usize) -> Result<&mut Table> {
-        let routes = self
-            .doc
-            .get_mut("routes")
-            .and_then(|r| r.as_table_like_mut())
-            .with_context(|| format!("no [routes] section for {id:?}"))?;
-        let route = routes
-            .get_mut(id)
-            .and_then(|r| r.as_table_like_mut())
-            .with_context(|| format!("no route named {id:?}"))?;
-        let aot = route
-            .get_mut("target")
-            .and_then(|i| i.as_array_of_tables_mut())
-            .with_context(|| format!("route {id:?} has no targets"))?;
+        let aot = self.target_aot_mut(id)?;
         // Read the length before the mutable borrow: `with_context` takes a
         // closure that would otherwise capture `aot` and borrow it a second
         // time while `get_mut`'s borrow is still live.
         let len = aot.len();
         aot.get_mut(index).with_context(|| {
-            format!(
-                "route {id:?} has {len} target(s); there is no target {}",
-                index + 1
-            )
+            format!("route {id:?} has {len} target(s); there is no target {index}")
         })
     }
 
-    /// The full target chain as `provider/model` strings, target 0 first.
+    /// The route's `target` array of tables, or an error naming why not.
+    fn target_aot_mut(&mut self, id: &str) -> Result<&mut ArrayOfTables> {
+        self.doc
+            .get_mut("routes")
+            .and_then(|r| r.as_table_like_mut())
+            .with_context(|| format!("no [routes] section for {id:?}"))?
+            .get_mut(id)
+            .and_then(|r| r.as_table_like_mut())
+            .with_context(|| format!("no route named {id:?}"))?
+            .get_mut("target")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .with_context(|| format!("route {id:?} has no targets"))
+    }
+
+    /// The full target chain as `provider/model` strings, in chain order.
     ///
     /// Parsed back through the config layer rather than read out of the
-    /// document, so the list the user sees is the list the gateway will honor —
-    /// including the synthesized target 0, which exists in no `[[…target]]`
-    /// block.
+    /// document, so the list the user sees is the list the gateway will honor.
     pub fn route_targets(&self, id: &str) -> Vec<(String, String)> {
         let Ok(cfg) = crate::config::load_from_str(&self.as_str()) else {
             return Vec::new();
@@ -776,8 +871,19 @@ base_url = "http://localhost:8888"
         };
         cfg.routes
             .iter()
-            .filter(|(_, r)| r.provider == provider)
-            .map(|(id, r)| (id.clone(), r.model.clone()))
+            .filter(|(_, r)| r.targets().iter().any(|t| t.provider == provider))
+            .map(|(id, r)| {
+                // Name the model the *matching* target points at, so a route
+                // that references the provider only behind a fallback says so
+                // instead of naming its primary's model.
+                let model = r
+                    .targets()
+                    .iter()
+                    .find(|t| t.provider == provider)
+                    .map(|t| t.model.clone())
+                    .unwrap_or_else(|| r.primary().model.clone());
+                (id.clone(), model)
+            })
             .collect()
     }
 
@@ -894,32 +1000,35 @@ base_url = "http://localhost:8888"
     /// Returns `None` when there is nothing but whitespace above the key, so a
     /// removal never leaves behind a stray blank line.
     fn comment_above(&self, path: &[&str], key: &str) -> Option<String> {
-        let header = format!("[{}]", path.join("."));
         let text = self.to_string();
+        // Route headers write their id quoted (`[routes."claude-sonnet-5"]`), so
+        // a bare-joined header matches nothing for them. Try the quoted
+        // spelling first, then the bare one (`[providers.zen]`).
+        let mut headers = Vec::new();
+        if path.len() == 2 {
+            headers.push(format!("[{}.{:?}]", path[0], path[1]));
+        }
+        headers.push(format!("[{}]", path.join(".")));
         // Scope to this table's block: `api_key` also exists under `[search]`,
         // and last-key-wins search would otherwise grab the wrong neighbour.
-        let block = text.split(&header).nth(1)?;
+        //
+        // A header must start its own line: the starter and the fixtures ship
+        // commented-out examples (`# [routes."x"]`), and a plain substring
+        // match would land on one of those and read a block that is not this
+        // table's.
+        let start = headers.iter().find_map(|h| {
+            let needle = format!("\n{h}");
+            text.find(&needle)
+                .map(|i| i + 1)
+                .or_else(|| text.starts_with(h.as_str()).then_some(0))
+        })?;
+        let block = &text[start..];
         let end = block.find("\n[").unwrap_or(block.len());
         let block = &block[..end];
 
         // Walk backwards from the key's own line over comment lines, stopping
         // at the first line that is neither a comment nor blank.
         let mut lines: Vec<&str> = Vec::new();
-        let mut seen_key = false;
-        for line in block.lines() {
-            let t = line.trim_start();
-            if !seen_key {
-                if t.starts_with(&format!("{key} ")) || t.starts_with(&format!("{key}=")) {
-                    seen_key = true;
-                }
-                continue;
-            }
-            break;
-        }
-        if !seen_key {
-            return None;
-        }
-
         let body: Vec<&str> = block.lines().collect();
         let key_line = body.iter().position(|l| {
             let t = l.trim_start();
@@ -940,6 +1049,89 @@ base_url = "http://localhost:8888"
         }
         lines.reverse();
         Some(format!("{}\n", lines.join("\n")))
+    }
+
+    /// Whether any route still carries the legacy flat `provider`/`model` keys
+    /// — i.e. whether this document needs the array-only migration.
+    pub fn has_legacy_routes(&self) -> bool {
+        !self.legacy_route_ids().is_empty()
+    }
+
+    /// Rewrite every legacy route into the array-only shape, in place.
+    ///
+    /// One `[[routes.<id>.target]]` block is created per legacy route and the
+    /// flat `provider`/`model`/`context_tokens` keys **move** into it, so a
+    /// comment written above any of them travels with it. `display_name` is
+    /// deliberately not copied: it is the route's catalog label, and a second
+    /// copy would drift the moment it is edited.
+    ///
+    /// Returns whether anything changed. The proof that a migration worked is
+    /// that the rendered document still parses into a [`crate::config::Config`]
+    /// — not that it validates, because an invalid-but-legacy file must still
+    /// normalize.
+    pub fn migrate_legacy_routes(&mut self) -> Result<bool> {
+        let ids = self.legacy_route_ids();
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        // Work on a copy: a failure halfway through must leave the original
+        // bytes untouched, or a refused save becomes a half-migration.
+        let mut next = Doc::parse(&self.to_string())?;
+        for id in &ids {
+            next.migrate_one_route(id)?;
+        }
+        toml::from_str::<crate::config::Config>(&next.to_string())
+            .context("the migrated document does not parse as a config")?;
+        *self = next;
+        Ok(true)
+    }
+
+    fn legacy_route_ids(&self) -> Vec<String> {
+        let Some(routes) = self.doc.get("routes").and_then(|r| r.as_table_like()) else {
+            return Vec::new();
+        };
+        routes
+            .iter()
+            .filter(|(_, item)| {
+                item.as_table_like()
+                    .map(|t| t.contains_key("provider") || t.contains_key("model"))
+                    .unwrap_or(false)
+            })
+            .map(|(id, _)| id.to_string())
+            .collect()
+    }
+
+    fn migrate_one_route(&mut self, id: &str) -> Result<()> {
+        let route = self
+            .doc
+            .get_mut("routes")
+            .and_then(|r| r.as_table_mut())
+            .and_then(|r| r.get_mut(id))
+            .and_then(|r| r.as_table_mut())
+            .with_context(|| format!("route {id:?} is not a table"))?;
+
+        let mut target = Table::new();
+        for key in ["provider", "model"] {
+            if let Some((k, item)) = route.remove_entry(key) {
+                target.insert_formatted(&k, item);
+            }
+        }
+        // `context_tokens` moves too, not copies: leaving it at route level
+        // would shadow every later edit of target 0's window. The value is the
+        // same either way — `effective_context_tokens` falls back to the
+        // primary for a static route and takes the chain minimum otherwise.
+        if let Some((k, item)) = route.remove_entry("context_tokens") {
+            target.insert_formatted(&k, item);
+        }
+        if route.get("target").is_none() {
+            route.insert("target", Item::ArrayOfTables(ArrayOfTables::new()));
+        }
+        let aot = route
+            .get_mut("target")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .with_context(|| format!("route {id:?} has a non-array `target` key"))?;
+        aot.insert(0, target);
+        Ok(())
     }
 
     /// Walk to `<path[0]>.<path[1]>…`, creating nothing.
@@ -987,12 +1179,27 @@ pub struct TargetDraft {
     pub model: String,
     pub display_name: Option<String>,
     pub context_tokens: Option<u64>,
+    /// UTC peak windows, `HH:MM-HH:MM`, validated when the block is written.
+    /// Empty omits the key.
+    pub peak_hours: Vec<String>,
 }
 
 /// The `strategy` values, in the order the wizard offers them. Kebab-case to
 /// match the config file (`Strategy`'s serde rename), unlike the snake_case
 /// config *keys* around them.
-pub const STRATEGIES: [&str; 3] = ["static", "load-balance", "failover"];
+pub const STRATEGIES: [&str; 4] = ["static", "load-balance", "failover", "peak-hours"];
+
+/// Parse the raw peak-window strings a caller supplies, naming the offender on
+/// failure. One home, so the wizard, the CLI op, and `add-target` cannot accept
+/// different syntax.
+fn parse_peak_hours(raw: &[String]) -> Result<Vec<crate::config::PeakWindow>> {
+    raw.iter()
+        .map(|s| {
+            s.parse::<crate::config::PeakWindow>()
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        })
+        .collect()
+}
 
 /// Search defaults, so `setup` can write a `[search]` block that `doctor` and
 /// `SearchManager::from_config` both accept.
@@ -1056,23 +1263,30 @@ api_key = "or-key"
 # ---- routes ----------------------------------------------------------------
 
 [routes."claude-sonnet-5"]
+family = "sonnet"
+
+[[routes."claude-sonnet-5".target]]
 provider = "zen"
 model = "claude-sonnet-4-5"
-family = "sonnet"
 
 # A commented-out example, kept commented.
 # [routes."claude-haiku-4-5"]
+# family = "haiku"
+#
+# [[routes."claude-haiku-4-5".target]]
 # provider = "zen"
 # model = "claude-haiku-4-5"
-# family = "haiku"
 
 [routes."claude-opus-5"]
-provider = "zen"
-model = "claude-opus-4-1"
 family = "opus"
 context_tokens = 200000
 
-[routes.fast]
+[[routes."claude-opus-5".target]]
+provider = "zen"
+model = "claude-opus-4-1"
+context_tokens = 200000
+
+[[routes.fast.target]]
 provider = "zen-go"
 model = "grok-code-fast-1"
 
@@ -1303,7 +1517,7 @@ base_url = "http://localhost:8888"
 
         let cfg = doc.validated().unwrap();
         let r = &cfg.routes["fast-new"];
-        assert_eq!(r.provider, "zen");
+        assert_eq!(r.primary().provider, "zen");
         assert_eq!(r.family.as_deref(), Some("haiku"));
         assert_eq!(r.max_tokens, None);
     }
@@ -1501,20 +1715,32 @@ base_url = "http://localhost:8888"
             model: model.to_string(),
             display_name: None,
             context_tokens: None,
+            peak_hours: Vec::new(),
         }
     }
 
-    /// A route with no `[[…target]]` yet: the array is created on first use
-    /// rather than requiring an existing key.
+    /// A legacy-shaped document (flat pair, no array) has no `target` key: the
+    /// array is created on first use rather than requiring the migration to
+    /// have run first.
     #[test]
     fn add_target_creates_the_aot_when_absent() {
-        let mut doc = fixture();
+        let mut doc = Doc::parse(
+            r#"[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "claude-sonnet-4-5"
+"#,
+        )
+        .unwrap();
         assert!(
             !doc.as_str().contains(".target]]"),
-            "fixture should have no target blocks"
+            "this document should have no target blocks"
         );
 
-        doc.add_route_target("claude-sonnet-5", &draft("zen", "claude-sonnet-4-5"))
+        doc.add_route_target("claude-sonnet-5", &draft("zen", "secondary"))
             .unwrap();
 
         let out = doc.as_str();
@@ -1528,17 +1754,16 @@ base_url = "http://localhost:8888"
             "route key lost its quotes"
         );
 
-        // And the config layer sees it as target 1, behind the flat pair.
+        // The config layer sees the flat pair first, then the new block.
         let cfg = doc.validated().unwrap();
-        let r = &cfg.routes["claude-sonnet-5"];
-        let targets = r.targets();
+        let targets = cfg.routes["claude-sonnet-5"].targets();
         assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].provider, "zen");
-        assert_eq!(targets[1].provider, "zen");
-        assert_eq!(targets[1].model, "claude-sonnet-4-5");
+        assert_eq!(targets[0].model, "claude-sonnet-4-5");
+        assert_eq!(targets[1].model, "secondary");
     }
 
-    /// A second target appends to the existing array instead of clobbering it.
+    /// A second target appends behind the existing blocks instead of
+    /// clobbering them.
     #[test]
     fn add_target_appends_to_an_existing_aot() {
         let mut doc = fixture();
@@ -1550,14 +1775,14 @@ base_url = "http://localhost:8888"
         let out = doc.as_str();
         assert_eq!(
             out.matches("[[routes.\"claude-sonnet-5\".target]]").count(),
-            2,
-            "expected two headers:\n{out}"
+            3,
+            "expected three headers (the fixture's plus two):\n{out}"
         );
 
         let cfg = doc.validated().unwrap();
         let targets = cfg.routes["claude-sonnet-5"].targets();
         assert_eq!(targets.len(), 3);
-        // Order is declaration order: flat pair, then first, then second.
+        // Order is declaration order: the fixture's block, then first, second.
         assert_eq!(targets[1].model, "first");
         assert_eq!(targets[2].model, "second");
     }
@@ -1612,31 +1837,25 @@ base_url = "http://localhost:8888"
         assert_eq!(targets[1].model, "second");
     }
 
-    /// Removing the last one drops the `target` key outright: a bare
-    /// `target = []` is valid but is a key the wizard invented, and it would
-    /// show as a diff against a freshly written config.
+    /// The last remaining target cannot be removed: a route with no upstream is
+    /// not servable, and the document would not parse.
     #[test]
-    fn remove_last_target_drops_the_key() {
+    fn removing_the_last_target_is_refused() {
         let mut doc = fixture();
-        doc.add_route_target("claude-sonnet-5", &draft("zen", "only"))
-            .unwrap();
-        doc.remove_route_target("claude-sonnet-5", 0).unwrap();
-
-        let out = doc.as_str();
-        assert!(!out.contains(".target]]"), "target header survived:\n{out}");
-        assert!(!out.contains("target = []"), "left a bare array:\n{out}");
-        assert!(!out.contains("target ="), "left a target key:\n{out}");
-
-        // And the route still resolves to exactly its flat pair.
-        let cfg = doc.validated().unwrap();
-        assert_eq!(cfg.routes["claude-sonnet-5"].targets().len(), 1);
+        let before = doc.as_str();
+        let err = doc.remove_route_target("claude-sonnet-5", 0).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("at least one"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(doc.as_str(), before, "document changed on a refused remove");
     }
 
     /// Removing an index that is not there is an error, not a silent no-op.
     #[test]
     fn remove_target_out_of_range_is_an_error() {
         let mut doc = fixture();
-        let err = doc.remove_route_target("claude-sonnet-5", 0).unwrap_err();
+        let err = doc.remove_route_target("claude-sonnet-5", 5).unwrap_err();
         assert!(
             format!("{err:#}").contains("no target"),
             "unexpected error: {err:#}"
@@ -1658,8 +1877,9 @@ base_url = "http://localhost:8888"
         assert_eq!(targets[1].display_name.as_deref(), Some("Zen primary"));
         assert_eq!(targets[1].context_tokens, Some(200_000));
 
-        // Overwrite, then clear both.
-        doc.set_route_target_scalar("claude-sonnet-5", 0, "context_tokens", 128_000i64)
+        // Overwrite, then clear both — on the target that carries them: chain
+        // index 1, behind the fixture's own block.
+        doc.set_route_target_scalar("claude-sonnet-5", 1, "context_tokens", 128_000i64)
             .unwrap();
         let cfg = doc.validated().unwrap();
         assert_eq!(
@@ -1667,8 +1887,8 @@ base_url = "http://localhost:8888"
             Some(128_000)
         );
 
-        assert!(doc.remove_route_target_scalar("claude-sonnet-5", 0, "display_name"));
-        assert!(doc.remove_route_target_scalar("claude-sonnet-5", 0, "context_tokens"));
+        assert!(doc.remove_route_target_scalar("claude-sonnet-5", 1, "display_name"));
+        assert!(doc.remove_route_target_scalar("claude-sonnet-5", 1, "context_tokens"));
         let out = doc.as_str();
         assert!(
             !out.contains("Zen primary"),
@@ -1677,12 +1897,12 @@ base_url = "http://localhost:8888"
         assert!(!out.contains("128000"), "context_tokens survived:\n{out}");
 
         // Clearing a key that is not there reports false rather than failing.
-        assert!(!doc.remove_route_target_scalar("claude-sonnet-5", 0, "display_name"));
+        assert!(!doc.remove_route_target_scalar("claude-sonnet-5", 1, "display_name"));
     }
 
-    /// Adding a target must not disturb the route's own fields — `targets()`
-    /// synthesizes target 0 from them, so an edit there would silently change
-    /// what target 0 reports.
+    /// Adding a target must not disturb the route's own fields or its primary:
+    /// the new block is appended behind target 0, and every route-level field
+    /// is untouched.
     #[test]
     fn add_target_leaves_route_fields_alone() {
         let mut doc = fixture();
@@ -1694,14 +1914,17 @@ base_url = "http://localhost:8888"
 
         let after = crate::config::load_from_str(&doc.as_str()).unwrap();
         let after_route = &after.routes["claude-sonnet-5"];
-        assert_eq!(after_route.provider, before_route.provider);
-        assert_eq!(after_route.model, before_route.model);
         assert_eq!(after_route.display_name, before_route.display_name);
         assert_eq!(after_route.family, before_route.family);
         assert_eq!(after_route.max_tokens, before_route.max_tokens);
         assert_eq!(after_route.context_tokens, before_route.context_tokens);
-        // Target 0 still reports the route's own pair.
-        assert_eq!(after_route.targets()[0].model, before_route.model);
+        // Target 0 is unchanged, and the new block landed behind it.
+        assert_eq!(
+            after_route.targets()[0].provider,
+            before_route.primary().provider
+        );
+        assert_eq!(after_route.targets()[0].model, before_route.primary().model);
+        assert_eq!(after_route.targets()[1].model, "fallback");
     }
 
     /// The block the wizard wrote is a valid config, and the route resolves to
@@ -1741,8 +1964,8 @@ base_url = "http://localhost:8888"
         assert_eq!(cfg.routes["b"].targets()[1].model, "extra");
     }
 
-    /// `route_targets` reports the full chain, target 0 first, including the
-    /// synthesized entry that exists in no `[[…target]]` block.
+    /// `route_targets` reports the full chain, target 0 first — and every entry
+    /// is a real `[[…target]]` block now.
     #[test]
     fn route_targets_lists_target_zero_first() {
         let mut doc = fixture();
@@ -1753,7 +1976,7 @@ base_url = "http://localhost:8888"
 
         let chain = doc.route_targets("claude-sonnet-5");
         assert_eq!(chain.len(), 2);
-        // Target 0 is the route's own pair, not the block we appended.
+        // Target 0 is the block the fixture declares, not the one we appended.
         assert_eq!(
             chain[0],
             ("zen".to_string(), "claude-sonnet-4-5".to_string())
@@ -2029,5 +2252,287 @@ base_url = "http://localhost:8888"
                 doc.as_str()
             );
         }
+    }
+
+    // -- legacy migration -----------------------------------------------------
+
+    /// A legacy document: a flat `provider`/`model` pair with an annotated
+    /// comment, a route-level `context_tokens`, and one already-array-shaped
+    /// fallback block behind it.
+    fn legacy_doc() -> Doc {
+        Doc::parse(
+            r#"[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+
+[routes."claude-sonnet-5"]
+family = "sonnet"
+# the expensive primary (and its comment should survive)
+provider = "zen"
+model = "claude-sonnet-4-5"
+context_tokens = 200000
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen-go"
+model = "v4-flash"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migration_moves_the_flat_pair_into_target_zero() {
+        let mut doc = legacy_doc();
+        assert!(doc.has_legacy_routes());
+        assert!(doc.migrate_legacy_routes().unwrap());
+        assert!(!doc.has_legacy_routes());
+
+        let cfg = doc.validated().unwrap();
+        let route = &cfg.routes["claude-sonnet-5"];
+        assert_eq!(
+            route.targets().len(),
+            2,
+            "the pre-existing block stays behind the migrated one"
+        );
+        assert_eq!(route.targets()[0].provider, "zen");
+        assert_eq!(route.targets()[0].model, "claude-sonnet-4-5");
+        assert_eq!(
+            route.targets()[0].context_tokens,
+            Some(200000),
+            "the window belongs to the target now"
+        );
+        assert_eq!(
+            route.context_tokens, None,
+            "it was moved, not copied — a route-level leftover would shadow target 0"
+        );
+        assert_eq!(route.family.as_deref(), Some("sonnet"));
+        assert_eq!(route.targets()[1].model, "v4-flash");
+
+        // The comment written above `provider` rides with the key into the new
+        // block rather than being stranded at route level.
+        let out = doc.as_str();
+        let header = out
+            .find("[[routes.\"claude-sonnet-5\".target]]")
+            .expect("a target header");
+        let comment = out
+            .find("# the expensive primary")
+            .expect("the comment above `provider` should survive the move");
+        assert!(
+            comment > header,
+            "the comment should sit inside the migrated block:\n{out}"
+        );
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let mut doc = legacy_doc();
+        assert!(doc.migrate_legacy_routes().unwrap());
+        let after = doc.as_str().to_string();
+        assert!(
+            !doc.migrate_legacy_routes().unwrap(),
+            "a second run reports no change"
+        );
+        assert_eq!(
+            doc.as_str(),
+            after,
+            "a no-op migration rewrote the document"
+        );
+    }
+
+    #[test]
+    fn migration_handles_a_quoted_route_id() {
+        let mut doc = Doc::parse(
+            r#"[providers.zen]
+spec = "anthropic"
+base_url = "https://x"
+
+[routes."my.route"]
+provider = "zen"
+model = "m"
+"#,
+        )
+        .unwrap();
+        assert!(doc.has_legacy_routes());
+        assert!(doc.migrate_legacy_routes().unwrap());
+        let cfg = doc.validated().unwrap();
+        assert_eq!(cfg.routes["my.route"].targets()[0].model, "m");
+        assert!(!cfg.routes["my.route"].targets()[0].provider.is_empty());
+    }
+
+    #[test]
+    fn a_target_op_on_an_unmigrated_route_is_refused() {
+        // The chain index cannot address a legacy route's target 0 — it lives
+        // in route-level keys — so the op says so instead of silently acting on
+        // the first declared block.
+        let mut doc = legacy_doc();
+        let before = doc.as_str().to_string();
+        let err = doc
+            .remove_route_target("claude-sonnet-5", 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("legacy"), "got: {err}");
+        assert_eq!(
+            doc.as_str(),
+            before,
+            "a refused op must leave the document byte-identical"
+        );
+    }
+
+    // -- reordering -----------------------------------------------------------
+
+    /// A two-block route whose second block carries an introducing comment.
+    fn reorder_doc() -> Doc {
+        Doc::parse(
+            r#"[providers.zen]
+spec = "anthropic"
+base_url = "https://x"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://y"
+
+[routes."r"]
+strategy = "failover"
+
+[[routes."r".target]]
+provider = "zen"
+model = "m-a"
+
+# the cheap backup
+[[routes."r".target]]
+provider = "zen-go"
+model = "m-b"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn move_route_target_reorders_and_carries_its_comment() {
+        let mut doc = reorder_doc();
+        doc.move_route_target("r", 1, 0).unwrap();
+
+        assert_eq!(
+            doc.route_targets("r"),
+            vec![
+                ("zen-go".to_string(), "m-b".to_string()),
+                ("zen".to_string(), "m-a".to_string()),
+            ]
+        );
+
+        // The block moves whole, so its leading comment moves with it — above
+        // the new first header, which is what distinguishes a decor-preserving
+        // move from one that only reorders the entries.
+        let out = doc.as_str();
+        let first_header = out.find("[[routes.\"r\".target]]").expect("a header");
+        let comment = out
+            .find("# the cheap backup")
+            .expect("the comment survived");
+        assert!(
+            comment < first_header,
+            "the moved block should keep its comment above it:\n{out}"
+        );
+        // The rest of the route is untouched.
+        assert!(out.contains("strategy = \"failover\""));
+    }
+
+    #[test]
+    fn move_route_target_rejects_out_of_range_and_ignores_a_no_op() {
+        let mut doc = fixture();
+        let before = doc.as_str().to_string();
+        // The fixture's route has one target, so a second index is out of range.
+        assert!(doc.move_route_target("claude-sonnet-5", 0, 1).is_err());
+        assert!(doc.move_route_target("claude-sonnet-5", 0, 0).is_ok());
+        assert_eq!(doc.as_str(), before);
+    }
+
+    #[test]
+    fn removing_target_zero_keeps_the_rest_and_refuses_the_last() {
+        let mut doc = fixture();
+        doc.add_route_target("claude-sonnet-5", &draft("zen-go", "extra"))
+            .unwrap();
+        assert_eq!(doc.route_targets("claude-sonnet-5").len(), 2);
+
+        // Index 0 is a normal chain entry and may be removed.
+        doc.remove_route_target("claude-sonnet-5", 0).unwrap();
+        assert_eq!(
+            doc.route_targets("claude-sonnet-5"),
+            vec![("zen-go".to_string(), "extra".to_string())]
+        );
+
+        // Down to one, the last target is refused: a route needs one upstream.
+        let err = doc
+            .remove_route_target("claude-sonnet-5", 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs at least one"), "got: {err}");
+    }
+
+    // -- peak hours -----------------------------------------------------------
+
+    #[test]
+    fn peak_hours_round_trip_and_clear() {
+        let mut doc = fixture();
+        doc.set_route_target_peak_hours(
+            "claude-sonnet-5",
+            0,
+            &["01:00-04:00".to_string(), "06:00-10:00".to_string()],
+        )
+        .unwrap();
+        let cfg = doc.validated().unwrap();
+        let windows = &cfg.routes["claude-sonnet-5"].targets()[0].peak_hours;
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[1].to_string(), "06:00-10:00");
+
+        // An empty list removes the key: no windows is the schema default.
+        doc.set_route_target_peak_hours("claude-sonnet-5", 0, &[])
+            .unwrap();
+        assert!(
+            !doc.as_str().contains("peak_hours"),
+            "an empty list should drop the key:\n{}",
+            doc.as_str()
+        );
+        let cfg = doc.validated().unwrap();
+        assert!(cfg.routes["claude-sonnet-5"].targets()[0]
+            .peak_hours
+            .is_empty());
+    }
+
+    #[test]
+    fn a_malformed_peak_window_is_refused_without_writing() {
+        let mut doc = fixture();
+        let before = doc.as_str().to_string();
+        let err = doc
+            .set_route_target_peak_hours("claude-sonnet-5", 0, &["9am-noon".to_string()])
+            .unwrap_err()
+            .to_string();
+        // The message names the offending half (`"9am"`), not the whole window.
+        assert!(err.contains("9am"), "got: {err}");
+        assert_eq!(
+            doc.as_str(),
+            before,
+            "a refused peak write must not touch the document"
+        );
+    }
+
+    // -- provider references --------------------------------------------------
+
+    #[test]
+    fn routes_using_sees_a_provider_referenced_only_by_a_fallback() {
+        // A pre-existing bug, pinned: the scan read only the flat pair, so a
+        // provider that survives only as a fallback was removable, which then
+        // broke every request to the route.
+        let mut doc = fixture();
+        doc.add_route_target("claude-sonnet-5", &draft("openrouter", "or-model"))
+            .unwrap();
+        assert_eq!(
+            doc.routes_using("openrouter"),
+            vec![("claude-sonnet-5".to_string(), "or-model".to_string())],
+            "the fallback's own model is named, not the primary's"
+        );
     }
 }

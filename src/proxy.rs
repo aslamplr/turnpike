@@ -73,6 +73,44 @@ struct Affinity {
     last_seen: std::time::Instant,
 }
 
+/// Minutes since UTC midnight — the clock `peak-hours` schedules are written
+/// against. Unix time carries no leap seconds and no local timezone, which is
+/// exactly the stability a published pricing window needs. A clock reading
+/// before the epoch (a broken system clock) counts as midnight.
+fn utc_minute_of_day() -> u32 {
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        % 86_400
+        / 60) as u32
+}
+
+/// The `peak-hours` pick: the first target that is not inside one of its own
+/// windows. When every target is in peak the chain's first target serves — a
+/// request is never refused over price, and the choice stays deterministic.
+/// Pure, so the boundaries are testable without a clock.
+fn peak_pick(targets: &[crate::config::Resolved], minute: u32) -> usize {
+    targets
+        .iter()
+        .position(|t| !t.peak_hours.iter().any(|w| w.contains(minute)))
+        .unwrap_or(0)
+}
+
+/// The attempt chain for a selection that moves one target to the front: that
+/// target first, then the rest in configured order. Shared by `cache_affinity`
+/// and `peak-hours`, so both policies walk — and fail over — through the same
+/// shape.
+fn chain_from(
+    targets: &[crate::config::Resolved],
+    index: usize,
+) -> Vec<(usize, &crate::config::Resolved)> {
+    let mut chain: Vec<(usize, &crate::config::Resolved)> = targets.iter().enumerate().collect();
+    let picked = chain.remove(index);
+    chain.insert(0, picked);
+    chain
+}
+
 impl Gateway {
     pub fn new(config: Arc<Config>) -> Self {
         let http = reqwest::Client::builder()
@@ -123,7 +161,30 @@ impl Gateway {
                 let n = self.advance_cursor(&res.route_id, res.targets.len());
                 &res.targets[n]
             }
+            Strategy::PeakHours if res.targets.len() < 2 => first(),
+            Strategy::PeakHours => &res.targets[self.peak_target_index(res)],
         }
+    }
+
+    /// Which target serves a `peak-hours` route right now: the first one
+    /// outside its own UTC windows, else the chain's first. Read once per
+    /// request — a clock read per attempt could flip at a minute boundary and
+    /// make one request's chain non-deterministic.
+    fn peak_target_index(&self, res: &crate::config::RouteResolution) -> usize {
+        let minute = utc_minute_of_day();
+        let index = peak_pick(&res.targets, minute);
+        tracing::debug!(
+            route = %res.route_id,
+            minute,
+            index,
+            in_peak = res
+                .targets
+                .iter()
+                .filter(|t| t.peak_hours.iter().any(|w| w.contains(minute)))
+                .count(),
+            "peak-hours: target selected"
+        );
+        index
     }
 
     /// The one round-robin advance — `load-balance` and the affinity miss
@@ -324,7 +385,7 @@ fn model_entry(id: &str, route: &crate::config::RouteCfg, search_configured: boo
         let models: Vec<&str> = targets.iter().map(|t| t.model.as_str()).collect();
         models.join(", ")
     } else {
-        route.model.clone()
+        route.primary().model.clone()
     };
     // Anthropic's spec: "Keys are always present for all known capabilities",
     // so the shape is the contract even where the answer is "no". Every value
@@ -333,7 +394,7 @@ fn model_entry(id: &str, route: &crate::config::RouteCfg, search_configured: boo
     json!({
         "type": "model",
         "id": id,
-        "display_name": route.display_name.clone().unwrap_or_else(|| route.model.clone()),
+        "display_name": route.display_name.clone().unwrap_or_else(|| route.primary().model.clone()),
         "created_at": route.created_at.clone().unwrap_or_else(|| "2025-01-01T00:00:00Z".into()),
         "max_tokens": route.max_tokens.unwrap_or(64_000),
         // The context window, from config. `null` when the route declares
@@ -783,15 +844,18 @@ async fn forward(
                     // slot moves to the front as attempt 1; the rest keep the
                     // configured order behind it.
                     let index = gw.select_affinity(&route, key);
-                    let mut chain: Vec<(usize, &crate::config::Resolved)> =
-                        route.targets.iter().enumerate().collect();
-                    let pinned = chain.remove(index);
-                    chain.insert(0, pinned);
                     sticky = Some(key);
-                    chain
+                    chain_from(&route.targets, index)
                 }
                 None => single(),
             }
+        }
+        // `peak-hours` gets the same shape for a different reason: the cheap
+        // pick leads, and a retryable failure still walks the rest — a target
+        // inside its peak window beats no answer at all.
+        crate::config::Strategy::PeakHours if route.targets.len() >= 2 => {
+            let index = gw.peak_target_index(&route);
+            chain_from(&route.targets, index)
         }
         _ => single(),
     };
@@ -4867,6 +4931,214 @@ strategy = "load-balance"
             );
         }
         assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    // -- peak-hours selection -----------------------------------------------
+
+    /// The target list of a `peak-hours` route, parsed from text so these tests
+    /// drive real `PeakWindow`s rather than hand-built ones. Each entry in
+    /// `windows` is one target's window list; an empty list means "always
+    /// available".
+    fn peak_route(windows: &[&[&str]]) -> crate::config::RouteResolution {
+        let mut providers = String::new();
+        let mut targets = String::new();
+        for (i, w) in windows.iter().enumerate() {
+            providers.push_str(&format!(
+                "\n[providers.p{i}]\nspec = \"anthropic\"\nbase_url = \"http://127.0.0.1:1\"\n"
+            ));
+            targets.push_str(&format!(
+                "\n[[routes.\"r\".target]]\nprovider = \"p{i}\"\nmodel = \"m{i}\"\n"
+            ));
+            if !w.is_empty() {
+                let list = w
+                    .iter()
+                    .map(|s| format!("{s:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                targets.push_str(&format!("peak_hours = [{list}]\n"));
+            }
+        }
+        let cfg_text = format!(
+            "[server]\nlisten = \"127.0.0.1:8710\"\n{providers}\n\
+             [routes.\"r\"]\nstrategy = \"peak-hours\"\n{targets}"
+        );
+        let cfg: Config = toml::from_str(&cfg_text).unwrap();
+        cfg.resolve_route("r").unwrap()
+    }
+
+    #[test]
+    fn peak_pick_skips_a_target_inside_its_own_window() {
+        let res = peak_route(&[&["10:00-11:00"], &[]]);
+        assert_eq!(peak_pick(&res.targets, 10 * 60 + 30), 1);
+        // Half-open: 11:00 is the first minute *outside* [10:00, 11:00).
+        assert_eq!(peak_pick(&res.targets, 11 * 60), 0);
+    }
+
+    #[test]
+    fn peak_pick_prefers_the_first_available_target() {
+        // Both free: the earlier one wins.
+        assert_eq!(peak_pick(&peak_route(&[&[], &[]]).targets, 0), 0);
+        // The first two are in peak, so the third serves.
+        let res = peak_route(&[&["00:00-23:59"], &["00:00-23:59"], &[]]);
+        assert_eq!(peak_pick(&res.targets, 5 * 60), 2);
+    }
+
+    #[test]
+    fn peak_pick_falls_back_to_target_zero_when_everything_is_in_peak() {
+        // Price never refuses a request: with no free target, the chain's first
+        // serves.
+        let res = peak_route(&[&["00:00-23:59"], &["00:00-23:59"]]);
+        assert_eq!(peak_pick(&res.targets, 12 * 60), 0);
+    }
+
+    #[test]
+    fn peak_pick_reads_a_wrapping_window() {
+        // 22:00-02:00 UTC covers 23:00 and 01:00, but not noon.
+        let res = peak_route(&[&["22:00-02:00"], &[]]);
+        assert_eq!(peak_pick(&res.targets, 23 * 60), 1);
+        assert_eq!(peak_pick(&res.targets, 60), 1);
+        assert_eq!(peak_pick(&res.targets, 12 * 60), 0);
+    }
+
+    /// `HH:MM-HH:MM` for a window that contains `minute` with several minutes of
+    /// slack on each side, so the assertion cannot be broken by a clock tick
+    /// between building the config and handling the request.
+    fn window_containing(minute: u32) -> String {
+        let start = (minute + 1440 - 3) % 1440;
+        let end = (minute + 4) % 1440;
+        format!(
+            "{:02}:{:02}-{:02}:{:02}",
+            start / 60,
+            start % 60,
+            end / 60,
+            end % 60
+        )
+    }
+
+    /// A ten-minute window far enough from `minute` that it can never contain
+    /// it, whatever the wrap.
+    fn window_clear_of(minute: u32) -> String {
+        let start = (minute + 600) % 1440;
+        let end = (minute + 610) % 1440;
+        format!(
+            "{:02}:{:02}-{:02}:{:02}",
+            start / 60,
+            start % 60,
+            end / 60,
+            end % 60
+        )
+    }
+
+    /// A two-target `peak-hours` route. `a` carries `a_windows`, `b` carries
+    /// `b_windows`; an empty string writes no `peak_hours` key.
+    fn peak_gateway(a: &str, b: &str, a_windows: &str, b_windows: &str) -> Arc<Gateway> {
+        let attr = |w: &str| {
+            if w.is_empty() {
+                String::new()
+            } else {
+                format!("peak_hours = [\"{w}\"]\n")
+            }
+        };
+        let cfg_text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.a]
+spec = "anthropic"
+base_url = "{a}"
+api_key = "k"
+
+[providers.b]
+spec = "anthropic"
+base_url = "{b}"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+strategy = "peak-hours"
+
+[[routes."claude-sonnet-5".target]]
+provider = "a"
+model = "m-a"
+{}
+
+[[routes."claude-sonnet-5".target]]
+provider = "b"
+model = "m-b"
+{}
+"#,
+            attr(a_windows),
+            attr(b_windows)
+        );
+        Arc::new(Gateway::new(Arc::new(
+            toml::from_str::<Config>(&cfg_text).unwrap(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn peak_hours_serves_the_alternate_inside_the_window() {
+        let now = utc_minute_of_day();
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        // The primary is pricey right now; the free alternate serves.
+        let gw = peak_gateway(&a, &b, &window_containing(now), "");
+        assert_eq!(
+            reply_text(send(gw, "claude-sonnet-5").await).await,
+            "from-b"
+        );
+        assert_eq!(
+            a_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the in-peak primary must not serve"
+        );
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn peak_hours_serves_the_primary_outside_the_window() {
+        let now = utc_minute_of_day();
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        // The primary's window is nowhere near now, so it serves even though
+        // the alternate is declared free.
+        let gw = peak_gateway(&a, &b, &window_clear_of(now), "");
+        assert_eq!(
+            reply_text(send(gw, "claude-sonnet-5").await).await,
+            "from-a"
+        );
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn peak_hours_all_in_peak_serves_target_zero() {
+        let now = utc_minute_of_day();
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
+        let gw = peak_gateway(&a, &b, &window_containing(now), &window_containing(now));
+        assert_eq!(
+            reply_text(send(gw, "claude-sonnet-5").await).await,
+            "from-a"
+        );
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failing_peak_pick_falls_back_to_the_rest_of_the_chain() {
+        let now = utc_minute_of_day();
+        let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
+        let (b, b_hits) =
+            stub_upstream(StatusCode::INTERNAL_SERVER_ERROR, ok_reply("from-b")).await;
+        // `b` is picked (the primary is in peak) and 500s; the chain's remaining
+        // target — the in-peak primary — serves. Availability beats cost.
+        let gw = peak_gateway(&a, &b, &window_containing(now), "");
+        assert_eq!(
+            reply_text(send(gw, "claude-sonnet-5").await).await,
+            "from-a"
+        );
+        assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(a_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

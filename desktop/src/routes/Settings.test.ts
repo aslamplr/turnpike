@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/svelte";
 import { userEvent } from "@testing-library/user-event";
 import { callCount, fake, lastCall } from "../test/tauri";
+import { cli } from "../lib/stores";
 import Settings from "./Settings.svelte";
 import type {
   CheckView,
@@ -50,7 +51,7 @@ const route = (over: Partial<RouteView> = {}): RouteView => ({
   display_name: null,
   context_tokens: null,
   targets: [
-    { provider: "zen", model: "claude-sonnet-4-5", display_name: null, context_tokens: null, spec: null },
+    { provider: "zen", model: "claude-sonnet-4-5", display_name: null, context_tokens: null, peak_hours: [], spec: null },
   ],
   ...over,
 });
@@ -500,6 +501,86 @@ describe("Settings — which panel is holding the edit", () => {
     // the session's staged keys.
     expect(callCount("config_edit_load")).toBe(before);
     expect(callCount("config_edit_apply")).toBe(0);
+  });
+});
+
+describe("Settings — a supervised CLI from another release", () => {
+  // `cli` is a module-level store; the guard reads it at click time, so a test
+  // that leaves it set would silently refuse every chain op in the tests after it.
+  afterEach(() => cli.set(null));
+
+  it("refuses a target-chain op rather than acting on the wrong upstream", async () => {
+    // 0.2.0 made a chain index the `target` array index *including* target 0.
+    // An older CLI reads the same argument relative to an array that excluded
+    // it, so a move or remove would land on a different upstream than the one
+    // the user pointed at. The app already noticed the skew and offered a
+    // Reinstall; this refuses the write instead of letting it land.
+    await mount(
+      session({
+        view: {
+          kind: "view",
+          view: configView({
+            providers: [provider()],
+            routes: [
+              route({
+                targets: [
+                  { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+                  { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+                ],
+              }),
+            ],
+          }),
+        },
+      }),
+    );
+    cli.set({
+      state: "versionMismatch",
+      path: "/usr/local/bin/turnpike",
+      found: "0.1.14",
+      expected: "0.2.0",
+      payload: null,
+    });
+    fake("config_edit_apply", () => session());
+
+    await openTab("Routes");
+    await userEvent.click(screen.getAllByTitle("Move this target down")[0]);
+
+    await screen.findByText(/before editing a route's targets/);
+    expect(callCount("config_edit_apply")).toBe(0);
+    // Nothing changed, so the session is still clean — and the refusal does not
+    // go to `problem`'s sibling `verdict`, which describes the *document*.
+    expect(clean()).toBeInTheDocument();
+  });
+
+  it("lets a chain op through when the CLI is ready", async () => {
+    // The guard is scoped to a *known* mismatch. An unknown version stays
+    // `ready`, and a ready CLI must not be blocked by it.
+    await mount(
+      session({
+        view: {
+          kind: "view",
+          view: configView({
+            providers: [provider()],
+            routes: [
+              route({
+                targets: [
+                  { provider: "zen", model: "a", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+                  { provider: "zen-go", model: "b", display_name: null, context_tokens: null, peak_hours: [], spec: null },
+                ],
+              }),
+            ],
+          }),
+        },
+      }),
+    );
+    cli.set({ state: "ready", path: "/usr/local/bin/turnpike", version: null });
+    fake("config_edit_apply", () => session());
+
+    await openTab("Routes");
+    await userEvent.click(screen.getAllByTitle("Move this target down")[0]);
+
+    await waitFor(() => expect(lastCall("config_edit_apply")).not.toBeNull());
+    expect(lastCall("config_edit_apply")).toMatchObject({ op: "move-target" });
   });
 });
 

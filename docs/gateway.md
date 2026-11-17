@@ -88,7 +88,8 @@ Every POST handler funnels into `forward(gw, path, family, headers, body)`:
    the router).
 7. **Select.** For a strategy route, `Gateway::select_target()` picks one
    candidate from the route's target chain — round-robin for `load-balance`,
-   target 0 for `static` and `failover`. A `load-balance` route with
+   the first target outside its own UTC windows for `peak-hours`, the primary
+   for `static` and `failover`. A `load-balance` route with
    `cache_affinity = true` pins the pick per conversation instead
    (`select_affinity`) — it engages only with 2+ targets in the chain;
    anything else keeps the strategy's own selection, and `doctor`'s

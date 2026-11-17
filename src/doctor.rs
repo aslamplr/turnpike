@@ -84,6 +84,7 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
     let mut context_problems = Vec::new();
     let mut failover_problems = Vec::new();
     let mut affinity_problems = Vec::new();
+    let mut peak_problems = Vec::new();
 
     for (id, route) in &cfg.routes {
         let targets = route.targets();
@@ -128,7 +129,7 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
         // failover across specs works — but it means the same route id streams
         // through two different code paths depending on which target answered.
         let mut specs: Vec<&'static str> = Vec::new();
-        for t in &targets {
+        for t in targets {
             if let Some(p) = cfg.providers.get(&t.provider) {
                 let s = p.spec.as_str();
                 if !specs.contains(&s) {
@@ -168,7 +169,6 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
         if route.strategy == config::Strategy::Failover && route.has_multiple_targets() {
             let mut providers: Vec<&str> =
                 route.target.iter().map(|t| t.provider.as_str()).collect();
-            providers.push(route.provider.as_str());
             providers.sort_unstable();
             providers.dedup();
             if providers.len() == 1 {
@@ -205,6 +205,24 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
                  only engages under \"load-balance\" with 2+",
                 route.strategy.as_str(),
                 targets.len()
+            ));
+        }
+
+        // 8. Peak windows only mean something under `peak-hours`, and a
+        // `peak-hours` route with no window declared anywhere has nothing to
+        // switch away from — it behaves exactly like `static`.
+        if route.strategy != config::Strategy::PeakHours {
+            if route.targets().iter().any(|t| !t.peak_hours.is_empty()) {
+                peak_problems.push(format!(
+                    "{id:?} declares peak_hours but its strategy is {:?}; the windows \
+                     are ignored",
+                    route.strategy.as_str()
+                ));
+            }
+        } else if !route.targets().iter().any(|t| !t.peak_hours.is_empty()) {
+            peak_problems.push(format!(
+                "{id:?} is \"peak-hours\" but no target declares peak_hours, so it \
+                 behaves exactly like \"static\""
             ));
         }
     }
@@ -268,6 +286,15 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
              targets, or drop the key",
             Status::Warn,
         ),
+        lint_or_ok(
+            "routes-peak-hours",
+            &peak_problems,
+            "`peak_hours` is set where it cannot apply, or a `peak-hours` route \
+             declares no windows",
+            "set `peak_hours = [\"HH:MM-HH:MM\"]` on the targets that are pricey, and put \
+             `strategy = \"peak-hours\"` on the route",
+            Status::Warn,
+        ),
     ]
 }
 
@@ -275,8 +302,8 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
 /// collected lines as its detail when something was.
 ///
 /// Every strategy lint has this shape: gather per-route complaints into a
-/// `Vec`, then either say nothing is wrong or report all of them at once. Seven
-/// copies of that branch would be seven places to get the detail formatting
+/// `Vec`, then either say nothing is wrong or report all of them at once. Nine
+/// copies of that branch would be nine places to get the detail formatting
 /// subtly different.
 fn lint_or_ok(id: &str, problems: &[String], summary: &str, fix: &str, status: Status) -> Check {
     if problems.is_empty() {
@@ -394,7 +421,7 @@ pub struct DoctorOptions {
 /// build), and the constant is the thing it asserts against. `cargo build` sees
 /// no reader; the test profile does.
 #[allow(dead_code)]
-pub const CHECK_IDS: [&str; 27] = [
+pub const CHECK_IDS: [&str; 29] = [
     "config-found",
     "config-parse",
     "validate",
@@ -408,6 +435,7 @@ pub const CHECK_IDS: [&str; 27] = [
     "listen-addr",
     "search-config",
     "routes-shape",
+    "routes-legacy-shape",
     "routes-target-provider",
     "routes-strategy",
     "routes-target-duplicate",
@@ -415,6 +443,7 @@ pub const CHECK_IDS: [&str; 27] = [
     "routes-context-mixed",
     "routes-failover-single-provider",
     "routes-affinity-shape",
+    "routes-peak-hours",
     "base-url-shape",
     "config-perms",
     "backups",
@@ -885,6 +914,44 @@ fn store_checks(ctx: &Ctx) -> Vec<Check> {
     checks
 }
 
+/// A file still written in the flat `provider`/`model` shape.
+///
+/// The typed config normalizes that shape on read, so the only place it can be
+/// seen is the raw document — and only until `serve`'s startup migration
+/// rewrites the file.
+fn legacy_route_shape_check(ctx: &Ctx) -> Check {
+    let parsed = toml::from_str::<toml::Value>(ctx.raw.as_deref().unwrap_or_default()).ok();
+    let legacy: Vec<String> = parsed
+        .as_ref()
+        .and_then(|v| v.get("routes"))
+        .and_then(|r| r.as_table())
+        .map(|routes| {
+            routes
+                .iter()
+                .filter(|(_, r)| {
+                    r.as_table()
+                        .map(|t| t.contains_key("provider") || t.contains_key("model"))
+                        .unwrap_or(false)
+                })
+                .map(|(id, _)| format!("{id:?}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if legacy.is_empty() {
+        return Check::ok("routes-legacy-shape", "routes use [[…target]] blocks");
+    }
+    Check::warn(
+        "routes-legacy-shape",
+        format!(
+            "{} route(s) still use the flat provider/model shape",
+            legacy.len()
+        ),
+        "start the gateway (`turnpike serve`) or save from `turnpike setup` to \
+         migrate them into `[[routes.<id>.target]]` blocks",
+    )
+    .with_detail(legacy.join("\n"))
+}
+
 /// Shape checks: the things that are legal but unwise.
 fn shape_checks(ctx: &Ctx) -> Vec<Check> {
     let mut checks = Vec::new();
@@ -893,6 +960,7 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
             "listen-addr",
             "search-config",
             "routes-shape",
+            "routes-legacy-shape",
             "routes-target-provider",
             "routes-strategy",
             "routes-target-duplicate",
@@ -900,6 +968,7 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
             "routes-context-mixed",
             "routes-failover-single-provider",
             "routes-affinity-shape",
+            "routes-peak-hours",
             "base-url-shape",
         ] {
             checks.push(Check::skip(id, "skipped — the config did not parse"));
@@ -947,10 +1016,14 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
     let mut seen: std::collections::BTreeMap<(String, String), String> =
         std::collections::BTreeMap::new();
     for (id, route) in &cfg.routes {
-        if let Some(prev) = seen.insert((route.provider.clone(), route.model.clone()), id.clone()) {
+        let primary = route.primary();
+        if let Some(prev) = seen.insert(
+            (primary.provider.clone(), primary.model.clone()),
+            id.clone(),
+        ) {
             problems.push(format!(
                 "{id:?} and {prev:?} both point at {}/{}",
-                route.provider, route.model
+                primary.provider, primary.model
             ));
         }
         if let Some(fam) = &route.family {
@@ -987,6 +1060,7 @@ fn shape_checks(ctx: &Ctx) -> Vec<Check> {
         );
     }
 
+    checks.push(legacy_route_shape_check(ctx));
     checks.extend(route_strategy_checks(cfg));
 
     // base_url: parseable, and an anthropic-spec one that ends in /v1 is almost
@@ -1618,6 +1692,15 @@ model = "claude-sonnet-4-5"
         path
     }
 
+    /// [`write_config`] with a caller-chosen tag, so tests that run concurrently
+    /// do not overwrite each other's file under one shared temp dir.
+    fn write_config_tagged(tag: &str, raw: &str) -> PathBuf {
+        let dir = temp_root(tag);
+        let path = dir.join("config.toml");
+        std::fs::write(&path, raw).unwrap();
+        path
+    }
+
     /// `diagnose`, with the store replaced by an in-memory one so the result
     /// does not depend on the machine's `~/.turnpike`.
     ///
@@ -1724,6 +1807,171 @@ model = "claude-sonnet-4-5"
             Status::Skip,
             "provider-reach must not run without --live"
         );
+    }
+
+    // -- the two shape lints added with peak-hours / array-only targets ------
+
+    #[tokio::test]
+    async fn a_peak_hours_route_with_no_windows_is_warned() {
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+api_key = "k"
+
+[routes."r"]
+strategy = "peak-hours"
+
+[[routes."r".target]]
+provider = "zen"
+model = "m-a"
+
+[[routes."r".target]]
+provider = "zen-go"
+model = "m-b"
+"#;
+        let path = write_config_tagged("doctor-peak-none", raw);
+        let checks = diagnose_with(path, raw, memory_store()).await;
+        let check = checks
+            .iter()
+            .find(|c| c.id == "routes-peak-hours")
+            .expect("routes-peak-hours runs");
+        assert_eq!(check.status, Status::Warn, "{}", check.summary);
+    }
+
+    #[tokio::test]
+    async fn peak_windows_on_a_static_route_are_warned() {
+        // Parsed, then ignored: the windows only mean something under
+        // `peak-hours`.
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+api_key = "k"
+
+[routes."r"]
+
+[[routes."r".target]]
+provider = "zen"
+model = "m-a"
+peak_hours = ["01:00-04:00"]
+
+[[routes."r".target]]
+provider = "zen-go"
+model = "m-b"
+"#;
+        let path = write_config_tagged("doctor-peak-static", raw);
+        let checks = diagnose_with(path, raw, memory_store()).await;
+        let check = checks
+            .iter()
+            .find(|c| c.id == "routes-peak-hours")
+            .expect("routes-peak-hours runs");
+        assert_eq!(check.status, Status::Warn, "{}", check.summary);
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_peak_route_is_quiet() {
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+api_key = "k"
+
+[routes."r"]
+strategy = "peak-hours"
+
+[[routes."r".target]]
+provider = "zen"
+model = "m-a"
+peak_hours = ["01:00-04:00", "06:00-10:00"]
+
+[[routes."r".target]]
+provider = "zen-go"
+model = "m-b"
+"#;
+        let path = write_config_tagged("doctor-peak-good", raw);
+        let checks = diagnose_with(path, raw, memory_store()).await;
+        let check = checks
+            .iter()
+            .find(|c| c.id == "routes-peak-hours")
+            .expect("routes-peak-hours runs");
+        assert_eq!(check.status, Status::Ok, "{}", check.summary);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_flat_route_is_reported() {
+        // The typed config normalizes this on read, so only the raw text can
+        // report it — and that is exactly what `routes-legacy-shape` reads.
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+provider = "zen"
+model = "claude-sonnet-4-5"
+"#;
+        let path = write_config_tagged("doctor-legacy", raw);
+        let checks = diagnose_with(path, raw, memory_store()).await;
+        let check = checks
+            .iter()
+            .find(|c| c.id == "routes-legacy-shape")
+            .expect("routes-legacy-shape runs");
+        assert_eq!(check.status, Status::Warn, "{}", check.summary);
+    }
+
+    #[tokio::test]
+    async fn an_array_only_config_has_no_legacy_shape_finding() {
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[routes."claude-sonnet-5"]
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "claude-sonnet-4-5"
+"#;
+        let path = write_config_tagged("doctor-not-legacy", raw);
+        let checks = diagnose_with(path, raw, memory_store()).await;
+        let check = checks
+            .iter()
+            .find(|c| c.id == "routes-legacy-shape")
+            .expect("routes-legacy-shape runs");
+        assert_eq!(check.status, Status::Ok, "{}", check.summary);
     }
 
     #[tokio::test]
@@ -2081,10 +2329,24 @@ strategy = "{strategy}"
         )
     }
 
+    /// A strategy route in the array-only shape: no flat pair, only the
+    /// `[[…target]]` blocks the caller supplies. Used where the *chain length*
+    /// is the thing under test — a flat pair would add a silent target 0.
+    fn array_route(strategy: &str, targets: &str) -> String {
+        format!(
+            r#"{TWO_PROVIDERS}
+[routes."claude-sonnet-5"]
+strategy = "{strategy}"
+{targets}
+"#
+        )
+    }
+
     #[tokio::test]
     async fn a_target_on_an_unknown_provider_is_a_failure() {
-        // The third `config::validate` rule, surfacing in the report as a `Fail`
-        // rather than a `Warn`: the gateway cannot serve this config at all.
+        // The target-provider rule of `config::validate`, surfacing in the
+        // report as a `Fail` rather than a `Warn`: the gateway cannot serve
+        // this config at all.
         let raw = strategy_route(
             "failover",
             r#"
@@ -2138,9 +2400,9 @@ model = "secondary"
 
     #[tokio::test]
     async fn a_duplicate_target_is_reported() {
-        // The route's own flat pair is target 0, so a `target` block repeating
-        // it is the duplicate — which the old `routes-shape` check cannot see,
-        // because it only ever compared distinct routes.
+        // The fixture is legacy-shaped: the flat pair normalizes to chain
+        // position 0, so the `target` block repeating it is the duplicate at
+        // positions 0 and 1.
         let raw = strategy_route(
             "load-balance",
             r#"
@@ -2197,7 +2459,7 @@ model = "secondary"
         // `effective_context_tokens` return it outright and short-circuit the
         // whole computation (rule 1), which is exactly what this check is not
         // about.
-        let raw = strategy_route(
+        let raw = array_route(
             "load-balance",
             r#"
 [[routes."claude-sonnet-5".target]]
@@ -2220,7 +2482,7 @@ model = "silent"
         assert!(c.detail.as_deref().unwrap().contains("1 of 2"), "{c:?}");
 
         // And when every target declares one, the check goes quiet.
-        let raw = strategy_route(
+        let raw = array_route(
             "load-balance",
             r#"
 [[routes."claude-sonnet-5".target]]

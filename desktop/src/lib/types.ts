@@ -31,6 +31,8 @@ export interface TargetView {
   model: string;
   display_name: string | null;
   context_tokens: number | null;
+  /** UTC windows in which this target is pricey, `HH:MM-HH:MM`. Empty = always available. */
+  peak_hours: string[];
   spec: string | null;
 }
 

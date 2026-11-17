@@ -82,20 +82,21 @@ silently shadowed.
 
 ### `[routes.<id>]`
 
-A route is a client-facing model id mapped onto a `provider`/`model` pair. It
-may also declare **additional** candidate upstreams and a `strategy` for
-choosing among them (`static`, `load-balance`, `failover`) — a route with no
-`strategy` and no `target` behaves exactly as it always has. The full story,
-including the retryable-failure rule and the context-window order, is in
-[routing.md](routing.md).
+A route is a client-facing model id mapped onto one or more
+`[[routes.<id>.target]]` blocks. The **first block is the primary**; a `strategy`
+decides which of them serves (`static`, `load-balance`, `failover`,
+`peak-hours`). A route with no `strategy` and a single target behaves exactly as
+it always has. The full story, including the retryable-failure rule and the
+context-window order, is in [routing.md](routing.md).
 
 `turnpike setup` writes the `[[routes.<id>.target]]` blocks through the same
 comment-preserving path as every other field, under Routes → edit a route →
-**Targets**. It appends to the `target` array and never rewrites target 0 — the
-route's own flat `provider`/`model`, edited through the fields below. A
-non-`static` `strategy` needs 2+ targets, so the wizard refuses one until a
-second target exists, and choosing `static` **omits** the key rather than
-writing `strategy = "static"`, which is the same thing to the config layer.
+**Targets**. A chain index **is** the `target` array index, target 0 included:
+Add appends, Edit/Move/Peak hours/Remove act on the block at that index, and
+removing the last remaining target is refused. A non-`static` `strategy` needs
+2+ targets, so the wizard refuses one until a second target exists, and choosing
+`static` **omits** the key rather than writing `strategy = "static"`, which is
+the same thing to the config layer.
 
 Each route is one client-facing model id. The id is the only thing a client
 picks that affects routing; everything else (provider choice, upstream model,
@@ -103,13 +104,18 @@ credentials) is decided here.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `provider` | — (required) | Provider id from `[providers.*]`. |
-| `model` | — (required) | Model id sent **upstream** after remapping. |
 | `display_name` | none | Human name, surfaced by Claude Desktop's picker. |
 | `created_at` | none | Free-form timestamp/string for the picker. |
 | `max_tokens` | none | Maximum output tokens; the launcher exports it as `CLAUDE_CODE_MAX_TOKENS`-family env vars for Claude Code. |
-| `context_tokens` | none | Real context window of the upstream model; the launcher exports it as `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for models Claude Code doesn't know. |
+| `context_tokens` | none | Explicit override for the advertised window; when set it wins over every target's own field. |
 | `family` | none | Claude family tier (`sonnet`/`opus`/`haiku`) shown in the Desktop picker and used to pick the default launch route. |
+| `strategy` | `"static"` | `static` / `load-balance` / `failover` / `peak-hours`; see [routing.md](routing.md). |
+| `cache_affinity` | `false` | Sticky per-conversation selection for `load-balance` routes; see [routing.md](routing.md#cache-affinity). |
+
+**The route's model config lives on its targets, not here.** A route carries no
+`provider`/`model`: every upstream is a `[[routes.<id>.target]]` block, and the
+first block is the primary. The older flat-pair shape still loads and migrates
+automatically — see [routing.md](routing.md#legacy-shape-and-migration).
 
 ### `[search]`
 
@@ -133,9 +139,9 @@ to loopback.
 
 ### `[[routes.<id>.target]]`
 
-Additional candidate upstreams for a route. The route's own `provider`/`model`
-is **target 0**; these are targets 1..N. `target` defaults to empty, so the key
-is purely additive.
+The route's candidate upstreams, in priority order. The **first block is the
+primary** — what `resolve()` answers — and there is no separate route-level
+`provider`/`model`. At least one block is required.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -143,11 +149,13 @@ is purely additive.
 | `model` | — (required) | Upstream model id. |
 | `display_name` | none | Label for logs and `doctor` reports only. |
 | `context_tokens` | none | This target's window; feeds the route-level minimum. |
+| `peak_hours` | none | UTC windows in which this pair is pricey, e.g. `["01:00-04:00", "06:00-10:00"]`; wrap past midnight (`"22:00-02:00"`). Read only by `strategy = "peak-hours"`. |
 
 `strategy` belongs to the route, not the target: `static` (default),
-`load-balance` (round-robin), `failover` (try in order). An unknown value is a
-parse error, not a silent fallback — a typo'd `"failoverr"` must not quietly
-turn failover off.
+`load-balance` (round-robin), `failover` (try in order), `peak-hours` (serve the
+first target outside its own UTC windows — [routing.md](routing.md#peak-hours)).
+An unknown value is a parse error, not a silent fallback — a typo'd
+`"failoverr"` must not quietly turn failover off.
 
 `cache_affinity` is a route-level `bool` (default `false`) that opts a
 `load-balance` route into sticky per-conversation selection: one conversation
@@ -199,12 +207,14 @@ implemented; see [bridge.md](bridge.md)).
 
 ## Validation
 
-`config::validate` has exactly **three** rules, and loading a config fails fast
-on any of them:
+`config::validate` has exactly **two** rules, and loading a config fails fast
+on either:
 
 - no `[providers.*]` at all,
-- a route referencing a provider that isn't defined,
 - a route **target** referencing a provider that isn't defined.
+
+(The former flat-route provider rule is subsumed by the target rule: every
+route now has at least one target, and each one is checked.)
 
 Nothing else refuses to start. Everything else that might be wrong — an unset
 env var, a wildcard `listen`, a `base_url` with a stray `/v1`, an inline key

@@ -130,11 +130,89 @@ impl ProviderCfg {
     }
 }
 
+/// One UTC window of the day during which a target is expensive.
+///
+/// Minutes since UTC midnight, half-open `[start, end)`. `end < start` means
+/// the window wraps past midnight: `22:00-02:00` covers 22:00–24:00 and
+/// 00:00–02:00. Parsed from `"HH:MM-HH:MM"`; a malformed window is a **parse
+/// error**, like an unknown `strategy` value — a schedule the gateway cannot
+/// honor must not silently become "never peak".
+///
+/// UTC, not local time, because provider pricing windows are published in UTC
+/// and the gateway must not depend on the host's timezone database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct PeakWindow {
+    start_min: u32,
+    end_min: u32,
+}
+
+impl PeakWindow {
+    /// Whether `minute` (minutes since UTC midnight) falls inside the window.
+    pub fn contains(&self, minute: u32) -> bool {
+        if self.start_min < self.end_min {
+            (self.start_min..self.end_min).contains(&minute)
+        } else {
+            minute >= self.start_min || minute < self.end_min
+        }
+    }
+}
+
+impl std::fmt::Display for PeakWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:02}:{:02}-{:02}:{:02}",
+            self.start_min / 60,
+            self.start_min % 60,
+            self.end_min / 60,
+            self.end_min % 60
+        )
+    }
+}
+
+impl std::str::FromStr for PeakWindow {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (start, end) = s
+            .split_once('-')
+            .ok_or_else(|| format!("{s:?} is not a peak window — expected \"HH:MM-HH:MM\""))?;
+        let start_min = parse_hhmm(start)?;
+        let end_min = parse_hhmm(end)?;
+        if start_min == end_min {
+            return Err(format!(
+                "{s:?} starts and ends at the same time; that window is ambiguous"
+            ));
+        }
+        Ok(Self { start_min, end_min })
+    }
+}
+
+impl TryFrom<String> for PeakWindow {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+fn parse_hhmm(s: &str) -> Result<u32, String> {
+    let invalid = || format!("{s:?} is not a clock time — expected \"HH:MM\"");
+    let (h, m) = s.trim().split_once(':').ok_or_else(invalid)?;
+    let hour: u32 = h.trim().parse().map_err(|_| invalid())?;
+    let minute: u32 = m.trim().parse().map_err(|_| invalid())?;
+    if hour > 23 || minute > 59 {
+        return Err(format!("{s:?} is not a time of day (00:00 to 23:59)"));
+    }
+    Ok(hour * 60 + minute)
+}
+
 /// One candidate upstream for a route.
 ///
-/// A route with no `[[routes.<id>.target]]` array is a target list of length
-/// one — its own `provider`/`model` — so this type is only ever *written* by
-/// users who want more than one upstream. See [`RouteCfg::targets`].
+/// A route's `[[routes.<id>.target]]` blocks **are** its target list, in
+/// priority order. The legacy flat `provider`/`model` pair is normalized into
+/// the first entry on read (see [`RouteCfg`]); writers emit only this shape.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TargetCfg {
     pub provider: String,
@@ -146,6 +224,10 @@ pub struct TargetCfg {
     /// minimum under a strategy; see [`effective_context_tokens`].
     #[serde(default)]
     pub context_tokens: Option<u64>,
+    /// UTC windows in which this (provider, model) pair is pricey. Empty means
+    /// always available. Consulted only by [`Strategy::PeakHours`].
+    #[serde(default)]
+    pub peak_hours: Vec<PeakWindow>,
 }
 
 /// How a route chooses among its targets, one per request.
@@ -165,6 +247,11 @@ pub enum Strategy {
     LoadBalance,
     /// Try targets in order; on a retryable failure, move to the next.
     Failover,
+    /// Serve from the first target that is not inside one of its own
+    /// `peak_hours` windows — the cheap pair outside its provider's pricey
+    /// hours. When every target is in peak, the first target in the chain
+    /// serves. See [`TargetCfg::peak_hours`].
+    PeakHours,
 }
 
 impl Strategy {
@@ -174,21 +261,17 @@ impl Strategy {
             Strategy::Static => "static",
             Strategy::LoadBalance => "load-balance",
             Strategy::Failover => "failover",
+            Strategy::PeakHours => "peak-hours",
         }
     }
 }
 
-/// One client-facing model route: `<id> -> provider/model`.
+/// One client-facing model route: `<id> -> a priority-ordered target list`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "RouteCfgRaw")]
 pub struct RouteCfg {
-    pub provider: String,
-    /// Model id sent upstream after remapping.
-    pub model: String,
-    #[serde(default)]
     pub display_name: Option<String>,
-    #[serde(default)]
     pub created_at: Option<String>,
-    #[serde(default)]
     pub max_tokens: Option<u64>,
     /// Real context window of the upstream model in tokens, if known. The
     /// launcher surfaces it as CLAUDE_CODE_MAX_CONTEXT_TOKENS for models
@@ -197,49 +280,117 @@ pub struct RouteCfg {
     /// When set, this value wins outright over anything computed from targets —
     /// it is the explicit static override, and a computed minimum that could
     /// beat it would leave no way to force a window.
-    #[serde(default)]
     pub context_tokens: Option<u64>,
     /// Optional Claude family tier shown in Claude Desktop's picker.
-    #[serde(default)]
     pub family: Option<String>,
     /// Selection policy across [`RouteCfg::targets`]. Defaults to `Static`.
-    #[serde(default)]
     pub strategy: Strategy,
     /// Sticky per-conversation selection for `load-balance` routes: turns of
     /// one conversation keep serving from the target that already holds the
     /// provider's copy of the prompt cache, instead of rotating into a target
     /// that must re-read the whole prompt at full price. Ignored on any other
     /// strategy — `doctor` lints that (`routes-affinity-shape`).
-    #[serde(default)]
     pub cache_affinity: bool,
-    /// Extra candidate upstreams, in declaration order. Target 0 is always the
-    /// route's own `provider`/`model`; this array holds targets 1..n.
-    #[serde(default)]
+    /// The route's candidate upstreams, in priority order. Never empty.
     pub target: Vec<TargetCfg>,
 }
 
 impl RouteCfg {
-    /// The route's candidate targets, in order: its own provider/model first,
-    /// then any declared `[[…target]]` blocks.
+    /// The route's candidate targets, in priority order.
     ///
     /// The single definition of "what can serve this route", shared by
-    /// resolution, selection, the catalog detail, and the wizard's list view —
-    /// so a static route and an N-target route cannot drift apart.
-    pub fn targets(&self) -> Vec<TargetCfg> {
-        let mut out = Vec::with_capacity(1 + self.target.len());
-        out.push(TargetCfg {
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            display_name: self.display_name.clone(),
-            context_tokens: self.context_tokens,
-        });
-        out.extend(self.target.iter().cloned());
-        out
+    /// resolution, selection, the catalog detail, and the view.
+    pub fn targets(&self) -> &[TargetCfg] {
+        &self.target
+    }
+
+    /// The primary target, chain index 0 — what [`Config::resolve`] answers.
+    pub fn primary(&self) -> &TargetCfg {
+        self.target
+            .first()
+            .expect("a RouteCfg always carries at least one target")
     }
 
     /// True when the route declares more than one candidate upstream.
     pub fn has_multiple_targets(&self) -> bool {
-        !self.target.is_empty()
+        self.target.len() > 1
+    }
+}
+
+/// The on-disk shape of a route, including the legacy flat pair.
+///
+/// [`RouteCfg`] has no `provider`/`model`: every candidate is a
+/// `[[routes.<id>.target]]` block. This raw layer is why old files keep
+/// loading — the flat pair is folded into the first target, exactly what the
+/// old `targets()` synthesized — and it is what `serve`'s one-time migration
+/// removes from the file. After migration, writers emit only the array shape.
+#[derive(Deserialize)]
+struct RouteCfgRaw {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    #[serde(default)]
+    context_tokens: Option<u64>,
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    strategy: Strategy,
+    #[serde(default)]
+    cache_affinity: bool,
+    #[serde(default)]
+    target: Vec<TargetCfg>,
+}
+
+impl TryFrom<RouteCfgRaw> for RouteCfg {
+    type Error = String;
+
+    fn try_from(raw: RouteCfgRaw) -> Result<Self, Self::Error> {
+        let mut target = raw.target;
+        match (raw.provider, raw.model) {
+            (Some(provider), Some(model)) => target.insert(
+                0,
+                TargetCfg {
+                    provider,
+                    model,
+                    // The route's `display_name` is the catalog label and stays
+                    // on the route. `context_tokens` moves onto the target it
+                    // describes; `effective_context_tokens` reads the same
+                    // value either way, and target 0 now owns it.
+                    display_name: None,
+                    context_tokens: raw.context_tokens,
+                    peak_hours: Vec::new(),
+                },
+            ),
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err("a route with a `provider` key also needs `model`".to_string())
+            }
+            (None, Some(_)) => {
+                return Err("a route with a `model` key also needs `provider`".to_string())
+            }
+        };
+        if target.is_empty() {
+            return Err("a route needs at least one `[[routes.<id>.target]]` block \
+                        (or a legacy `provider`/`model` pair)"
+                .to_string());
+        }
+        Ok(RouteCfg {
+            display_name: raw.display_name,
+            created_at: raw.created_at,
+            max_tokens: raw.max_tokens,
+            context_tokens: raw.context_tokens,
+            family: raw.family,
+            strategy: raw.strategy,
+            cache_affinity: raw.cache_affinity,
+            target,
+        })
     }
 }
 
@@ -247,8 +398,9 @@ impl RouteCfg {
 ///
 /// Order of resolution, and the order is the design:
 ///   1. the route's own `context_tokens`, if the user set one → wins outright;
-///   2. `static` → that same field, unchanged, so adding targets to a route
-///      cannot change what a static route advertises;
+///   2. `static` → that same field, else the primary target's own window —
+///      every model is a target now, so a static route's pair carries its
+///      window on target 0;
 ///   3. a strategy is active → the minimum over targets that declare one,
 ///      falling back to the route field when none do.
 ///
@@ -263,10 +415,13 @@ pub fn effective_context_tokens(route: &RouteCfg) -> Option<u64> {
         return route.context_tokens;
     }
     if route.strategy == Strategy::Static {
-        return None;
+        // The primary's window is what a static route advertises: its pair is
+        // a `[[…target]]` block like any other, and the route-level field is
+        // only the explicit override.
+        return route.primary().context_tokens;
     }
     route
-        .target
+        .targets()
         .iter()
         .filter_map(|t| t.context_tokens)
         .min()
@@ -396,6 +551,9 @@ pub struct Resolved {
     pub provider: String,
     pub provider_cfg: ProviderCfg,
     pub upstream_model: String,
+    /// The target's UTC peak windows, carried so selection does not have to
+    /// re-read the config. Empty on an explicit `provider/model` resolution.
+    pub peak_hours: Vec<PeakWindow>,
 }
 
 /// A route's full candidate list, before a target is chosen for a request.
@@ -407,7 +565,8 @@ pub struct Resolved {
 #[derive(Debug, Clone)]
 pub struct RouteResolution {
     pub route_id: String,
-    /// Targets in order. Target 0 is always the route's flat `provider`/`model`.
+    /// Targets in order. The first block is the primary; a legacy flat pair
+    /// normalizes into position 0 on read.
     pub targets: Vec<Resolved>,
     pub strategy: Strategy,
     /// Whether the route opted into cache-affinity selection. Consumed by the
@@ -488,6 +647,7 @@ impl Config {
                         provider: prov.to_string(),
                         provider_cfg: provider_cfg.clone(),
                         upstream_model: model.to_string(),
+                        peak_hours: Vec::new(),
                     }],
                     strategy: Strategy::Static,
                     // Explicit provider/model routing: no route owns this
@@ -514,6 +674,7 @@ impl Config {
                 provider: t.provider.clone(),
                 provider_cfg: provider_cfg.clone(),
                 upstream_model: t.model.clone(),
+                peak_hours: t.peak_hours.clone(),
             });
         }
         Ok(RouteResolution {
@@ -598,27 +759,20 @@ pub fn load_from_str(raw: &str) -> Result<Config> {
 
 /// The rules that make a config unusable, as opposed to merely unwise.
 ///
-/// Deliberately just these: everything else `doctor` could object to (unknown
-/// family tiers, odd token counts, a `/v1` suffix on an anthropic base_url, a
-/// strategy route with one target) is a lint, and raising it here would break
-/// configs that work today — a worse outcome than a warning.
+/// Deliberately just these two: everything else `doctor` could object to
+/// (unknown family tiers, odd token counts, a `/v1` suffix on an anthropic
+/// base_url, a strategy route with one target) is a lint, and raising it here
+/// would break configs that work today — a worse outcome than a warning.
 ///
-/// The target rule earns its place because it is the *same* impossibility as
-/// the route rule: `[providers]` is the only source of a spec and base_url, so
-/// a route — or a target within one — naming a provider that isn't there
-/// cannot be served at all, by any request.
+/// The target rule earns its place because `[providers]` is the only source of
+/// a spec and base_url: a target naming a provider that isn't there cannot be
+/// served at all, by any request.
 pub(crate) fn validate(cfg: &Config) -> Result<()> {
     if cfg.providers.is_empty() {
         anyhow::bail!("config defines no [providers.*]");
     }
     for (id, route) in &cfg.routes {
-        if !cfg.providers.contains_key(&route.provider) {
-            anyhow::bail!(
-                "route {id:?} references unknown provider {:?}",
-                route.provider
-            );
-        }
-        for (i, target) in route.target.iter().enumerate() {
+        for (i, target) in route.targets().iter().enumerate() {
             if !cfg.providers.contains_key(&target.provider) {
                 anyhow::bail!(
                     "route {id:?} target {i} references unknown provider {:?}",
@@ -674,12 +828,18 @@ pub fn default_config_text() -> String {
 #     "x-opencode-session" = "…"
 #
 # ---- routes ----------------------------------------------------------------
-# A route is a model id your client asks for, pointed at a provider's model.
+# A route is a model id your client asks for, pointed at one or more upstream
+# models. Every candidate is a [[routes."<id>".target]] block, in priority
+# order — the first one is the primary.
 #
 #     [routes."claude-sonnet-4-5"]
+#     family = "sonnet"                  # sonnet | opus | haiku
+#     # strategy = "failover"            # static | load-balance | failover | peak-hours
+#
+#     [[routes."claude-sonnet-4-5".target]]
 #     provider = "NAME"
 #     model = "the-upstream-model-id"
-#     family = "sonnet"                  # sonnet | opus | haiku
+#     # peak_hours = ["01:00-04:00"]     # optional: UTC windows when this pair is pricey
 #
 # `turnpike routes` prints what is configured; `turnpike doctor` says what is
 # wrong. Client to start once the gateway is up: `turnpike launch claude-code`.
@@ -791,8 +951,6 @@ model = "openai/gpt-5"
         cfg.routes.insert(
             "claude-opus-5".to_string(),
             RouteCfg {
-                provider: "zen".into(),
-                model: "claude-opus-4-5".into(),
                 display_name: None,
                 created_at: None,
                 max_tokens: None,
@@ -800,7 +958,13 @@ model = "openai/gpt-5"
                 family: Some("opus".into()),
                 strategy: Strategy::Static,
                 cache_affinity: false,
-                target: Vec::new(),
+                target: vec![TargetCfg {
+                    provider: "zen".into(),
+                    model: "claude-opus-4-5".into(),
+                    display_name: None,
+                    context_tokens: None,
+                    peak_hours: Vec::new(),
+                }],
             },
         );
         // Alphabetical order would pick claude-sonnet-5 here; add a haiku
@@ -808,8 +972,6 @@ model = "openai/gpt-5"
         cfg.routes.insert(
             "claude-haiku-4-5".to_string(),
             RouteCfg {
-                provider: "zen".into(),
-                model: "claude-haiku-4-5".into(),
                 display_name: None,
                 created_at: None,
                 max_tokens: None,
@@ -817,7 +979,13 @@ model = "openai/gpt-5"
                 family: Some("haiku".into()),
                 strategy: Strategy::Static,
                 cache_affinity: false,
-                target: Vec::new(),
+                target: vec![TargetCfg {
+                    provider: "zen".into(),
+                    model: "claude-haiku-4-5".into(),
+                    display_name: None,
+                    context_tokens: None,
+                    peak_hours: Vec::new(),
+                }],
             },
         );
         // Give the sonnet route its family tier (test_config leaves it unset).
@@ -984,13 +1152,16 @@ model = "gemma3:27b"
         // No `strategy` key at all — the overwhelmingly common case, and the
         // one that must keep meaning what it meant before this feature.
         let cfg = test_config();
-        assert_eq!(cfg.routes["gpt"].strategy, Strategy::Static);
-        assert!(cfg.routes["gpt"].target.is_empty());
+        let route = &cfg.routes["gpt"];
+        assert_eq!(route.strategy, Strategy::Static);
+        // Nothing declared in the array; the legacy flat pair is target 0.
+        assert_eq!(route.target.len(), 1);
     }
 
     #[test]
     fn route_targets_put_the_flat_pair_first() {
-        // Target 0 is synthesized, not declared: users write targets 1..n.
+        // This fixture is legacy-shaped: the flat pair normalizes into chain
+        // position 0 ahead of the declared blocks.
         let cfg = multi_target_config();
         let targets = cfg.routes["claude-sonnet-5"].targets();
         assert_eq!(targets.len(), 3);
@@ -1143,10 +1314,9 @@ model = "claude-sonnet-4-5"
 
     #[test]
     fn validate_rejects_target_with_unknown_provider() {
-        // The third rule, and the only widening. A target naming a provider
-        // that is not in `[providers]` is a serve-time impossibility for every
-        // request, exactly like the route-level rule — so it belongs here
-        // rather than in `doctor`'s lints.
+        // The target rule. A target naming a provider that is not in
+        // `[providers]` is a serve-time impossibility for every request, so it
+        // belongs here rather than in `doctor`'s lints.
         let bad = r#"
 [providers.zen]
 spec = "anthropic"
@@ -1164,7 +1334,9 @@ model = "qwen3.8"
         // Names the route *and* the position, so an N-target chain is fixable
         // without counting by hand.
         assert!(err.contains("claude-sonnet-5"), "{err}");
-        assert!(err.contains("target 0"), "{err}");
+        // The flat pair normalized into chain position 0, so the ghost block
+        // is target 1 — the index the message must name.
+        assert!(err.contains("target 1"), "{err}");
         assert!(err.contains("ghost"), "{err}");
 
         let good = bad.replace("ghost", "zen");
@@ -1456,5 +1628,188 @@ api_key = "inline-key"
         assert_eq!(out.value, "inline-key");
         assert_eq!(out.source, KeySource::Inline);
         assert_eq!(out.store_status.reason(), Some("boom"));
+    }
+
+    // --- peak windows -------------------------------------------------------
+
+    #[test]
+    fn peak_windows_parse_and_render() {
+        let w: PeakWindow = "01:00-04:00".parse().unwrap();
+        assert_eq!(w.to_string(), "01:00-04:00");
+        // One-digit hours are accepted and rendered canonically.
+        let w: PeakWindow = "1:05-2:06".parse().unwrap();
+        assert_eq!(w.to_string(), "01:05-02:06");
+    }
+
+    #[test]
+    fn peak_window_membership_is_half_open() {
+        let w: PeakWindow = "01:00-04:00".parse().unwrap();
+        assert!(!w.contains(59), "00:59 is before the window");
+        assert!(w.contains(60), "01:00 is the first minute");
+        assert!(w.contains(239), "03:59 is the last minute");
+        assert!(!w.contains(240), "04:00 is outside");
+    }
+
+    #[test]
+    fn a_wrapping_peak_window_covers_both_ends() {
+        let w: PeakWindow = "22:00-02:00".parse().unwrap();
+        assert!(w.contains(22 * 60));
+        assert!(w.contains(23 * 60 + 59));
+        assert!(w.contains(0));
+        assert!(w.contains(119));
+        assert!(!w.contains(120));
+        assert!(!w.contains(21 * 60 + 59));
+    }
+
+    #[test]
+    fn malformed_peak_windows_are_parse_errors() {
+        for bad in [
+            "01:00",
+            "25:00-02:00",
+            "01:60-02:00",
+            "02:00-02:00",
+            "x-02:00",
+        ] {
+            assert!(
+                bad.parse::<PeakWindow>().is_err(),
+                "{bad} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_window_in_the_config_names_itself() {
+        let bad = r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes.r]
+strategy = "peak-hours"
+
+[[routes.r.target]]
+provider = "zen"
+model = "m"
+peak_hours = ["25:00-02:00"]
+"#;
+        let err = toml::from_str::<Config>(bad).unwrap_err().to_string();
+        assert!(err.contains("25:00-02:00"), "{err}");
+    }
+
+    #[test]
+    fn the_peak_hours_strategy_and_windows_parse() {
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes.r]
+strategy = "peak-hours"
+
+[[routes.r.target]]
+provider = "zen"
+model = "a"
+peak_hours = ["01:00-04:00", "06:00-10:00"]
+
+[[routes.r.target]]
+provider = "zen"
+model = "b"
+"#,
+        )
+        .unwrap();
+        let route = &cfg.routes["r"];
+        assert_eq!(route.strategy, Strategy::PeakHours);
+        assert_eq!(route.targets()[0].peak_hours.len(), 2);
+        assert!(route.targets()[1].peak_hours.is_empty());
+    }
+
+    // --- array-only shape and legacy read-compat ----------------------------
+
+    #[test]
+    fn a_route_needs_at_least_one_target() {
+        let err = toml::from_str::<Config>(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes.r]
+family = "sonnet"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at least one"), "{err}");
+    }
+
+    #[test]
+    fn half_a_legacy_pair_is_rejected() {
+        let base = r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes.r]
+"#;
+        let err = toml::from_str::<Config>(&format!("{base}provider = \"zen\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("model"), "{err}");
+        let err = toml::from_str::<Config>(&format!("{base}model = \"m\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider"), "{err}");
+    }
+
+    #[test]
+    fn the_legacy_pair_becomes_the_first_target() {
+        // Read-compat forever: the flat pair normalizes into chain position 0,
+        // carrying the window it used to synthesize.
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes.r]
+provider = "zen"
+model = "primary"
+context_tokens = 200000
+strategy = "failover"
+
+[[routes.r.target]]
+provider = "zen"
+model = "secondary"
+"#,
+        )
+        .unwrap();
+        let route = &cfg.routes["r"];
+        assert_eq!(route.targets().len(), 2);
+        assert_eq!(route.primary().model, "primary");
+        assert_eq!(route.primary().context_tokens, Some(200_000));
+        assert_eq!(route.targets()[1].model, "secondary");
+    }
+
+    #[test]
+    fn a_static_route_advertises_its_primarys_window() {
+        // The array-only shape puts the window on the target; a static route
+        // must still advertise it.
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes.r]
+
+[[routes.r.target]]
+provider = "zen"
+model = "m"
+context_tokens = 200000
+"#,
+        )
+        .unwrap();
+        assert_eq!(effective_context_tokens(&cfg.routes["r"]), Some(200_000));
     }
 }

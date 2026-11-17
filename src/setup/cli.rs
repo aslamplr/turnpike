@@ -141,7 +141,7 @@ impl Reply {
 /// One flat enum of *every* operation rather than a nested subcommand tree: the
 /// caller sends a JSON object either way, and a flat list keeps the desktop
 /// side's dispatch table and this one lined up one-to-one.
-pub const OPS: [&str; 18] = [
+pub const OPS: [&str; 20] = [
     "add-provider",
     "remove-provider",
     "set-provider",
@@ -153,7 +153,9 @@ pub const OPS: [&str; 18] = [
     "set-strategy",
     "add-target",
     "remove-target",
+    "move-target",
     "set-target",
+    "set-peak-hours",
     "set-search",
     "remove-search",
     "stage-key",
@@ -232,7 +234,11 @@ struct SetStrategy {
     strategy: String,
 }
 
+/// `deny_unknown_fields`: the same class `SetSearch` guards against. A caller
+/// that sends a field this struct does not know (a newer window sending
+/// `peak_hours` to an older CLI) must be refused, not told the write landed.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddTarget {
     id: String,
     provider: String,
@@ -241,13 +247,16 @@ struct AddTarget {
     display_name: Option<String>,
     #[serde(default)]
     context_tokens: Option<u64>,
+    /// UTC peak windows, `HH:MM-HH:MM`. Omitted or empty writes no key.
+    #[serde(default)]
+    peak_hours: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TargetRef {
     id: String,
-    /// The **array** index — chain index minus one. Target 0 is the route's
-    /// flat provider/model and is edited with `set-route`, never here.
+    /// The **chain** index, which is the `target` array index: every model is a
+    /// `[[routes.<id>.target]]` block, target 0 included.
     index: usize,
 }
 
@@ -257,6 +266,23 @@ struct SetTarget {
     index: usize,
     key: String,
     value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoveTarget {
+    id: String,
+    /// Chain position to move, and where it lands. Both are `target` array
+    /// indexes: every model is a `[[routes.<id>.target]]` block.
+    from: usize,
+    to: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetPeakHours {
+    id: String,
+    index: usize,
+    /// `HH:MM-HH:MM` UTC windows. An empty list removes the key.
+    windows: Vec<String>,
 }
 
 /// `deny_unknown_fields` here is the fix for the *class* of bug, not just its
@@ -332,12 +358,19 @@ pub fn load(config: Option<PathBuf>) -> Result<Session> {
         crate::config::default_config_text()
     };
 
-    // Parse now so a session never starts from a document that cannot be one.
-    // `Doc::parse` keeps the text; this only proves it is valid TOML.
-    Doc::parse(&doc_text).context("parsing the config")?;
+    // Parse now so a session never starts from a document that cannot be one,
+    // and normalize the route shape: a legacy flat `provider`/`model` pair is
+    // migrated before the session is handed out, so the first `--view` and any
+    // save already show and write `[[…target]]` blocks.
+    let mut doc = Doc::parse(&doc_text).context("parsing the config")?;
+    if let Err(e) = doc.migrate_legacy_routes() {
+        // The typed layer still accepts the legacy shape, so a document we
+        // cannot migrate is carried as-is rather than refusing the session.
+        tracing::warn!("not migrating the config's route shape: {e:#}");
+    }
 
     Ok(Session {
-        doc: doc_text,
+        doc: doc.as_str(),
         plan: PlanRepr::default(),
         path: path.display().to_string(),
     })
@@ -504,6 +537,7 @@ pub fn apply(op: &str, session: &Session, args: &str) -> Result<Reply> {
                 model: a.model,
                 display_name: a.display_name,
                 context_tokens: a.context_tokens,
+                peak_hours: a.peak_hours.unwrap_or_default(),
             };
             match doc.add_route_target(&a.id, &draft) {
                 Ok(()) => None,
@@ -538,6 +572,20 @@ pub fn apply(op: &str, session: &Session, args: &str) -> Result<Reply> {
                     Ok(()) => None,
                     Err(e) => Some(e.to_string()),
                 }
+            }
+        }
+        "move-target" => {
+            let a: MoveTarget = parse_args(args)?;
+            match doc.move_route_target(&a.id, a.from, a.to) {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            }
+        }
+        "set-peak-hours" => {
+            let a: SetPeakHours = parse_args(args)?;
+            match doc.set_route_target_peak_hours(&a.id, a.index, &a.windows) {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
             }
         }
         "set-search" => {
@@ -584,7 +632,14 @@ pub fn apply(op: &str, session: &Session, args: &str) -> Result<Reply> {
 /// sees the store as it is on disk now, not as it was when the session started.
 fn save(session: &Session) -> Result<()> {
     let path = PathBuf::from(&session.path);
-    let doc = Doc::parse(&session.doc).context("parsing the session document")?;
+    let mut doc = Doc::parse(&session.doc).context("parsing the session document")?;
+    // A session that predates the array-only shape still saves as arrays — but
+    // a document the migrator cannot rewrite (an inline-table route) must still
+    // save: the typed parser accepts the legacy shape, and refusing the save
+    // would make a config loadable and editable but never saveable.
+    if let Err(e) = doc.migrate_legacy_routes() {
+        tracing::warn!("not migrating the config's route shape: {e:#}");
+    }
     let mut store = secrets::open(&path);
     if let StoreStatus::Unavailable(reason) = &store.status {
         let root = if store.root.as_os_str().is_empty() {
@@ -603,7 +658,6 @@ fn save(session: &Session) -> Result<()> {
     // the one that resolves. Doing the strip first is the data-loss bug the
     // module docs describe.
     let plan = session.plan.to_plan();
-    let mut doc = doc;
     for slot in plan.secret_writes.keys() {
         if let Some(provider) = slot.strip_prefix("provider.") {
             doc.remove_provider_inline_key_keeping_comment(provider);
@@ -925,6 +979,148 @@ mod tests {
         std::fs::write(&path, body).unwrap();
         let session = load(Some(path)).unwrap();
         assert_eq!(session.doc, body);
+    }
+
+    /// `load` normalizes a legacy flat-pair route before the session is handed
+    /// out, so a caller's first `--view` and any later save are already
+    /// array-shaped. The typed layer would still read it either way; this is
+    /// about what a *writer* emits.
+    #[test]
+    fn load_normalizes_a_legacy_route_into_target_blocks() {
+        let path = temp_path("load-legacy");
+        std::fs::write(
+            &path,
+            r#"[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes."legacy"]
+family = "sonnet"
+provider = "zen"
+model = "claude-sonnet-4-5"
+"#,
+        )
+        .unwrap();
+
+        let session = load(Some(path)).unwrap();
+        let parsed: toml::Value = toml::from_str(&session.doc).unwrap();
+        let route = parsed
+            .get("routes")
+            .and_then(|r| r.get("legacy"))
+            .and_then(|r| r.as_table())
+            .expect("the legacy route table");
+        assert!(
+            !route.contains_key("provider") && !route.contains_key("model"),
+            "the flat pair survived `load`:\n{}",
+            session.doc
+        );
+        let targets = route
+            .get("target")
+            .and_then(|t| t.as_array())
+            .expect("the migrated chain");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].get("provider").and_then(|v| v.as_str()),
+            Some("zen")
+        );
+        assert_eq!(
+            targets[0].get("model").and_then(|v| v.as_str()),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(
+            route.get("family").and_then(|v| v.as_str()),
+            Some("sonnet"),
+            "route-level scalars stay at route level"
+        );
+    }
+
+    #[test]
+    fn move_target_reorders_the_chain() {
+        let session = starter_session("move-target");
+        // The fixture's route has one target; add a second, then move it to
+        // the front. Both indexes are `target` array indexes.
+        let session = chain(
+            &session,
+            &[
+                (
+                    "add-target",
+                    r#"{"id":"claude-opus-5","provider":"zen-go","model":"m-extra"}"#,
+                ),
+                ("move-target", r#"{"id":"claude-opus-5","from":1,"to":0}"#),
+            ],
+        );
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        let chain = cfg.routes["claude-opus-5"].targets();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].provider, "zen-go");
+        assert_eq!(chain[0].model, "m-extra");
+        assert_eq!(chain[1].model, "claude-opus-4-1");
+    }
+
+    #[test]
+    fn set_peak_hours_writes_and_clears_the_windows() {
+        let session = starter_session("peak-hours-op");
+        let session = chain(
+            &session,
+            &[(
+                "set-peak-hours",
+                r#"{"id":"claude-opus-5","index":0,"windows":["01:00-04:00","06:00-10:00"]}"#,
+            )],
+        );
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        let windows = &cfg.routes["claude-opus-5"].targets()[0].peak_hours;
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[1].to_string(), "06:00-10:00");
+
+        // An empty list removes the key rather than writing `peak_hours = []`.
+        let session = chain(
+            &session,
+            &[(
+                "set-peak-hours",
+                r#"{"id":"claude-opus-5","index":0,"windows":[]}"#,
+            )],
+        );
+        assert!(
+            !session.doc.contains("peak_hours"),
+            "an empty list should drop the key:\n{}",
+            session.doc
+        );
+    }
+
+    #[test]
+    fn add_target_carries_peak_hours() {
+        let session = starter_session("add-target-peak");
+        let session = chain(
+            &session,
+            &[(
+                "add-target",
+                r#"{"id":"claude-sonnet-5","provider":"zen-go","model":"m-b","peak_hours":["22:00-02:00"]}"#,
+            )],
+        );
+        let cfg = crate::config::load_from_str(&session.doc).unwrap();
+        let chain = cfg.routes["claude-sonnet-5"].targets();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[1].peak_hours.len(), 1);
+        assert_eq!(chain[1].peak_hours[0].to_string(), "22:00-02:00");
+    }
+
+    #[test]
+    fn a_malformed_peak_window_is_refused_and_the_session_is_untouched() {
+        let session = starter_session("peak-hours-bad");
+        let reply = apply(
+            "set-peak-hours",
+            &session,
+            r#"{"id":"claude-opus-5","index":0,"windows":["9am-noon"]}"#,
+        )
+        .unwrap();
+        let error = reply.error.expect("a malformed window is refused");
+        // The message names the offending half (`"9am"`), not the whole window.
+        assert!(error.contains("9am"), "got: {error}");
+        assert_eq!(
+            reply.session.unwrap().doc,
+            session.doc,
+            "a refused op must leave the session byte-identical"
+        );
     }
 
     /// **The equivalence property.** The same edits, driven through the wizard

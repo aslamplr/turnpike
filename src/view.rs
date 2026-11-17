@@ -74,6 +74,9 @@ pub struct TargetView {
     pub model: String,
     pub display_name: Option<String>,
     pub context_tokens: Option<u64>,
+    /// UTC windows in which this target is pricey, rendered `HH:MM-HH:MM`.
+    /// Empty means always available.
+    pub peak_hours: Vec<String>,
     /// The target provider's wire spec, so the UI can mark the hop that gets
     /// bridged.
     pub spec: Option<String>,
@@ -166,8 +169,8 @@ fn route_view(id: &str, r: &RouteCfg, providers: &BTreeMap<String, ProviderCfg>)
         cache_affinity: r.cache_affinity,
         display_name: r.display_name.clone(),
         context_tokens: config::effective_context_tokens(r),
-        // `targets()` synthesizes target 0 from the route's flat pair, so the
-        // view shows the same chain resolution and selection walk.
+        // The view shows the same chain resolution and selection walk: the
+        // `[[…target]]` blocks *are* the chain, in priority order.
         targets: r
             .targets()
             .iter()
@@ -176,6 +179,7 @@ fn route_view(id: &str, r: &RouteCfg, providers: &BTreeMap<String, ProviderCfg>)
                 model: t.model.clone(),
                 display_name: t.display_name.clone(),
                 context_tokens: t.context_tokens,
+                peak_hours: t.peak_hours.iter().map(|w| w.to_string()).collect(),
                 // `validate` guarantees the provider exists, but the view must
                 // not panic on a config that got past it by another route.
                 spec: providers
@@ -379,9 +383,9 @@ api_key = "k"
 
     #[test]
     fn view_targets_match_route_targets() {
-        // The chain the view shows is the chain resolution walks: target 0 is
-        // synthesized from the route's flat pair, so two declared blocks mean
-        // three targets, in declaration order.
+        // The chain the view shows is the chain resolution walks. This fixture
+        // is legacy-shaped, so the flat pair normalizes to position 0 ahead of
+        // the two declared blocks — three targets, in chain order.
         let view = build_from(
             r#"
 [providers.zen]
@@ -427,6 +431,40 @@ model = "gemma3:27b"
                 ("lms", "gemma3:27b"),
             ]
         );
+    }
+
+    #[test]
+    fn view_reports_peak_hours_and_the_strategy() {
+        let view = build_from(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+
+[routes."claude-sonnet-5"]
+strategy = "peak-hours"
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "claude-sonnet-4-5"
+peak_hours = ["01:00-04:00", "22:00-02:00"]
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen-go"
+model = "deepseek-v4-flash"
+"#,
+        );
+        let route = &view.routes[0];
+        assert_eq!(route.strategy, "peak-hours");
+        assert_eq!(
+            route.targets[0].peak_hours,
+            vec!["01:00-04:00".to_string(), "22:00-02:00".to_string()]
+        );
+        assert!(route.targets[1].peak_hours.is_empty());
     }
 
     #[test]

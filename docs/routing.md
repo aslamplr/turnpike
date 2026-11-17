@@ -1,19 +1,20 @@
 # Routing: one route, several upstreams
 
-A route is a client-facing model id (`claude-sonnet-5`) mapped onto a
-`provider`/`model` pair. That pair is the whole story for a `static` route —
-today's behavior, exactly. A route may also declare **additional** candidate
-upstreams and a **strategy** for choosing among them, so a request survives the
-provider it was not written for: a revoked key at `zen-go` while a local Ollama
-sits idle on the same machine.
+A route is a client-facing model id (`claude-sonnet-5`) mapped onto an ordered
+list of upstream models. Each candidate is a `[[routes.<id>.target]]` block, in
+priority order; the first one is the primary, and the whole list is what a
+`strategy` chooses among — so a request survives the provider it was not
+written for: a revoked key at `zen-go` while a local Ollama sits idle on the
+same machine.
 
-Three strategies, all per route, all optional:
+Four strategies, all per route, all optional:
 
 | `strategy` | Behavior |
 | --- | --- |
-| `static` | The route's own `provider`/`model`, every request. **The default**, and what a route with no `strategy` key means. |
+| `static` | The primary (chain index 0), every request. **The default**, and what a route with no `strategy` key means. |
 | `load-balance` | Round-robin across the route's targets, one per request. With `cache_affinity = true`, sticky per conversation instead — see [Cache affinity](#cache-affinity). |
 | `failover` | Try targets in order; on a retryable failure, move to the next. |
+| `peak-hours` | Serve from the first target that is not inside one of its own UTC `peak_hours` windows — the cheap pair outside its provider's pricey hours. See [Peak hours](#peak-hours). |
 
 **Keys are snake_case, values are hyphenated or a single word.** That is the
 existing convention and it is consistent: keys are `api_key_env` / `base_url` /
@@ -25,12 +26,15 @@ existing convention and it is consistent: keys are `api_key_env` / `base_url` /
 
 ```toml
 [routes."claude-sonnet-5"]
-provider = "zen-go"          # target 0 — the route's own pair, always first
-model = "deepseek-v4-flash"
 display_name = "Sonnet 5 (via Zen)"
 family = "sonnet"
 max_tokens = 64000
 strategy = "failover"
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen-go"
+model = "deepseek-v4-flash"
+display_name = "Sonnet 5 (via Zen)"
 
 [[routes."claude-sonnet-5".target]]
 provider = "ollama-local"
@@ -49,25 +53,40 @@ display_name = "Sonnet 5 (via LM Studio)"
 | `model` | — (required) | The upstream model id sent to that provider. |
 | `display_name` | none | A label for logs and reports only. Never sent upstream, never in the catalog. |
 | `context_tokens` | none | This target's real window. Feeds the route-level minimum; see [Context windows](#context-windows). |
+| `peak_hours` | none | UTC windows in which this target is pricey, e.g. `["01:00-04:00", "06:00-10:00"]`. Read only by `strategy = "peak-hours"`; see [Peak hours](#peak-hours). |
 
-**The schema is additive.** `target` is a list that defaults to empty and the
-flat `provider`/`model` stay required, so a route with no `[[…target]]` block is
-a target list of length one. Nothing existing changes meaning, and a config with
-no `strategy` key resolves, forwards, and advertises exactly what it did before
-this feature existed.
+**Every model is one of these blocks.** A route's `target` array *is* its chain,
+in priority order: chain index 0 (the first block) is the primary. There is no
+separate route-level `provider`/`model` — the older shape in which they held
+target 0 is still **accepted on read** and migrates automatically; see
+[Legacy shape and migration](#legacy-shape-and-migration).
 
 `RouteCfg::targets()` (`src/config.rs`) is the single definition of "what can
-serve this route" — target 0 is the route's flat pair, then the declared blocks.
-Resolution, selection, the catalog detail, and the `doctor` checks all read it,
-so a static route and an N-target route cannot drift apart.
+serve this route". Resolution, selection, the catalog detail, and the `doctor`
+checks all read it, so a static route and an N-target route cannot drift apart.
 
-## The flat pair is target 0
+## Legacy shape and migration
 
-There is no separate "primary" key. The route's own `provider`/`model` **is**
-target 0, and the `[[…target]]` blocks are targets 1..N. That is why the example
-above puts `strategy = "failover"` on the route and still lists the first
-candidate as the flat pair: the Zen target is the primary, and the two `target`
-blocks are what it fails over to.
+Before every model became an array item, a route carried its primary as flat
+`provider`/`model` keys and the `target` array held the rest. That shape still
+**loads**: the parser folds the flat pair into the first target (carrying its
+`context_tokens` with it), so an old file resolves and forwards exactly as
+before without being touched by hand.
+
+Writers only ever emit the array shape. `turnpike serve` migrates the file
+itself on startup: it rewrites it through the same comment-preserving
+`toml_edit` path the wizard uses, keeping the original bytes at a sibling
+`<config>.bak` — same permissions, because a config may hold inline keys — and
+logs both paths. If the file cannot be rewritten (read-only, or an inline-table
+route the migrator cannot touch), the gateway warns and keeps serving the legacy
+shape from memory; nothing is lost. `turnpike doctor`'s `routes-legacy-shape`
+warns while a file is still in the old shape.
+
+The migration **moves** `provider`, `model` and `context_tokens` into the new
+first block, so a comment above any of them travels with it. `display_name`
+stays on the route as the catalog label. The migrated document must parse back
+into a config — that is the proof the rewrite is sound — but it is not
+validated, so an invalid-but-legacy file still normalizes.
 
 ## Model resolution does not change
 
@@ -83,9 +102,9 @@ The three matching rules are unchanged, with one compatibility fix:
 
 1. **Exact route id** — `"claude-sonnet-5"` matches `[routes."claude-sonnet-5"]`.
 2. **Any route whose target model matches** — requesting an upstream id directly.
-   This rule must scan `targets()`, not the route's flat `model`, or a request
+   This rule must scan `targets()`, not just the primary's `model`, or a request
    for `qwen3.8` (a real target in the example above) would silently stop
-   resolving. That is a compatibility fix, not a new feature.
+   resolving.
 3. **`provider/model` or `provider:model`** — explicit routing, checked after
    the two route rules so ids that themselves contain `/` or `:` still resolve.
 
@@ -94,12 +113,14 @@ The three matching rules are unchanged, with one compatibility fix:
 `Gateway` is `Arc`-shared, which is where a cross-request counter belongs.
 `select_target()` picks and advances:
 
-- `static` → target 0, counter untouched.
+- `static` → the primary (chain index 0), counter untouched.
 - `load-balance` → `n = counter[route_id] % targets.len()`, then increment.
   With `cache_affinity = true`, the pick is sticky per conversation instead —
   the cursor advances on new conversations only. [Cache affinity](#cache-affinity).
-- `failover` → target 0. The *ordering* of attempts is the policy, so selection
+- `failover` → the primary. The *ordering* of attempts is the policy, so selection
   itself is trivial.
+- `peak-hours` → the first target outside its own UTC windows, else the
+  primary. [Peak hours](#peak-hours).
 
 Two rules make round-robin correct, and both are the classic failure mode:
 
@@ -128,10 +149,12 @@ last grew on b's side. Both targets write duplicate caches of the shared head.
 
 ```toml
 [routes."claude-sonnet-5"]
-provider = "a"
-model = "m-a"
 strategy = "load-balance"
 cache_affinity = true
+
+[[routes."claude-sonnet-5".target]]
+provider = "a"
+model = "m-a"
 
 [[routes."claude-sonnet-5".target]]
 provider = "b"
@@ -229,6 +252,59 @@ live search loop) that show the cache economics.
 the pin cannot engage — any strategy other than `load-balance`, or fewer than
 two targets. Hand-editing is the way to set it today; the setup wizard does
 not yet offer it.
+
+## Peak hours
+
+Providers publish price windows: the same (provider, model) pair can cost
+several times more between, say, 01:00 and 04:00 UTC. `peak-hours` turns that
+into a routing decision. Each target declares the UTC windows in which **it** is
+expensive:
+
+```toml
+[routes."claude-sonnet-5"]
+strategy = "peak-hours"
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen"
+model = "claude-sonnet-4-5"
+peak_hours = ["01:00-04:00", "06:00-10:00"]
+
+[[routes."claude-sonnet-5".target]]
+provider = "zen-go"
+model = "deepseek-v4-flash"
+```
+
+Selection walks the chain in order and serves from the **first target that is
+not inside one of its own windows**. A target with no windows is always
+available. When every target is in peak the chain's first target serves — a
+request is never refused over price, and the choice stays deterministic.
+
+- **UTC, not local time.** Provider pricing is published in UTC; the gateway
+  reads `SystemTime` and derives the minute of day, with no timezone database
+  and no DST. A window for a provider that publishes local time has to be
+  converted by hand.
+- **Several windows per day, and they may wrap.** `"22:00-02:00"` covers
+  22:00–24:00 and 00:00–02:00. Each window is half-open: `01:00-04:00` contains
+  01:00 but not 04:00.
+- **A malformed window is a parse error**, naming the offending string — a
+  schedule the gateway cannot honor must not silently become "never peak".
+  `start == end` is rejected as ambiguous.
+- **The pick is read once per request**, not per attempt: a clock read per
+  attempt could flip at a minute boundary and make one request's chain
+  non-deterministic.
+- **It fails over like the affinity pick.** The peak pick leads; the rest of the
+  chain follows in configured order, so a retryable failure on the cheap
+  alternate falls back to the (in-peak) primary rather than failing.
+  Availability beats cost.
+- **Crossing a boundary costs one cold-cache turn.** A conversation spanning a
+  window edge switches targets mid-flight and re-reads its prompt once. That is
+  inherent to switching models; `cache_affinity` does not apply (it is a
+  `load-balance` knob, and `doctor`'s `routes-affinity-shape` says so).
+
+`doctor`'s `routes-peak-hours` warns when windows are set on a route whose
+strategy is not `peak-hours` (they parse and are then ignored), or when a
+`peak-hours` route declares no windows at all (it behaves exactly like
+`static`).
 
 ## Failover is pre-first-byte only
 
@@ -346,8 +422,9 @@ design:
 1. **The route's own `context_tokens`, if the user set it → wins outright.**
    That is the explicit static override; if a computed minimum could beat it,
    there would be no way to force a window.
-2. **`static` → that same field, unchanged.** Adding targets to a route must not
-   change what a static route advertises.
+2. **`static` → that same field, else the primary's own window.** Every model is
+   a target now, so a static route's pair carries its window on chain index 0;
+   adding later targets must not change what it advertises.
 3. **A strategy is active → `min()` over the targets that declare one**, falling
    back to the route field when none do.
 
@@ -379,13 +456,15 @@ picker lists.
 
 | Check | Status | Finding |
 | --- | --- | --- |
-| `routes-target-provider` | **Fail** | A target references a provider not in `[providers]`. This is the third `config::validate` rule, not a lint: the gateway cannot serve the config at all. |
+| `routes-target-provider` | **Fail** | A target references a provider not in `[providers]`. This is the `config::validate` target rule, not a lint: the gateway cannot serve the config at all. |
 | `routes-strategy` | `Warn` | `load-balance` / `failover` with fewer than 2 targets — indistinguishable from `static`. |
 | `routes-target-duplicate` | `Warn` | The same `(provider, model)` twice in one route's chain. |
 | `routes-mixed-spec` | `Warn` | A route mixes anthropic- and openai-spec targets; the translation path changes per request. |
 | `routes-context-mixed` | `Warn` | A strategy route where some targets declare `context_tokens` and others don't. |
 | `routes-failover-single-provider` | `Warn` | A `failover` chain whose targets are all one provider — a provider-wide outage still takes the route down. |
 | `routes-affinity-shape` | `Warn` | `cache_affinity` set on a route where the pin cannot engage — any strategy other than `load-balance`, or fewer than 2 targets; the key parses and is then ignored. |
+| `routes-peak-hours` | `Warn` | `peak_hours` set on a route whose strategy is not `peak-hours` (parsed, then ignored), or a `peak-hours` route that declares no windows (behaves as `static`). |
+| `routes-legacy-shape` | `Warn` | A route still written with the flat `provider`/`model` pair; start the gateway (`turnpike serve`) or save from `turnpike setup` to migrate it. |
 
 `key-resolvable` gains importance rather than changing: with failover, an
 unresolvable primary key no longer fails loudly at request time, so the static
@@ -397,13 +476,16 @@ Hand-editing `[[…target]]` works and `doctor` validates it, but the wizard
 writes the same blocks through the same comment-preserving `toml_edit` path as
 every other field. Under **Routes** → edit a route, two menu entries do the work:
 
-- **Targets** — lists the whole chain (`target 0` is labelled *the route's own
-  pair*), then Add / Edit / Remove / Strategy / Back. Adding asks the provider
-  from a menu of `[providers.*]` ids, the upstream model, and then
-  `display_name`/`context_tokens`, where an empty answer **omits** the key
-  rather than writing `key = ""`.
-- **strategy** — `static` / `load-balance` / `failover`, defaulting to the
-  route's current value.
+- **Targets** — lists the whole chain uniformly (`target 0` is marked
+  *primary*), then Add / Edit / Move up / Move down / Peak hours / Remove /
+  Strategy / Back. Adding asks the provider from a menu of `[providers.*]` ids,
+  the upstream model, `display_name`/`context_tokens`, and optional
+  `peak_hours`, where an empty answer **omits** the key rather than writing
+  `key = ""`. Move up/down reorders the chain — the priority order `failover`,
+  `peak-hours`, and even `static` (whose primary is index 0) obey. The last
+  remaining target cannot be removed: a route needs at least one.
+- **strategy** — `static` / `load-balance` / `failover` / `peak-hours`,
+  defaulting to the route's current value.
 
 Two rules the wizard enforces, both matching `doctor` rather than inventing a
 second opinion:
@@ -416,14 +498,12 @@ second opinion:
    says so, undoing rule 1's state rather than leaving a file the user's own
    `doctor` complains about.
 
-**Target 0 is never rewritten.** The wizard appends to the `target` array, which
-is targets 1..N by definition; the route's own flat `provider`/`model` is edited
-through the route's ordinary `provider`/`model` fields. Writing a `[[…target]]`
-block for the pair the route already has would give it two target 0s.
+**Reordering moves the block, comments and all.** A `# …` line above a
+`[[…target]]` header lives in that table's prefix decor, and `move-target`
+re-inserts the whole table, so the comment travels with it.
 
-**Removing a target loses its introducing comment.** A `# …` line above a
-`[[…target]]` header lives in that table's prefix decor, and dropping the block
-drops the comment with it. This is accepted and documented rather than worked
+**Removing a target loses its introducing comment.** The same decor is dropped
+when the block is removed. This is accepted and documented rather than worked
 around: the comment-preservation rule exists for scalars a user annotates
 (`api_key`), and a half-working graft for a second header shape would be worse
 than a known limit.
@@ -434,6 +514,12 @@ than a known limit.
   (and, with `cache_affinity`, sticky per conversation) — there is no weight
   key. The schema leaves room: a `weight` field on `TargetCfg` is additive and
   no existing key changes meaning.
+- **Local-time or per-weekday peak schedules.** `peak_hours` is UTC and the
+  same every day. A provider that publishes local-time windows has to be
+  converted by hand, and a weekday-only window is written as a daily one.
+- **Priced cost modelling.** The gateway does not know what a request costs; a
+  peak schedule is an operator's declaration, not a computed decision, and there
+  is no price multiplier key.
 - **First-byte timeout**, and with it the "is slow" half.
 - **Mid-stream failover** — requires buffering; see above.
 - **The `401`/`402`/`403`/`404`/`408` retry allowlist** — see
@@ -448,5 +534,5 @@ than a known limit.
   `[routes.<id>]` and the target array.
 - [gateway.md](gateway.md) — the forwarding pipeline and where the attempt loop
   sits in it.
-- [setup-and-doctor.md](setup-and-doctor.md) — the check list these seven checks
+- [setup-and-doctor.md](setup-and-doctor.md) — the check list these nine checks
   joined.

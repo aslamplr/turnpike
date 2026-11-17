@@ -114,19 +114,28 @@ cargo test        # inline #[cfg(test)] modules per file
   target 0. "Which target serves *this* request, right now?" is stateful and request-scoped, so it
   lives on `Gateway` (`select_target`); folding the two would make the launcher and `/v1/models`
   advance round-robin counters, and "what does this name mean" would stop being deterministic.
-- **Per-route targets** (`docs/routing.md`): a route's flat `provider`/`model` is **target 0**, and
-  `[[routes.<id>.target]]` adds 1..N behind a `strategy` — `static` (default), `load-balance`
-  (round-robin), `failover` (in order). `RouteCfg::targets()` is the single definition of "what can
+- **Per-route targets, array-only** (`docs/routing.md`): **every model is a
+  `[[routes.<id>.target]]` block** and a chain index **is** the `target` array index — target 0,
+  the primary, included. There is no route-level `provider`/`model` in the schema; a legacy flat
+  pair still *parses* through a private `RouteCfgRaw` + `#[serde(try_from)]` layer that turns it
+  into target 0, and `turnpike serve` **migrates the file** at startup (`migrate_config_file`,
+  comment-preserving via `toml_edit`, `<config>.bak` backup, warning and continuing in memory if
+  the write fails). Writers normalize too (`setup::run_with`, `config-edit --load`/`save`), so
+  nothing new emits the old shape. `RouteCfg::targets()` is the single definition of "what can
   serve this route", read by resolution, selection, the catalog detail, and `doctor`. Rule 2 of
-  resolution scans the **whole target chain**, not the flat `model`, or a request for a target's
-  upstream id would silently stop resolving. Round-robin counters are keyed by **route id, not
-  index** (`routes` is a `BTreeMap`, so iteration is alphabetical) and built **once** in
-  `Gateway::new` — a per-request map degenerates to "always target 0". The wizard's target UI
-  (`turnpike setup` → Routes → edit a route → Targets) **appends** to the `target` array and never
-  rewrites target 0, which stays the route's flat `provider`/`model`: `targets()` synthesizes
-  target 0, so a block for that pair would give the route two of them. It refuses a non-`static`
-  strategy on a 1-target route (the state `routes-strategy` lints) and resets a stranded strategy
-  to `static` when a removal leaves one target. `cache_affinity = true` opts a
+  resolution scans the **whole target chain**, or a request for a target's upstream id would
+  silently stop resolving. Round-robin counters are keyed by **route id, not index** (`routes` is
+  a `BTreeMap`, so iteration is alphabetical) and built **once** in `Gateway::new` — a
+  per-request map degenerates to "always target 0". `strategy` is one of `static` (default),
+  `load-balance` (round-robin), `failover` (in order), `peak-hours`. **Peak hours** are per-target
+  UTC windows (`peak_hours = ["01:00-04:00", "06:00-10:00"]`, half-open, wrapping past midnight
+  when `end < start`); `peak_pick()` serves the first target *outside* its own windows, target 0
+  when every target is in peak, evaluated **once per request** (never per attempt) and the chain
+  becomes pick + the rest in configured order — so a peak-hours route also fails over. The
+  wizard's target UI and the desktop Routes panel treat the chain uniformly: Add / Edit / Move
+  up / Move down / Peak hours / Remove / Strategy, every op taking the array index. They refuse a
+  non-`static` strategy on a 1-target route (the state `routes-strategy` lints) and reset a
+  stranded strategy to `static` when a removal leaves one target. `cache_affinity = true` opts a
   `load-balance` route into **sticky per-conversation selection** — a SHA-256 pin over the
   replay-stable head `(model, system, messages[0])`, next-cursor pick on a miss, ~5-min TTL, and a
   fallback-served turn re-points the pin; plain `load-balance` keeps its documented single attempt
@@ -163,8 +172,9 @@ cargo test        # inline #[cfg(test)] modules per file
   never be called from any view path; the view reads only the source. The desktop shell consumes
   this view, so this is also what keeps credentials out of the webview.
 - **`Fail` vs `Warn` in `doctor`**: `Fail` means the gateway cannot serve the config at all — the
-  three `config::validate` rules and nothing more. Everything else is a lint → `Warn`. Do not widen
-  `validate` to cover a lint; it breaks working configs.
+  two `config::validate` rules (no providers; a target naming an unknown provider) and nothing
+  more. Everything else is a lint → `Warn`. Do not widen `validate` to cover a lint; it breaks
+  working configs.
 - **The desktop bundle carries the CLI, and that payload is a build input**
   (`desktop/src-tauri/src/cli_install.rs`): `binaries/turnpike-cli` is declared as a
   `bundle.resources` entry, and `tauri-build` validates it at build-script time on **every** target — so

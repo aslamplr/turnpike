@@ -94,22 +94,25 @@ second question.
   menu whose first entry is `(infer from upstream model)`, so the common path is
   one keystroke. Optional fields are asked one at a time and an empty answer
   **omits** the key rather than writing `key = ""`. The list view renders the
-  whole target chain, not just target 0: `claude-sonnet-5 -> zen-go/v4-flash
-  [failover, 3 targets]`. Editing a route offers two more entries:
+  whole target chain: `claude-sonnet-5 -> zen-go/v4-flash [failover, 3 targets]`.
+  Editing a route offers two more entries:
 
-  - **strategy** — `static` / `load-balance` / `failover`, defaulting to the
-    route's current value. `static` **omits** the key rather than writing
-    `strategy = "static"`, the same omit-when-default discipline as an empty
-    optional. A non-`static` choice on a route with fewer than 2 targets prints
-    the requirement and writes nothing — the wizard will not create the state
-    `routes-strategy` warns about.
-  - **Targets** — the `[[routes.<id>.target]]` chain, listed with `target 0`
-    labelled *the route's own pair*, then Add / Edit / Remove / Back. Add asks
-    the provider from a menu of `[providers.*]` ids, the upstream model, then
-    `display_name` / `context_tokens` with the same omit-on-empty rule. Target 0
-    is never written: the route's own flat `provider`/`model` is edited through
-    the route's ordinary fields, and a block for it would give the route two
-    target 0s.
+  - **strategy** — `static` / `load-balance` / `failover` / `peak-hours`,
+    defaulting to the route's current value. `static` **omits** the key rather
+    than writing `strategy = "static"`, the same omit-when-default discipline as
+    an empty optional. A non-`static` choice on a route with fewer than 2 targets
+    prints the requirement and writes nothing — the wizard will not create the
+    state `routes-strategy` warns about.
+  - **Targets** — the `[[routes.<id>.target]]` chain, every entry listed
+    uniformly with `target 0` labelled `(primary)`, then Add / Edit / Move up /
+    Move down / Peak hours / Remove / Strategy / Back. A chain index **is** the
+    `target` array index, target 0 included. Add and Edit ask the provider from a
+    menu of `[providers.*]` ids, the upstream model, then `display_name` /
+    `context_tokens` / `peak_hours` with the same omit-on-empty rule; **Peak
+    hours** asks for a comma-separated `HH:MM-HH:MM` list (UTC, blank clears);
+    **Move up**/**Move down** rewrite the chain order. The route's own `model` /
+    `provider` fields in the edit menu are labelled `(target 0)` and write that
+    block through `set_route_target_scalar`.
 
   Removing a target **loses its introducing comment**: a `# …` line above a
   `[[…target]]` header lives in that table's prefix decor, and dropping the
@@ -264,9 +267,11 @@ input and testable without a tty.
 | `remove-route` | `id` | `remove_route` |
 | `set-route` | `id`, `key`, `value` | `set_route_scalar` |
 | `set-strategy` | `id`, `strategy` | `set_strategy` |
-| `add-target` | `id`, `provider`, `model`, … | `add_route_target` |
+| `add-target` | `id`, `provider`, `model`, `peak_hours`?, … | `add_route_target` |
 | `remove-target` | `id`, `index` | `remove_route_target` |
+| `move-target` | `id`, `from`, `to` | `move_route_target` |
 | `set-target` | `id`, `index`, `key`, `value` | `set_route_target_scalar` |
+| `set-peak-hours` | `id`, `index`, `windows` | `set_route_target_peak_hours` |
 | `set-search` | `provider`, `base_url`, `max_loops`, `api_key_env`, `clear_inline_key` | `set_search` |
 | `remove-search` | — | `remove_search` |
 | `stage-key` | `slot`, `value` | `Plan::secret_writes` |
@@ -309,10 +314,12 @@ Three conventions the callers must respect, all of them the wizard's:
 
 - **`strategy = "static"` is written by removing the key**, not by writing the
   value (`remove_route_scalar_keeping_comment`).
-- **Target 0 is the route's flat `provider`/`model` and is never written as a
-  `[[routes.<id>.target]]` block.** `add-target` appends to the array (so chain
-  index `i` is array index `i - 1`), `remove-target` takes the **array** index, and
-  changing target 0 is `set-route`, not `remove-target`.
+- **Every model is a `[[routes.<id>.target]]` block.** A chain index **is** the
+  `target` array index — including 0, the primary. `add-target` appends,
+  `remove-target` and `move-target` take that index, and `set-peak-hours` takes
+  it too. Removing the last remaining target is refused: a route needs one.
+  A legacy flat-pair route still loads; start `turnpike serve` (or save from
+  setup) to migrate it into blocks first.
 - **A key's slot is `provider.<id>` or `search.<provider>`** — the plan key it is
   staged under, and the only thing a caller ever learns about a staged secret. The
   search slot is keyed by the *provider*, not fixed at `search.exa`, so exa's key is
@@ -390,8 +397,8 @@ chance to disagree. `--json` is the real interface:
       "cache_affinity": false,
       "context_tokens": 200000,
       "targets": [
-        { "provider": "zen", "model": "claude-sonnet-4-5", "spec": "anthropic" },
-        { "provider": "zen-go", "model": "v4-flash", "spec": "openai" }
+        { "provider": "zen", "model": "claude-sonnet-4-5", "spec": "anthropic", "peak_hours": ["01:00-04:00", "06:00-10:00"] },
+        { "provider": "zen-go", "model": "v4-flash", "spec": "openai", "peak_hours": [] }
       ]
     }
   ],
@@ -434,9 +441,9 @@ false alarm.
 
 Three things the view deliberately does *not* compute for itself:
 
-- **`RouteCfg::targets()`** for a route's chain, so target 0 is synthesized from
-  the route's flat `provider`/`model` exactly as resolution sees it — the window
-  cannot show a chain the gateway would not walk.
+- **`RouteCfg::targets()`** for a route's chain, so the blocks the window shows
+  *are* the chain resolution and selection walk — there is no synthesized target
+  0 to drift from what the gateway would serve.
 - **`effective_context_tokens(route)`** for the route-level window, so the
   displayed number is the one the gateway enforces.
 - **`SearchManager::from_config(cfg)`** for the search block's `running` flag, so
@@ -469,12 +476,14 @@ repairs, and the process exits 0 unless a check came back `Fail`.
 
 ### Where the `Fail`/`Warn` line is drawn
 
-`Fail` means **the gateway cannot serve this config at all** — exactly the three
+`Fail` means **the gateway cannot serve this config at all** — exactly the two
 rules `config::validate` enforces:
 
 - no `[providers.*]` at all,
-- a route referencing a provider that is not defined,
 - a route target referencing a provider that is not defined.
+
+(The old flat-route rule is subsumed: a legacy `provider`/`model` pair is parsed
+into target 0, so it is checked by the target rule.)
 
 Everything else is a lint, and lints are `Warn`. Widening `validate` to cover a
 lint would break configs that work today, which is strictly worse than a
@@ -486,14 +495,14 @@ explains it. The rest of the list is advice.
 
 ### The check list
 
-The 27 checks, in the order they run — from "is there even a config" to "does
+The 29 checks, in the order they run — from "is there even a config" to "does
 the upstream answer":
 
 | # | Check | Reports |
 | --- | --- | --- |
 | 1 | `config-found` | Which path was resolved, and whether it exists. |
 | 2 | `config-parse` | A TOML syntax error, with toml's own line number. |
-| 3 | `validate` | The three hard rules above. |
+| 3 | `validate` | The two hard rules above. |
 | 4 | `providers-key-env` | Whether each `api_key_env` is set and non-empty. |
 | 5 | `providers-key-inline` | One warning per literal `api_key`, pointing at `turnpike setup`. |
 | 6 | `secrets-store` | Whether `~/.turnpike/` is present and `master.key` is mode 0600, with the exact `chmod` in `fix`. |
@@ -504,20 +513,22 @@ the upstream answer":
 | 11 | `listen-addr` | `SocketAddr::parse` plus a loopback check. Binding a wildcard address is not fatal — the Host guard still rejects off-host requests — but it widens exposure, so it warns. |
 | 12 | `search-config` | The configured search provider and loop bound. |
 | 13 | `routes-shape` | Non-empty, known `family`, sane token counts, duplicate `(provider, model)` pairs. |
-| 14 | `routes-target-provider` | A target names a provider that isn't in `[providers.*]`. The one `Fail` in this group — it is the third `config::validate` rule, so the gateway cannot serve the config at all. |
-| 15 | `routes-strategy` | `load-balance` / `failover` with fewer than 2 targets, which is indistinguishable from `static`. |
-| 16 | `routes-target-duplicate` | The same `(provider, model)` twice in one route's target chain, reported by position. |
-| 17 | `routes-mixed-spec` | A route mixing anthropic- and openai-spec targets; the translation path is chosen per attempt. |
-| 18 | `routes-context-mixed` | A strategy route where some targets declare `context_tokens` and others don't — the route minimum then ignores the silent ones. |
-| 19 | `routes-failover-single-provider` | A `failover` chain whose targets are all one provider, so a provider-wide outage still takes the route down. |
-| 20 | `routes-affinity-shape` | `cache_affinity` set on a route where the pin cannot engage — the strategy is not `load-balance`, or the chain has fewer than 2 targets. The key parses and is then ignored, which is the silent state this check exists to prevent. |
-| 21 | `base-url-shape` | Parses with `reqwest::Url`; warns when an Anthropic-spec `base_url` ends in `/v1`, since turnpike appends the spec path itself. |
-| 22 | `config-perms` | Warns if an inline key is present and `mode & 0o077 != 0`. |
-| 23 | `backups` | Whether a config backup exists yet. |
-| 24 | `launchers` | Claude Code on `PATH` / installed, and whether the Claude Desktop gateway profile is applied. |
-| 25 | `gateway-detected` | `GET /_health` on the configured gateway address, expecting 204 + `x-turnpike-gateway: 1`. |
-| 26 | `gateway-shadows-config` | Compares the running gateway's `/v1/models` route ids against this config and warns on divergence. |
-| 27 | `provider-reach` | Live-only. `GET` the cheap endpoint per provider with injected auth and an 8s timeout. Any HTTP response means reachable; **only** a 401/403 escalates, and then doctor asks before a billed call. |
+| 14 | `routes-legacy-shape` | A route still using the flat `provider`/`model` pair — read-compat that the startup migration rewrites. Fix: start `turnpike serve`, or save from setup. |
+| 15 | `routes-target-provider` | A target names a provider that isn't in `[providers.*]`. The one `Fail` in this group — it is the `config::validate` target rule, so the gateway cannot serve the config at all. |
+| 16 | `routes-strategy` | `load-balance` / `failover` / `peak-hours` with fewer than 2 targets, which is indistinguishable from `static`. |
+| 17 | `routes-target-duplicate` | The same `(provider, model)` twice in one route's target chain, reported by position. |
+| 18 | `routes-mixed-spec` | A route mixing anthropic- and openai-spec targets; the translation path is chosen per attempt. |
+| 19 | `routes-context-mixed` | A strategy route where some targets declare `context_tokens` and others don't — the route minimum then ignores the silent ones. |
+| 20 | `routes-failover-single-provider` | A `failover` chain whose targets are all one provider, so a provider-wide outage still takes the route down. |
+| 21 | `routes-affinity-shape` | `cache_affinity` set on a route where the pin cannot engage — the strategy is not `load-balance`, or the chain has fewer than 2 targets. The key parses and is then ignored, which is the silent state this check exists to prevent. |
+| 22 | `routes-peak-hours` | `peak_hours` set on a route whose strategy is not `peak-hours` (parsed, then ignored), or a `peak-hours` route that declares no windows at all (it behaves exactly like `static`). |
+| 23 | `base-url-shape` | Parses with `reqwest::Url`; warns when an Anthropic-spec `base_url` ends in `/v1`, since turnpike appends the spec path itself. |
+| 24 | `config-perms` | Warns if an inline key is present and `mode & 0o077 != 0`. |
+| 25 | `backups` | Whether a config backup exists yet. |
+| 26 | `launchers` | Claude Code on `PATH` / installed, and whether the Claude Desktop gateway profile is applied. |
+| 27 | `gateway-detected` | `GET /_health` on the configured gateway address, expecting 204 + `x-turnpike-gateway: 1`. |
+| 28 | `gateway-shadows-config` | Compares the running gateway's `/v1/models` route ids against this config and warns on divergence. |
+| 29 | `provider-reach` | Live-only. `GET` the cheap endpoint per provider with injected auth and an 8s timeout. Any HTTP response means reachable; **only** a 401/403 escalates, and then doctor asks before a billed call. |
 
 ### Local probe vs live checks
 
@@ -574,7 +585,7 @@ Machine-readable, `--json`:
       "fix": "run `turnpike setup` → Keys, or export the env var shown below"
     }
   ],
-  "summary": { "warnings": 3, "failures": 0, "total": 27 }
+  "summary": { "warnings": 3, "failures": 0, "total": 29 }
 }
 ```
 

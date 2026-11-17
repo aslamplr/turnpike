@@ -308,6 +308,78 @@ fn save_succeeds_when_the_config_directory_does_not_exist_yet() {
     std::fs::remove_dir_all(scratch_config.parent().expect("config parent")).ok();
 }
 
+/// The writers normalize the document shape, and `--load` is the one place that
+/// can be pinned across the process edge.
+///
+/// A legacy flat `provider`/`model` route still *parses* (read-compat forever),
+/// but every writer emits the array shape — starting with the session `--load`
+/// hands the window, so the first `--view` a user sees and any later save are
+/// already `[[…target]]` blocks. `--load` still writes nothing: opening a
+/// session stays free, and the file is only rewritten by an explicit save (or
+/// `serve`'s startup migration).
+#[test]
+fn load_normalizes_a_legacy_route_into_target_blocks() {
+    let (config, home) = scratch("legacy-load");
+    let legacy = r#"# a hand-written config in the old shape
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key_env = "OPENCODE_API_KEY"
+
+[routes."claude-sonnet-5"]
+family = "sonnet"
+provider = "zen"
+model = "claude-sonnet-4-5"
+"#;
+    std::fs::write(&config, legacy).expect("writing the legacy config");
+
+    let (loaded, stderr, ok) = run(&config, &home, &["--load"], "");
+    assert!(ok, "--load failed: {stderr}");
+    let reply = one_json_object(&loaded, "--load", &stderr);
+    let session = reply["session"]["doc"]
+        .as_str()
+        .expect("--load's reply carries the session document");
+
+    let parsed: toml::Value = toml::from_str(session).expect("the session document is TOML");
+    let route = parsed
+        .get("routes")
+        .and_then(|r| r.get("claude-sonnet-5"))
+        .and_then(|r| r.as_table())
+        .expect("the route table");
+    assert!(
+        !route.contains_key("provider") && !route.contains_key("model"),
+        "the session is still in the legacy shape:\n{session}"
+    );
+    let targets = route
+        .get("target")
+        .and_then(|t| t.as_array())
+        .expect("a target chain");
+    assert_eq!(targets.len(), 1);
+    assert_eq!(
+        targets[0].get("provider").and_then(|v| v.as_str()),
+        Some("zen")
+    );
+    assert_eq!(
+        targets[0].get("model").and_then(|v| v.as_str()),
+        Some("claude-sonnet-4-5")
+    );
+    // Route-level scalars stay put, and the comment survives the rewrite.
+    assert_eq!(route.get("family").and_then(|v| v.as_str()), Some("sonnet"));
+    assert!(
+        session.contains("# a hand-written config in the old shape"),
+        "a comment was lost in normalization:\n{session}"
+    );
+
+    // Opening a session is still free.
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("reading the config back"),
+        legacy,
+        "--load rewrote the file"
+    );
+
+    std::fs::remove_dir_all(config.parent().expect("config parent")).ok();
+}
+
 /// The store tier of the view, end to end.
 ///
 /// It cannot be asserted from `setup::cli`'s inline tests: `cli::view` opens the
