@@ -292,6 +292,51 @@ describe("Routes — the target chain", () => {
     expect(screen.getByLabelText("peak hours (UTC)")).toBeInTheDocument();
   });
 
+  it("checks all seven weekdays by default and sends the checked subset", async () => {
+    // The day list is part of the peak-hours config: absent means all seven
+    // active, and unchecking a day removes it from what is written.
+    const seen: Array<[string, number, string[], string[]]> = [];
+    const withPeak = route({
+      targets: [
+        {
+          provider: "zen",
+          model: "claude-sonnet-4-5",
+          display_name: null,
+          context_tokens: null,
+          peak_hours: ["01:00-04:00"],
+          enabled: true,
+          spec: null,
+        },
+      ],
+    });
+    mount([withPeak], {
+      onPeakHours: async (
+        id: string,
+        index: number,
+        windows: string[],
+        days: string[],
+      ) => {
+        seen.push([id, index, windows, days]);
+        return true;
+      },
+    });
+
+    await userEvent.click(screen.getByText("Peak hours"));
+    for (const d of ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]) {
+      expect(screen.getByLabelText(`Target 0 ${d}`)).toBeChecked();
+    }
+
+    // Drop the weekend; the checked days are what gets written.
+    await userEvent.click(screen.getByLabelText("Target 0 Sat"));
+    await userEvent.click(screen.getByLabelText("Target 0 Sun"));
+    expect(screen.getByLabelText("Target 0 Sat")).not.toBeChecked();
+
+    await userEvent.click(screen.getByText("Save"));
+    expect(seen).toEqual([
+      ["claude-sonnet-5", 0, ["01:00-04:00"], ["mon", "tue", "wed", "thu", "fri"]],
+    ]);
+  });
+
   it("renders exactly the targets it is handed, synthesizing nothing", () => {
     // The Rust view is what guarantees target 0 exists — `targets()` synthesizes
     // it there. This component does not: it iterates the array it is given, so an

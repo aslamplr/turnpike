@@ -621,6 +621,21 @@ base_url = "http://localhost:8888"
                 arr.push(w.to_string());
             }
             table["peak_hours"] = toml_edit::value(arr);
+
+            // Days are a sub-config of the windows: only written alongside
+            // them. `None` (the default) omits the key — all days — and an
+            // all-seven list is redundant with that default, so it is omitted
+            // too.
+            if let Some(raw_days) = &t.peak_days {
+                let days = parse_peak_days(raw_days)?;
+                if days.len() != 7 {
+                    let mut darr = Array::new();
+                    for d in &days {
+                        darr.push(d.to_string());
+                    }
+                    table["peak_days"] = toml_edit::value(darr);
+                }
+            }
         }
 
         let routes = self
@@ -710,32 +725,55 @@ base_url = "http://localhost:8888"
         Ok(())
     }
 
-    /// Replace a target's UTC peak windows. `index` is the chain index.
+    /// Replace a target's UTC peak windows and, optionally, their active days.
+    /// `index` is the chain index.
     ///
-    /// Every window is parsed before anything is written — an invalid one is a
-    /// refusal that names it, and the document stays byte-identical. An empty
-    /// list removes the key: a target with no windows is always available,
-    /// which is the schema's default.
+    /// Every window and day is parsed before anything is written — an invalid
+    /// one is a refusal that names it, and the document stays byte-identical.
+    ///
+    /// `days` is the weekday sub-config of the windows: `None` leaves it
+    /// untouched, `Some` replaces it (all seven → the key is removed, since all
+    /// days is the default; an explicit empty list → `peak_days = []`, i.e. the
+    /// windows never apply). Clearing the windows (`windows` empty) removes the
+    /// day list too: a day set with no windows gates nothing.
     pub fn set_route_target_peak_hours(
         &mut self,
         id: &str,
         index: usize,
         windows: &[String],
+        days: Option<&[String]>,
     ) -> Result<()> {
         let parsed = parse_peak_hours(windows)?;
+        let parsed_days = match days {
+            Some(d) => Some(parse_peak_days(d)?),
+            None => None,
+        };
         self.refuse_legacy_target_op(id)?;
         // Existence first, so a bad index is an error even when the list is
         // empty and there is nothing to remove.
         self.target_table_mut(id, index)?;
         if parsed.is_empty() {
             self.remove_route_target_scalar(id, index, "peak_hours");
+            self.remove_route_target_scalar(id, index, "peak_days");
             return Ok(());
         }
         let mut arr = Array::new();
         for w in &parsed {
             arr.push(w.to_string());
         }
-        self.set_route_target_scalar(id, index, "peak_hours", arr)
+        self.set_route_target_scalar(id, index, "peak_hours", arr)?;
+        if let Some(days) = parsed_days {
+            if days.len() == 7 {
+                self.remove_route_target_scalar(id, index, "peak_days");
+            } else {
+                let mut darr = Array::new();
+                for d in &days {
+                    darr.push(d.to_string());
+                }
+                self.set_route_target_scalar(id, index, "peak_days", darr)?;
+            }
+        }
+        Ok(())
     }
 
     /// Replace one scalar inside `[[routes.<id>.target]]` entry `index`.
@@ -1246,6 +1284,9 @@ pub struct TargetDraft {
     /// UTC peak windows, `HH:MM-HH:MM`, validated when the block is written.
     /// Empty omits the key.
     pub peak_hours: Vec<String>,
+    /// Weekdays on which `peak_hours` apply (`mon`..`sun`). `None` omits the
+    /// key — all days, the default. Only written alongside non-empty windows.
+    pub peak_days: Option<Vec<String>>,
 }
 
 /// The `strategy` values, in the order the wizard offers them. Kebab-case to
@@ -1263,6 +1304,25 @@ fn parse_peak_hours(raw: &[String]) -> Result<Vec<crate::config::PeakWindow>> {
                 .map_err(|e| anyhow::anyhow!("{e}"))
         })
         .collect()
+}
+
+/// Parse the raw weekday strings a caller supplies, naming the offender on
+/// failure. Canonicalizes to `Mon..Sun` order and dedupes, so the written
+/// document is stable regardless of click order. An empty input is an empty
+/// list (no day active) — the caller decides whether that means "omit".
+fn parse_peak_days(raw: &[String]) -> Result<Vec<crate::config::Weekday>> {
+    let mut picked: Vec<crate::config::Weekday> = Vec::new();
+    for s in raw {
+        let day = s
+            .parse::<crate::config::Weekday>()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        picked.push(day);
+    }
+    Ok(crate::config::Weekday::ALL
+        .iter()
+        .copied()
+        .filter(|d| picked.contains(d))
+        .collect())
 }
 
 /// Search defaults, so `setup` can write a `[search]` block that `doctor` and
@@ -1780,6 +1840,7 @@ base_url = "http://localhost:8888"
             display_name: None,
             context_tokens: None,
             peak_hours: Vec::new(),
+            peak_days: None,
         }
     }
 
@@ -2603,6 +2664,7 @@ model = "m-b"
             "claude-sonnet-5",
             0,
             &["01:00-04:00".to_string(), "06:00-10:00".to_string()],
+            None,
         )
         .unwrap();
         let cfg = doc.validated().unwrap();
@@ -2611,7 +2673,7 @@ model = "m-b"
         assert_eq!(windows[1].to_string(), "06:00-10:00");
 
         // An empty list removes the key: no windows is the schema default.
-        doc.set_route_target_peak_hours("claude-sonnet-5", 0, &[])
+        doc.set_route_target_peak_hours("claude-sonnet-5", 0, &[], None)
             .unwrap();
         assert!(
             !doc.as_str().contains("peak_hours"),
@@ -2629,7 +2691,7 @@ model = "m-b"
         let mut doc = fixture();
         let before = doc.as_str().to_string();
         let err = doc
-            .set_route_target_peak_hours("claude-sonnet-5", 0, &["9am-noon".to_string()])
+            .set_route_target_peak_hours("claude-sonnet-5", 0, &["9am-noon".to_string()], None)
             .unwrap_err()
             .to_string();
         // The message names the offending half (`"9am"`), not the whole window.
@@ -2638,6 +2700,71 @@ model = "m-b"
             doc.as_str(),
             before,
             "a refused peak write must not touch the document"
+        );
+    }
+
+    #[test]
+    fn peak_days_round_trip_canonicalize_and_clear() {
+        let mut doc = fixture();
+        // Unsorted with a duplicate: written canonically, deduped.
+        doc.set_route_target_peak_hours(
+            "claude-sonnet-5",
+            0,
+            &["01:00-04:00".to_string()],
+            Some(&["sun".to_string(), "mon".to_string(), "sun".to_string()]),
+        )
+        .unwrap();
+        let cfg = doc.validated().unwrap();
+        let days = &cfg.routes["claude-sonnet-5"].targets()[0].peak_days;
+        assert_eq!(
+            days.to_vec(),
+            vec![crate::config::Weekday::Mon, crate::config::Weekday::Sun]
+        );
+        assert!(doc.as_str().contains("peak_days"));
+
+        // All seven is the default: the key is omitted.
+        let all: Vec<String> = crate::config::Weekday::ALL
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        doc.set_route_target_peak_hours(
+            "claude-sonnet-5",
+            0,
+            &["01:00-04:00".to_string()],
+            Some(&all),
+        )
+        .unwrap();
+        assert!(
+            !doc.as_str().contains("peak_days"),
+            "all-seven should drop the key:\n{}",
+            doc.as_str()
+        );
+
+        // Clearing the windows clears the day list too.
+        doc.set_route_target_peak_hours("claude-sonnet-5", 0, &[], Some(&["mon".to_string()]))
+            .unwrap();
+        assert!(!doc.as_str().contains("peak_hours"));
+        assert!(!doc.as_str().contains("peak_days"));
+    }
+
+    #[test]
+    fn a_malformed_peak_day_is_refused_without_writing() {
+        let mut doc = fixture();
+        let before = doc.as_str().to_string();
+        let err = doc
+            .set_route_target_peak_hours(
+                "claude-sonnet-5",
+                0,
+                &["01:00-04:00".to_string()],
+                Some(&["funday".to_string()]),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("funday"), "got: {err}");
+        assert_eq!(
+            doc.as_str(),
+            before,
+            "a refused day write must not touch the doc"
         );
     }
 

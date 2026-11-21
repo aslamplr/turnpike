@@ -529,6 +529,7 @@ impl WizardState {
             display_name: None,
             context_tokens: None,
             peak_hours: Vec::new(),
+            peak_days: None,
         };
         let disp = p.ask_default("Target display name (blank to omit)", "")?;
         if !disp.trim().is_empty() {
@@ -543,6 +544,18 @@ impl WizardState {
             "",
         )?;
         t.peak_hours = split_peak_hours(&ph);
+        if !t.peak_hours.is_empty() {
+            let pd = p.ask_default(
+                "Days for peak hours, comma-separated mon..sun (blank for all)",
+                "",
+            )?;
+            let days = split_peak_hours(&pd);
+            t.peak_days = Some(if days.is_empty() {
+                all_day_names()
+            } else {
+                days
+            });
+        }
         Ok(Some(t))
     }
 
@@ -745,7 +758,24 @@ impl WizardState {
             "",
         )?;
         let windows = split_peak_hours(&raw);
-        report(self.doc.set_route_target_peak_hours(id, index, &windows));
+        let days = if windows.is_empty() {
+            None
+        } else {
+            let pd = p.ask_default(
+                "Days for peak hours, comma-separated mon..sun (blank for all)",
+                "",
+            )?;
+            let list = split_peak_hours(&pd);
+            Some(if list.is_empty() {
+                all_day_names()
+            } else {
+                list
+            })
+        };
+        report(
+            self.doc
+                .set_route_target_peak_hours(id, index, &windows, days.as_deref()),
+        );
         if windows.is_empty() {
             println!("  peak hours cleared for target {index}");
         }
@@ -841,7 +871,24 @@ impl WizardState {
                     "",
                 )?;
                 let windows = split_peak_hours(&v);
-                report(self.doc.set_route_target_peak_hours(id, index, &windows));
+                let days = if windows.is_empty() {
+                    None
+                } else {
+                    let pd = p.ask_default(
+                        "Days for peak hours, comma-separated mon..sun (blank for all)",
+                        "",
+                    )?;
+                    let list = split_peak_hours(&pd);
+                    Some(if list.is_empty() {
+                        all_day_names()
+                    } else {
+                        list
+                    })
+                };
+                report(
+                    self.doc
+                        .set_route_target_peak_hours(id, index, &windows, days.as_deref()),
+                );
                 if windows.is_empty() {
                     println!("  cleared peak_hours");
                 }
@@ -1505,6 +1552,15 @@ fn split_peak_hours(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every weekday name, Monday first — what a blank answer to the days prompt
+/// means (all days active, the key omitted).
+fn all_day_names() -> Vec<String> {
+    crate::config::Weekday::ALL
+        .iter()
+        .map(|d| d.to_string())
+        .collect()
+}
+
 /// `&[String]` as `&[&str]`, for `choose`'s option list.
 fn as_refs(items: &[String]) -> Vec<&str> {
     items.iter().map(|s| s.as_str()).collect()
@@ -1938,6 +1994,7 @@ base_url = "https://opencode.ai/zen"
                     display_name: None,
                     context_tokens: None,
                     peak_hours: Vec::new(),
+                    peak_days: None,
                 },
             )
             .unwrap();
@@ -1990,6 +2047,7 @@ base_url = "https://opencode.ai/zen"
                     display_name: None,
                     context_tokens: None,
                     peak_hours: Vec::new(),
+                    peak_days: None,
                 },
             )
             .unwrap();
@@ -2067,6 +2125,7 @@ base_url = "https://opencode.ai/zen"
                     display_name: None,
                     context_tokens: None,
                     peak_hours: Vec::new(),
+                    peak_days: None,
                 },
             )
             .unwrap();

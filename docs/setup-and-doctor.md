@@ -117,7 +117,8 @@ second question.
     array index, target 0 included. Add and Edit ask the provider from a menu of
     `[providers.*]` ids, the upstream model, then `display_name` /
     `context_tokens` / `peak_hours` with the same omit-on-empty rule; **Peak
-    hours** asks for a comma-separated `HH:MM-HH:MM` list (UTC, blank clears);
+    hours** asks for a comma-separated `HH:MM-HH:MM` list (UTC, blank clears)
+    and then the weekdays it applies on (blank = all);
     **Enable/disable** flips `enabled` (enabling removes the key, the default);
     **Move up**/**Move down** rewrite the chain order. The route's own `model` /
     `provider` fields in the edit menu are labelled `(target 0)` and write that
@@ -276,12 +277,12 @@ input and testable without a tty.
 | `remove-route` | `id` | `remove_route` |
 | `set-route` | `id`, `key`, `value` | `set_route_scalar` |
 | `set-strategy` | `id`, `strategy` | `set_strategy` |
-| `add-target` | `id`, `provider`, `model`, `peak_hours`?, … | `add_route_target` |
+| `add-target` | `id`, `provider`, `model`, `peak_hours`?, `peak_days`?, … | `add_route_target` |
 | `remove-target` | `id`, `index` | `remove_route_target` |
 | `move-target` | `id`, `from`, `to` | `move_route_target` |
 | `set-target` | `id`, `index`, `key`, `value` | `set_route_target_scalar` |
 | `set-target-enabled` | `id`, `index`, `enabled` | `set_route_target_enabled` |
-| `set-peak-hours` | `id`, `index`, `windows` | `set_route_target_peak_hours` |
+| `set-peak-hours` | `id`, `index`, `windows`, `days`? | `set_route_target_peak_hours` |
 | `set-search` | `provider`, `base_url`, `max_loops`, `api_key_env`, `clear_inline_key` | `set_search` |
 | `remove-search` | — | `remove_search` |
 | `stage-key` | `slot`, `value` | `Plan::secret_writes` |
@@ -409,8 +410,8 @@ chance to disagree. `--json` is the real interface:
       "cache_affinity": false,
       "context_tokens": 200000,
       "targets": [
-        { "provider": "zen", "model": "claude-sonnet-4-5", "spec": "anthropic", "peak_hours": ["01:00-04:00", "06:00-10:00"] },
-        { "provider": "zen-go", "model": "v4-flash", "spec": "openai", "peak_hours": [] }
+        { "provider": "zen", "model": "claude-sonnet-4-5", "spec": "anthropic", "peak_hours": ["01:00-04:00", "06:00-10:00"], "peak_days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] },
+        { "provider": "zen-go", "model": "v4-flash", "spec": "openai", "peak_hours": [], "peak_days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] }
       ]
     }
   ],
@@ -534,7 +535,7 @@ the upstream answer":
 | 20 | `routes-context-mixed` | A strategy route where some enabled targets declare `context_tokens` and others don't — the route minimum then ignores the silent ones. |
 | 21 | `routes-failover-single-provider` | A `failover` chain whose enabled targets are all one provider, so a provider-wide outage still takes the route down. |
 | 22 | `routes-affinity-shape` | `cache_affinity` set on a route where the pin cannot engage — the strategy is not `load-balance`, or there are fewer than 2 enabled targets. The key parses and is then ignored, which is the silent state this check exists to prevent. |
-| 23 | `routes-peak-hours` | Windows declared with neither `respect_peak_hours` nor `strategy = "peak-hours"` (parsed, then ignored); a peak-aware route with no enabled target declaring a window (it behaves exactly like `static`); or one with no second enabled target to switch to. |
+| 23 | `routes-peak-hours` | Windows declared with neither `respect_peak_hours` nor `strategy = "peak-hours"` (parsed, then ignored); a peak-aware route with no enabled target declaring a window (it behaves exactly like `static`); or one with no second enabled target to switch to. Per target: `peak_days` excluding every weekday (the windows never apply) or set with no windows to gate. |
 | 24 | `base-url-shape` | Parses with `reqwest::Url`; warns when an Anthropic-spec `base_url` ends in `/v1`, since turnpike appends the spec path itself. |
 | 25 | `config-perms` | Warns if an inline key is present and `mode & 0o077 != 0`. |
 | 26 | `backups` | Whether a config backup exists yet. |

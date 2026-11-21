@@ -208,6 +208,93 @@ fn parse_hhmm(s: &str) -> Result<u32, String> {
     Ok(hour * 60 + minute)
 }
 
+/// A day of the week, used to restrict a target's [`PeakWindow`]s.
+///
+/// UTC, like the windows: provider schedules are published in UTC and the
+/// gateway stays out of the host's timezone database. Parsed from the
+/// three-letter abbreviation (`"mon"`…`"sun"`); an unknown value is a **parse
+/// error**, the same strictness as a malformed window.
+///
+/// A day not listed for a target means its windows do not make it peak that
+/// day — the target is treated as free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Weekday {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+impl Weekday {
+    /// Every day, Monday first — the order writers emit.
+    pub const ALL: [Weekday; 7] = [
+        Weekday::Mon,
+        Weekday::Tue,
+        Weekday::Wed,
+        Weekday::Thu,
+        Weekday::Fri,
+        Weekday::Sat,
+        Weekday::Sun,
+    ];
+
+    /// The weekday for a count of days since the Unix epoch.
+    ///
+    /// 1970-01-01 was a Thursday, and [`Weekday::ALL`] is Monday-first, so
+    /// Thursday sits at index 3. Reducing `days` modulo 7 *before* adding the
+    /// offset keeps a `u64::MAX` day count from overflowing.
+    pub fn from_days_since_epoch(days: u64) -> Self {
+        Self::ALL[((days % 7 + 3) % 7) as usize]
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Weekday::Mon => "mon",
+            Weekday::Tue => "tue",
+            Weekday::Wed => "wed",
+            Weekday::Thu => "thu",
+            Weekday::Fri => "fri",
+            Weekday::Sat => "sat",
+            Weekday::Sun => "sun",
+        }
+    }
+}
+
+impl fmt::Display for Weekday {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Weekday {
+    type Err = String;
+
+    /// Lenient for typed editor input (`Monday`, `mon`, `MON`); the config file
+    /// itself is strict and accepts only the abbreviation.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "mon" | "monday" => Ok(Weekday::Mon),
+            "tue" | "tues" | "tuesday" => Ok(Weekday::Tue),
+            "wed" | "weds" | "wednesday" => Ok(Weekday::Wed),
+            "thu" | "thur" | "thurs" | "thursday" => Ok(Weekday::Thu),
+            "fri" | "friday" => Ok(Weekday::Fri),
+            "sat" | "saturday" => Ok(Weekday::Sat),
+            "sun" | "sunday" => Ok(Weekday::Sun),
+            _ => Err(format!(
+                "{s:?} is not a weekday — expected mon, tue, wed, thu, fri, sat or sun"
+            )),
+        }
+    }
+}
+
+/// The default for [`TargetCfg::peak_days`]: every day.
+fn all_weekdays() -> Vec<Weekday> {
+    Weekday::ALL.to_vec()
+}
+
 /// One candidate upstream for a route.
 ///
 /// A route's `[[routes.<id>.target]]` blocks **are** its target list, in
@@ -225,9 +312,15 @@ pub struct TargetCfg {
     #[serde(default)]
     pub context_tokens: Option<u64>,
     /// UTC windows in which this (provider, model) pair is pricey. Empty means
-    /// always available. Consulted only by [`Strategy::PeakHours`].
+    /// always available. Consulted by any peak-aware route.
     #[serde(default)]
     pub peak_hours: Vec<PeakWindow>,
+    /// Days of the week on which `peak_hours` apply. Defaults to every day (so
+    /// a config that never mentions it behaves exactly as before); an explicit
+    /// empty list means the windows never apply. A day not listed has no peak
+    /// pricing for this target.
+    #[serde(default = "all_weekdays")]
+    pub peak_days: Vec<Weekday>,
     /// Whether this target may serve. `true` unless the block says otherwise,
     /// so a config that never mentions it reads exactly as before. A disabled
     /// target stays in the document — it is how a pair is taken out of service
@@ -420,6 +513,7 @@ impl TryFrom<RouteCfgRaw> for RouteCfg {
                     display_name: None,
                     context_tokens: raw.context_tokens,
                     peak_hours: Vec::new(),
+                    peak_days: all_weekdays(),
                     enabled: true,
                 },
             ),
@@ -610,6 +704,8 @@ pub struct Resolved {
     /// The target's UTC peak windows, carried so selection does not have to
     /// re-read the config. Empty on an explicit `provider/model` resolution.
     pub peak_hours: Vec<PeakWindow>,
+    /// The weekdays on which `peak_hours` apply, carried alongside them.
+    pub peak_days: Vec<Weekday>,
 }
 
 /// A route's full candidate list, before a target is chosen for a request.
@@ -713,6 +809,7 @@ impl Config {
                         provider_cfg: provider_cfg.clone(),
                         upstream_model: model.to_string(),
                         peak_hours: Vec::new(),
+                        peak_days: all_weekdays(),
                     }],
                     strategy: Strategy::Static,
                     // Explicit provider/model routing: no route owns this
@@ -741,6 +838,7 @@ impl Config {
                 provider_cfg: provider_cfg.clone(),
                 upstream_model: t.model.clone(),
                 peak_hours: t.peak_hours.clone(),
+                peak_days: t.peak_days.clone(),
             });
         }
         if targets.is_empty() {
@@ -924,6 +1022,7 @@ pub fn default_config_text() -> String {
 #     provider = "NAME"
 #     model = "the-upstream-model-id"
 #     # peak_hours = ["01:00-04:00"]     # optional: UTC windows when this pair is pricey
+#     # peak_days  = ["mon","tue","wed","thu","fri"]  # optional: days the windows apply (all by default)
 #
 # `turnpike routes` prints what is configured; `turnpike doctor` says what is
 # wrong. Client to start once the gateway is up: `turnpike launch claude-code`.
@@ -1049,6 +1148,7 @@ model = "openai/gpt-5"
                     display_name: None,
                     context_tokens: None,
                     peak_hours: Vec::new(),
+                    peak_days: all_weekdays(),
                     enabled: true,
                 }],
             },
@@ -1072,6 +1172,7 @@ model = "openai/gpt-5"
                     display_name: None,
                     context_tokens: None,
                     peak_hours: Vec::new(),
+                    peak_days: all_weekdays(),
                     enabled: true,
                 }],
             },
@@ -1971,6 +2072,98 @@ peak_hours = ["25:00-02:00"]
 "#;
         let err = toml::from_str::<Config>(bad).unwrap_err().to_string();
         assert!(err.contains("25:00-02:00"), "{err}");
+    }
+
+    #[test]
+    fn weekdays_round_trip_and_parse_leniently() {
+        assert_eq!(crate::config::Weekday::Mon.to_string(), "mon");
+        assert_eq!(crate::config::Weekday::Sun.to_string(), "sun");
+        for (raw, want) in [
+            ("mon", crate::config::Weekday::Mon),
+            ("Monday", crate::config::Weekday::Mon),
+            (" MON ", crate::config::Weekday::Mon),
+            ("thurs", crate::config::Weekday::Thu),
+            ("sunday", crate::config::Weekday::Sun),
+        ] {
+            assert_eq!(
+                raw.parse::<crate::config::Weekday>().unwrap(),
+                want,
+                "{raw}"
+            );
+        }
+        assert!("funday".parse::<crate::config::Weekday>().is_err());
+    }
+
+    #[test]
+    fn weekday_from_days_since_epoch_uses_thursdays_epoch() {
+        use crate::config::Weekday;
+        // 1970-01-01 was a Thursday.
+        assert_eq!(Weekday::from_days_since_epoch(0), Weekday::Thu);
+        assert_eq!(Weekday::from_days_since_epoch(1), Weekday::Fri);
+        assert_eq!(Weekday::from_days_since_epoch(4), Weekday::Mon);
+        assert_eq!(Weekday::from_days_since_epoch(7), Weekday::Thu);
+        // A very large count must not overflow.
+        let _ = Weekday::from_days_since_epoch(u64::MAX);
+    }
+
+    #[test]
+    fn peak_days_default_to_every_day_and_parse_a_subset() {
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.p]
+spec = "anthropic"
+base_url = "https://x.example"
+
+[[routes."r".target]]
+provider = "p"
+model = "m"
+peak_hours = ["01:00-04:00"]
+"#,
+        )
+        .unwrap();
+        // Absent key: all seven, preserving the old every-day behavior.
+        assert_eq!(
+            cfg.routes["r"].targets()[0].peak_days,
+            crate::config::Weekday::ALL.to_vec()
+        );
+
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.p]
+spec = "anthropic"
+base_url = "https://x.example"
+
+[[routes."r".target]]
+provider = "p"
+model = "m"
+peak_hours = ["01:00-04:00"]
+peak_days = ["sat", "sun"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.routes["r"].targets()[0].peak_days,
+            vec![crate::config::Weekday::Sat, crate::config::Weekday::Sun]
+        );
+    }
+
+    #[test]
+    fn a_malformed_peak_day_is_a_parse_error() {
+        let err = toml::from_str::<Config>(
+            r#"
+[providers.p]
+spec = "anthropic"
+base_url = "https://x.example"
+
+[[routes."r".target]]
+provider = "p"
+model = "m"
+peak_days = ["funday"]
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("funday"), "{err}");
     }
 
     #[test]

@@ -33,6 +33,8 @@ export interface TargetView {
   context_tokens: number | null;
   /** UTC windows in which this target is pricey, `HH:MM-HH:MM`. Empty = always available. */
   peak_hours: string[];
+  /** Weekdays on which those windows apply, `mon`..`sun`. All seven = every day. Optional so a view from an older supervised CLI (which predates the key) still type-checks; absent means all seven. */
+  peak_days?: string[];
   /** Whether this target may serve. A disabled pair stays listed so it can be re-enabled. */
   enabled: boolean;
   spec: string | null;

@@ -152,6 +152,7 @@ enabled for anything to serve.
 | `display_name` | none | Label for logs and `doctor` reports only. |
 | `context_tokens` | none | This target's window; feeds the minimum over enabled targets. |
 | `peak_hours` | none | UTC windows in which this pair is pricey, e.g. `["01:00-04:00", "06:00-10:00"]`; wrap past midnight (`"22:00-02:00"`). Read by peak-aware routes — `respect_peak_hours = true` (any strategy), or `strategy = "peak-hours"`. |
+| `peak_days` | all seven | Weekdays on which `peak_hours` apply, e.g. `["mon","tue","wed","thu","fri"]` — omitted means every day, `[]` means never. A day not listed has no peak pricing for this target. UTC; evaluated at the request instant, so a wrapping window's after-midnight tail follows the new day. |
 | `enabled` | `true` | `enabled = false` takes the pair out of service without deleting the block: resolution, selection and the context-window minimum skip it. A disabled target stays listed in the editor so it can be brought back. Disabling every target takes the route offline (`503`). |
 
 `strategy` belongs to the route, not the target: `static` (default),

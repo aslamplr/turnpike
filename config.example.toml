@@ -79,6 +79,9 @@ model = "deepseek-v4-flash"
 # provider = "zen"
 # model = "claude-sonnet-4-5"
 # peak_hours = ["01:00-04:00", "06:00-10:00"]
+# # Optional: weekdays the windows apply on (mon..sun). Omitted = every day;
+# # [] = never. UTC, evaluated at the request instant.
+# # peak_days = ["mon", "tue", "wed", "thu", "fri"]
 #
 # [[routes."claude-sonnet-5".target]]
 # provider = "zen-go"

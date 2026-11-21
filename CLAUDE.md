@@ -133,11 +133,14 @@ cargo test        # inline #[cfg(test)] modules per file
   per-request map degenerates to "always target 0". `strategy` is one of `static` (default),
   `load-balance` (round-robin), `failover` (in order), `peak-hours`. **Peak hours** are per-target
   UTC windows (`peak_hours = ["01:00-04:00", "06:00-10:00"]`, half-open, wrapping past midnight
-  when `end < start`). Peak awareness is a **route-level modifier**: `respect_peak_hours = true`
+  when `end < start`). **`peak_days`** restricts a target's windows to selected weekdays
+  (`["mon", …]`; omitted = every day, `[]` = never) — part of the peak-hours config, per target.
+  Peak awareness is a **route-level modifier**: `respect_peak_hours = true`
   (or the older `peak-hours` strategy, which implies it) makes `peak_order()` put outside-window
   targets first, `select_index_at` read that order for every strategy, `serving_pool()` restrict
   `load-balance` to the cheap ones, and `select_affinity` re-pin a target that enters a window.
-  The minute is read **once per request** (never per attempt).
+  The clock (UTC weekday + minute) is read **once per request** (never per attempt) and threaded
+  as `PeakClock`; the weekday is the instant's, so a wrapping window's tail follows the new day.
   **`enabled = false`** takes a target out of service without deleting the block: resolution,
   `select_index_at`, `peak_pick`, the round-robin count and `effective_context_tokens` all walk
   `RouteCfg::enabled_targets()`, never `targets()`, and `resolve_route` answers

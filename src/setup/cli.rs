@@ -251,6 +251,10 @@ struct AddTarget {
     /// UTC peak windows, `HH:MM-HH:MM`. Omitted or empty writes no key.
     #[serde(default)]
     peak_hours: Option<Vec<String>>,
+    /// Weekdays on which `peak_hours` apply (`mon`..`sun`). Omitted or all
+    /// seven writes no key (all days, the default).
+    #[serde(default)]
+    peak_days: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +296,10 @@ struct SetPeakHours {
     index: usize,
     /// `HH:MM-HH:MM` UTC windows. An empty list removes the key.
     windows: Vec<String>,
+    /// Weekdays on which the windows apply (`mon`..`sun`). Omitted leaves the
+    /// existing day list untouched; all seven removes it (the default).
+    #[serde(default)]
+    days: Option<Vec<String>>,
 }
 
 /// `deny_unknown_fields` here is the fix for the *class* of bug, not just its
@@ -547,6 +555,7 @@ pub fn apply(op: &str, session: &Session, args: &str) -> Result<Reply> {
                 display_name: a.display_name,
                 context_tokens: a.context_tokens,
                 peak_hours: a.peak_hours.unwrap_or_default(),
+                peak_days: a.peak_days,
             };
             match doc.add_route_target(&a.id, &draft) {
                 Ok(()) => None,
@@ -605,7 +614,7 @@ pub fn apply(op: &str, session: &Session, args: &str) -> Result<Reply> {
         }
         "set-peak-hours" => {
             let a: SetPeakHours = parse_args(args)?;
-            match doc.set_route_target_peak_hours(&a.id, a.index, &a.windows) {
+            match doc.set_route_target_peak_hours(&a.id, a.index, &a.windows, a.days.as_deref()) {
                 Ok(()) => None,
                 Err(e) => Some(e.to_string()),
             }

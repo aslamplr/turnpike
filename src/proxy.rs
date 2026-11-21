@@ -73,30 +73,55 @@ struct Affinity {
     last_seen: std::time::Instant,
 }
 
-/// Minutes since UTC midnight — the clock `peak-hours` schedules are written
-/// against. Unix time carries no leap seconds and no local timezone, which is
-/// exactly the stability a published pricing window needs. A clock reading
-/// before the epoch (a broken system clock) counts as midnight.
-fn utc_minute_of_day() -> u32 {
-    (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        % 86_400
-        / 60) as u32
+/// The UTC clock a peak selection is evaluated against: the weekday and the
+/// minute of the day. Read once per request and threaded by value, so one
+/// request cannot straddle a minute or midnight boundary mid-selection.
+#[derive(Debug, Clone, Copy)]
+struct PeakClock {
+    weekday: crate::config::Weekday,
+    minute: u32,
 }
 
-/// Whether this target is inside one of its own pricey windows.
-fn in_peak(t: &crate::config::Resolved, minute: u32) -> bool {
-    t.peak_hours.iter().any(|w| w.contains(minute))
+impl PeakClock {
+    /// A clock at `minute` on Monday — for tests that exercise only the time of
+    /// day (their targets default to every weekday).
+    #[cfg(test)]
+    fn at(minute: u32) -> Self {
+        Self {
+            weekday: crate::config::Weekday::Mon,
+            minute,
+        }
+    }
+}
+
+/// The current UTC clock — what `peak-hours` schedules are written against.
+/// Unix time carries no leap seconds and no local timezone, which is exactly
+/// the stability a published pricing window needs. A clock reading before the
+/// epoch (a broken system clock) counts as the Unix epoch.
+fn utc_peak_clock() -> PeakClock {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    PeakClock {
+        weekday: crate::config::Weekday::from_days_since_epoch(secs / 86_400),
+        minute: ((secs % 86_400) / 60) as u32,
+    }
+}
+
+/// Whether this target is inside one of its pricey windows **today** — the
+/// window must cover the minute, and today's weekday must be one the target
+/// lists. A day not listed means no peak pricing, so the target reads as free.
+fn in_peak(t: &crate::config::Resolved, clock: PeakClock) -> bool {
+    t.peak_days.contains(&clock.weekday) && t.peak_hours.iter().any(|w| w.contains(clock.minute))
 }
 
 /// The enabled targets outside their own windows, in chain order.
-fn free_indices(targets: &[crate::config::Resolved], minute: u32) -> Vec<usize> {
+fn free_indices(targets: &[crate::config::Resolved], clock: PeakClock) -> Vec<usize> {
     targets
         .iter()
         .enumerate()
-        .filter(|(_, t)| !in_peak(t, minute))
+        .filter(|(_, t)| !in_peak(t, clock))
         .map(|(i, _)| i)
         .collect()
 }
@@ -107,8 +132,8 @@ fn free_indices(targets: &[crate::config::Resolved], minute: u32) -> Vec<usize> 
 /// chain: a cheap target is always tried before a pricey one, and the pricey
 /// ones stay in the tail as a last resort (a target in its peak window beats no
 /// answer at all).
-fn peak_order(targets: &[crate::config::Resolved], minute: u32) -> Vec<usize> {
-    let free = free_indices(targets, minute);
+fn peak_order(targets: &[crate::config::Resolved], clock: PeakClock) -> Vec<usize> {
+    let free = free_indices(targets, clock);
     let mut order = free.clone();
     order.extend((0..targets.len()).filter(|i| !free.contains(i)));
     order
@@ -116,11 +141,11 @@ fn peak_order(targets: &[crate::config::Resolved], minute: u32) -> Vec<usize> {
 
 /// What `load-balance` rotates over under peak awareness: the free targets
 /// when there are any, else every target — price never refuses a request.
-fn serving_pool(res: &crate::config::RouteResolution, minute: u32) -> Vec<usize> {
+fn serving_pool(res: &crate::config::RouteResolution, clock: PeakClock) -> Vec<usize> {
     if !res.peak_aware {
         return (0..res.targets.len()).collect();
     }
-    let free = free_indices(&res.targets, minute);
+    let free = free_indices(&res.targets, clock);
     if free.is_empty() {
         (0..res.targets.len()).collect()
     } else {
@@ -132,8 +157,8 @@ fn serving_pool(res: &crate::config::RouteResolution, minute: u32) -> Vec<usize>
 /// windows. When every target is in peak the first target serves — a request
 /// is never refused over price, and the choice stays deterministic. Pure, so
 /// the boundaries are testable without a clock.
-fn peak_pick(targets: &[crate::config::Resolved], minute: u32) -> usize {
-    peak_order(targets, minute).first().copied().unwrap_or(0)
+fn peak_pick(targets: &[crate::config::Resolved], clock: PeakClock) -> usize {
+    peak_order(targets, clock).first().copied().unwrap_or(0)
 }
 
 /// The attempt chain for a selection that moves one target to the front: that
@@ -197,14 +222,14 @@ impl Gateway {
     /// outside its windows, and `load-balance` rotates among the cheap ones,
     /// touching an in-peak target only when every target is in peak.
     ///
-    /// The minute is a parameter so one request reads the clock once: a
-    /// per-attempt read could flip at a minute boundary and make the request's
+    /// The clock is a parameter so one request reads it once: a per-attempt
+    /// read could flip at a minute or midnight boundary and make the request's
     /// own chain non-deterministic.
-    fn select_index_at(&self, res: &crate::config::RouteResolution, minute: u32) -> usize {
+    fn select_index_at(&self, res: &crate::config::RouteResolution, clock: PeakClock) -> usize {
         use crate::config::Strategy;
         let head = || {
             if res.peak_aware {
-                peak_pick(&res.targets, minute)
+                peak_pick(&res.targets, clock)
             } else {
                 0
             }
@@ -212,7 +237,7 @@ impl Gateway {
         let index = match res.strategy {
             Strategy::Static | Strategy::Failover | Strategy::PeakHours => head(),
             Strategy::LoadBalance => {
-                let pool = serving_pool(res, minute);
+                let pool = serving_pool(res, clock);
                 if pool.len() < 2 {
                     pool.first().copied().unwrap_or(0)
                 } else {
@@ -223,9 +248,10 @@ impl Gateway {
         if res.peak_aware {
             tracing::debug!(
                 route = %res.route_id,
-                minute,
+                minute = clock.minute,
+                weekday = %clock.weekday,
                 index,
-                in_peak = res.targets.iter().filter(|t| in_peak(t, minute)).count(),
+                in_peak = res.targets.iter().filter(|t| in_peak(t, clock)).count(),
                 "peak-hours: target selected"
             );
         }
@@ -897,9 +923,9 @@ async fn forward(
     // boundary and make one request's chain non-deterministic. Peak awareness
     // reorders the chain (cheap targets first, in-peak ones as the tail) for
     // every strategy, not just `peak-hours`.
-    let minute = utc_minute_of_day();
+    let clock = utc_peak_clock();
     let order: Vec<usize> = if route.peak_aware {
-        peak_order(&route.targets, minute)
+        peak_order(&route.targets, clock)
     } else {
         (0..route.targets.len()).collect()
     };
@@ -910,7 +936,7 @@ async fn forward(
     // sticky re-point, which a no-key turn (or a non-affinity strategy)
     // never performs.
     let single = || {
-        let index = gw.select_index_at(&route, minute);
+        let index = gw.select_index_at(&route, clock);
         vec![(index, &route.targets[index])]
     };
     let attempts: Vec<(usize, &crate::config::Resolved)> = match route.strategy {
@@ -924,7 +950,7 @@ async fn forward(
                 Some(key) => {
                     // The pin leads; the rest of the peak-aware order follows,
                     // so a fallback turn still prefers a cheap target.
-                    let pool = serving_pool(&route, minute);
+                    let pool = serving_pool(&route, clock);
                     let index = gw.select_affinity(&route, key, &pool);
                     sticky = Some(key);
                     chain_from_head(&order, &route.targets, index)
@@ -5059,21 +5085,57 @@ strategy = "load-balance"
         cfg.resolve_route("r").unwrap()
     }
 
+    /// Like [`peak_route`], but each target also carries a `peak_days` list.
+    /// A `(window, days)` pair: an empty window writes no `peak_hours`, an
+    /// empty days list writes no `peak_days` (i.e. all seven).
+    fn peak_route_days(targets: &[(&str, &[&str])]) -> crate::config::RouteResolution {
+        let mut providers = String::new();
+        let mut blocks = String::new();
+        for (i, (window, days)) in targets.iter().enumerate() {
+            providers.push_str(&format!(
+                "\n[providers.p{i}]\nspec = \"anthropic\"\nbase_url = \"http://127.0.0.1:1\"\n"
+            ));
+            blocks.push_str(&format!(
+                "\n[[routes.\"r\".target]]\nprovider = \"p{i}\"\nmodel = \"m{i}\"\n"
+            ));
+            if !window.is_empty() {
+                blocks.push_str(&format!("peak_hours = [{window:?}]\n"));
+            }
+            if !days.is_empty() {
+                let list = days
+                    .iter()
+                    .map(|d| format!("{d:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                blocks.push_str(&format!("peak_days = [{list}]\n"));
+            }
+        }
+        let cfg_text = format!(
+            "[server]\nlisten = \"127.0.0.1:8710\"\n{providers}\n\
+             [routes.\"r\"]\nstrategy = \"peak-hours\"\n{blocks}"
+        );
+        let cfg: Config = toml::from_str(&cfg_text).unwrap();
+        cfg.resolve_route("r").unwrap()
+    }
+
     #[test]
     fn peak_pick_skips_a_target_inside_its_own_window() {
         let res = peak_route(&[&["10:00-11:00"], &[]]);
-        assert_eq!(peak_pick(&res.targets, 10 * 60 + 30), 1);
+        assert_eq!(peak_pick(&res.targets, PeakClock::at(10 * 60 + 30)), 1);
         // Half-open: 11:00 is the first minute *outside* [10:00, 11:00).
-        assert_eq!(peak_pick(&res.targets, 11 * 60), 0);
+        assert_eq!(peak_pick(&res.targets, PeakClock::at(11 * 60)), 0);
     }
 
     #[test]
     fn peak_pick_prefers_the_first_available_target() {
         // Both free: the earlier one wins.
-        assert_eq!(peak_pick(&peak_route(&[&[], &[]]).targets, 0), 0);
+        assert_eq!(
+            peak_pick(&peak_route(&[&[], &[]]).targets, PeakClock::at(0)),
+            0
+        );
         // The first two are in peak, so the third serves.
         let res = peak_route(&[&["00:00-23:59"], &["00:00-23:59"], &[]]);
-        assert_eq!(peak_pick(&res.targets, 5 * 60), 2);
+        assert_eq!(peak_pick(&res.targets, PeakClock::at(5 * 60)), 2);
     }
 
     #[test]
@@ -5081,16 +5143,33 @@ strategy = "load-balance"
         // Price never refuses a request: with no free target, the chain's first
         // serves.
         let res = peak_route(&[&["00:00-23:59"], &["00:00-23:59"]]);
-        assert_eq!(peak_pick(&res.targets, 12 * 60), 0);
+        assert_eq!(peak_pick(&res.targets, PeakClock::at(12 * 60)), 0);
     }
 
     #[test]
     fn peak_pick_reads_a_wrapping_window() {
         // 22:00-02:00 UTC covers 23:00 and 01:00, but not noon.
         let res = peak_route(&[&["22:00-02:00"], &[]]);
-        assert_eq!(peak_pick(&res.targets, 23 * 60), 1);
-        assert_eq!(peak_pick(&res.targets, 60), 1);
-        assert_eq!(peak_pick(&res.targets, 12 * 60), 0);
+        assert_eq!(peak_pick(&res.targets, PeakClock::at(23 * 60)), 1);
+        assert_eq!(peak_pick(&res.targets, PeakClock::at(60)), 1);
+        assert_eq!(peak_pick(&res.targets, PeakClock::at(12 * 60)), 0);
+    }
+
+    #[test]
+    fn peak_pick_honors_a_weekday_filter() {
+        // Target 0 is pricey 10:00-11:00, but only Mondays. On any other day
+        // its window is off, so it reads as free and keeps the head.
+        let res = peak_route_days(&[("10:00-11:00", &["mon"]), ("", &[])]);
+        let monday = PeakClock {
+            weekday: crate::config::Weekday::Mon,
+            minute: 10 * 60 + 30,
+        };
+        let tuesday = PeakClock {
+            weekday: crate::config::Weekday::Tue,
+            minute: 10 * 60 + 30,
+        };
+        assert_eq!(peak_pick(&res.targets, monday), 1, "Monday: in peak");
+        assert_eq!(peak_pick(&res.targets, tuesday), 0, "Tuesday: window off");
     }
 
     /// `HH:MM-HH:MM` for a window that contains `minute` with several minutes of
@@ -5170,7 +5249,7 @@ model = "m-b"
 
     #[tokio::test]
     async fn peak_hours_serves_the_alternate_inside_the_window() {
-        let now = utc_minute_of_day();
+        let now = utc_peak_clock().minute;
         let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
         let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
         // The primary is pricey right now; the free alternate serves.
@@ -5189,7 +5268,7 @@ model = "m-b"
 
     #[tokio::test]
     async fn peak_hours_serves_the_primary_outside_the_window() {
-        let now = utc_minute_of_day();
+        let now = utc_peak_clock().minute;
         let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
         let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
         // The primary's window is nowhere near now, so it serves even though
@@ -5205,7 +5284,7 @@ model = "m-b"
 
     #[tokio::test]
     async fn peak_hours_all_in_peak_serves_target_zero() {
-        let now = utc_minute_of_day();
+        let now = utc_peak_clock().minute;
         let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
         let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
         let gw = peak_gateway(&a, &b, &window_containing(now), &window_containing(now));
@@ -5219,7 +5298,7 @@ model = "m-b"
 
     #[tokio::test]
     async fn a_failing_peak_pick_falls_back_to_the_rest_of_the_chain() {
-        let now = utc_minute_of_day();
+        let now = utc_peak_clock().minute;
         let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
         let (b, b_hits) =
             stub_upstream(StatusCode::INTERNAL_SERVER_ERROR, ok_reply("from-b")).await;
@@ -5288,7 +5367,7 @@ model = "m-b"
     async fn peak_awareness_works_on_a_static_route() {
         // The modifier is what makes the windows apply here: `static` alone
         // would serve the configured primary.
-        let now = utc_minute_of_day();
+        let now = utc_peak_clock().minute;
         let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
         let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
         let gw = peak_aware_gateway("static", true, &a, &b, &window_containing(now));
@@ -5302,7 +5381,7 @@ model = "m-b"
 
     #[tokio::test]
     async fn peak_windows_are_ignored_without_the_flag() {
-        let now = utc_minute_of_day();
+        let now = utc_peak_clock().minute;
         let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
         let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
         let gw = peak_aware_gateway("static", false, &a, &b, &window_containing(now));
@@ -5316,7 +5395,7 @@ model = "m-b"
 
     #[tokio::test]
     async fn load_balance_with_peak_awareness_rotates_only_free_targets() {
-        let now = utc_minute_of_day();
+        let now = utc_peak_clock().minute;
         let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
         let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
         let gw = peak_aware_gateway("load-balance", true, &a, &b, &window_containing(now));
@@ -5336,7 +5415,7 @@ model = "m-b"
 
     #[tokio::test]
     async fn failover_with_peak_awareness_tries_the_free_target_first() {
-        let now = utc_minute_of_day();
+        let now = utc_peak_clock().minute;
         let (a, a_hits) = stub_upstream(StatusCode::OK, ok_reply("from-a")).await;
         let (b, b_hits) = stub_upstream(StatusCode::OK, ok_reply("from-b")).await;
         // Both healthy, so ordering decides: without the flag, failover would

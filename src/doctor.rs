@@ -255,6 +255,23 @@ fn route_strategy_checks(cfg: &Config) -> Vec<Check> {
                      switch to"
                 ));
             }
+            // Per-target day state: a day list that excludes every day silences
+            // the windows, and a day list with no windows gates nothing.
+            for (i, t) in enabled.iter().enumerate() {
+                let all_seven = crate::config::Weekday::ALL
+                    .iter()
+                    .all(|d| t.peak_days.contains(d));
+                if t.peak_days.is_empty() && !t.peak_hours.is_empty() {
+                    peak_problems.push(format!(
+                        "{id:?} target {i} excludes every weekday, so its peak_hours never \
+                         apply"
+                    ));
+                } else if !all_seven && t.peak_hours.is_empty() {
+                    peak_problems.push(format!(
+                        "{id:?} target {i} sets peak_days but declares no peak_hours"
+                    ));
+                }
+            }
         }
     }
 
@@ -1963,6 +1980,144 @@ provider = "zen-go"
 model = "m-b"
 "#;
         let path = write_config_tagged("doctor-peak-good", raw);
+        let checks = diagnose_with(path, raw, memory_store()).await;
+        let check = checks
+            .iter()
+            .find(|c| c.id == "routes-peak-hours")
+            .expect("routes-peak-hours runs");
+        assert_eq!(check.status, Status::Ok, "{}", check.summary);
+    }
+
+    #[tokio::test]
+    async fn a_target_that_excludes_every_weekday_is_warned() {
+        // `peak_days = []` is the user unchecking all seven boxes: the windows
+        // parse and then can never apply.
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+api_key = "k"
+
+[routes."r"]
+strategy = "peak-hours"
+
+[[routes."r".target]]
+provider = "zen"
+model = "m-a"
+peak_hours = ["01:00-04:00"]
+peak_days = []
+
+[[routes."r".target]]
+provider = "zen-go"
+model = "m-b"
+"#;
+        let path = write_config_tagged("doctor-peak-days-none", raw);
+        let checks = diagnose_with(path, raw, memory_store()).await;
+        let check = checks
+            .iter()
+            .find(|c| c.id == "routes-peak-hours")
+            .expect("routes-peak-hours runs");
+        assert_eq!(check.status, Status::Warn, "{}", check.summary);
+        assert!(
+            check
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("excludes every weekday"),
+            "detail: {:?}",
+            check.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn peak_days_without_windows_are_warned() {
+        // A day list is a sub-config of the windows; with no windows it gates
+        // nothing, which is the state the UI never creates but a hand edit can.
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+api_key = "k"
+
+[routes."r"]
+strategy = "peak-hours"
+
+[[routes."r".target]]
+provider = "zen"
+model = "m-a"
+peak_days = ["sat", "sun"]
+
+[[routes."r".target]]
+provider = "zen-go"
+model = "m-b"
+peak_hours = ["01:00-04:00"]
+"#;
+        let path = write_config_tagged("doctor-peak-days-nowin", raw);
+        let checks = diagnose_with(path, raw, memory_store()).await;
+        let check = checks
+            .iter()
+            .find(|c| c.id == "routes-peak-hours")
+            .expect("routes-peak-hours runs");
+        assert_eq!(check.status, Status::Warn, "{}", check.summary);
+        assert!(
+            check
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("declares no peak_hours"),
+            "detail: {:?}",
+            check.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peak_route_with_a_restricted_day_set_is_quiet() {
+        // A proper subset of days is the intended use; only the empty set is a
+        // problem.
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8710"
+
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+api_key = "k"
+
+[providers.zen-go]
+spec = "openai"
+base_url = "https://opencode.ai/zen/go"
+api_key = "k"
+
+[routes."r"]
+strategy = "peak-hours"
+
+[[routes."r".target]]
+provider = "zen"
+model = "m-a"
+peak_hours = ["01:00-04:00"]
+peak_days = ["mon", "tue", "wed", "thu", "fri"]
+
+[[routes."r".target]]
+provider = "zen-go"
+model = "m-b"
+"#;
+        let path = write_config_tagged("doctor-peak-days-good", raw);
         let checks = diagnose_with(path, raw, memory_store()).await;
         let check = checks
             .iter()

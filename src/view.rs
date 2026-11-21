@@ -80,6 +80,9 @@ pub struct TargetView {
     /// UTC windows in which this target is pricey, rendered `HH:MM-HH:MM`.
     /// Empty means always available.
     pub peak_hours: Vec<String>,
+    /// Weekdays on which those windows apply, rendered `mon`..`sun` in
+    /// Monday-first order. All seven means every day (the schema default).
+    pub peak_days: Vec<String>,
     /// Whether this target may serve. A disabled pair stays in the chain list
     /// so the window can offer the toggle that brings it back.
     pub enabled: bool,
@@ -187,6 +190,13 @@ fn route_view(id: &str, r: &RouteCfg, providers: &BTreeMap<String, ProviderCfg>)
                 display_name: t.display_name.clone(),
                 context_tokens: t.context_tokens,
                 peak_hours: t.peak_hours.iter().map(|w| w.to_string()).collect(),
+                // Canonical Mon..Sun order, filtered by membership, so a
+                // hand-written unsorted/duplicate list still renders stably.
+                peak_days: crate::config::Weekday::ALL
+                    .iter()
+                    .filter(|d| t.peak_days.contains(*d))
+                    .map(|d| d.to_string())
+                    .collect(),
                 enabled: t.enabled,
                 // `validate` guarantees the provider exists, but the view must
                 // not panic on a config that got past it by another route.
@@ -509,6 +519,36 @@ model = "deepseek-v4-flash"
             vec!["01:00-04:00".to_string(), "22:00-02:00".to_string()]
         );
         assert!(route.targets[1].peak_hours.is_empty());
+        // No `peak_days` key: every day is active by default.
+        let all_days: Vec<String> = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(route.targets[0].peak_days, all_days);
+    }
+
+    #[test]
+    fn view_reports_a_restricted_peak_day_set() {
+        let view = build_from(
+            r#"
+[providers.zen]
+spec = "anthropic"
+base_url = "https://opencode.ai/zen"
+
+[routes."r"]
+
+[[routes."r".target]]
+provider = "zen"
+model = "m"
+peak_hours = ["01:00-04:00"]
+peak_days = ["sun", "mon", "fri"]
+"#,
+        );
+        // Rendered canonically, Monday first, regardless of the config order.
+        assert_eq!(
+            view.routes[0].targets[0].peak_days,
+            vec!["mon".to_string(), "fri".to_string(), "sun".to_string()]
+        );
     }
 
     #[test]

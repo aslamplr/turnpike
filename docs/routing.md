@@ -286,6 +286,7 @@ respect_peak_hours = true
 provider = "zen"
 model = "claude-sonnet-4-5"
 peak_hours = ["01:00-04:00", "06:00-10:00"]
+peak_days  = ["mon", "tue", "wed", "thu", "fri"]   # weekends are never peak
 
 [[routes."claude-sonnet-5".target]]
 provider = "zen-go"
@@ -304,6 +305,12 @@ the same windows work with every strategy:
 - **`peak-hours`** is the older spelling of the same flag, plus the failover
   walk; a route written that way keeps working unchanged.
 
+**Days are part of the same config, per target.** `peak_days` names the
+weekdays on which a target's windows apply — `["mon","tue","wed","thu","fri"]`
+means "no peak pricing on weekends". Omitted means every day (the pre-existing
+behavior); an explicit empty list means the windows never apply. A day not
+listed is never peak for that target, so it counts as free.
+
 A target with no windows is always available. When every target is in peak the
 first enabled target serves — a request is never refused over price, and the
 choice stays deterministic.
@@ -318,9 +325,13 @@ choice stays deterministic.
 - **A malformed window is a parse error**, naming the offending string — a
   schedule the gateway cannot honor must not silently become "never peak".
   `start == end` is rejected as ambiguous.
-- **The pick is read once per request**, not per attempt: a clock read per
-  attempt could flip at a minute boundary and make one request's chain
-  non-deterministic.
+- **The weekday is UTC and read at the current instant.** The after-midnight
+  tail of a wrapping window (`22:00-02:00`) follows the **new** day, so a target
+  that excludes Tuesday is free at Tuesday 01:00 even though that minute is the
+  tail of Monday's window.
+- **The clock (weekday and minute) is read once per request**, not per attempt:
+  a per-attempt read could flip at a minute or midnight boundary and make one
+  request's chain non-deterministic.
 - **The walking policies fail over.** `failover` and `peak-hours` walk the
   cheap-first order, so a retryable failure on a cheap alternate falls back to
   the (in-peak) primary rather than failing. `static` and plain `load-balance`
@@ -336,7 +347,8 @@ choice stays deterministic.
 `respect_peak_hours` nor `strategy = "peak-hours"` turns them on (they parse and
 are then ignored), when a peak-aware route has no enabled target declaring one
 (it behaves exactly like `static`), and when it has only one enabled target to
-switch between.
+switch between. Per target it also warns when `peak_days` excludes every
+weekday (the windows can never apply) or is set with no windows to gate.
 
 ## Failover is pre-first-byte only
 
@@ -556,9 +568,10 @@ than a known limit.
   (and, with `cache_affinity`, sticky per conversation) — there is no weight
   key. The schema leaves room: a `weight` field on `TargetCfg` is additive and
   no existing key changes meaning.
-- **Local-time or per-weekday peak schedules.** `peak_hours` is UTC and the
-  same every day. A provider that publishes local-time windows has to be
-  converted by hand, and a weekday-only window is written as a daily one.
+- **Local-time schedules**, and **per-weekday windows.** `peak_hours` is UTC. A
+  provider that publishes local-time windows has to be converted by hand.
+  Per-weekday *selection* is supported (`peak_days`), but the windows themselves
+  are the same on every active day — there is no "cheap Saturday hours" list.
 - **Priced cost modelling.** The gateway does not know what a request costs; a
   peak schedule is an operator's declaration, not a computed decision, and there
   is no price multiplier key.

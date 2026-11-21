@@ -465,9 +465,11 @@
   const moveTarget = (id: string, from: number, to: number) =>
     apply("move-target", { id, from, to }, "Routes");
 
-  /// One target's UTC peak windows. An empty list clears the key.
-  const setPeakHours = (id: string, index: number, windows: string[]) =>
-    apply("set-peak-hours", { id, index, windows }, "Routes");
+  /// One target's UTC peak windows and the weekdays they are active on.
+  /// `days` all seven is the default (the CLI omits the key); an empty list
+  /// means the windows never apply.
+  const setPeakHours = (id: string, index: number, windows: string[], days: string[]) =>
+    apply("set-peak-hours", { id, index, windows, days }, "Routes");
 
   /// Boolean route flags, through the generic scalar op.
   ///

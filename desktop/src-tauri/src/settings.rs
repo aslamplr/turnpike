@@ -61,6 +61,11 @@ pub struct TargetView {
     /// still deserializes instead of failing the whole settings read.
     #[serde(default)]
     pub peak_hours: Vec<String>,
+    /// Weekdays on which `peak_hours` apply, `mon`..`sun`. Defaulted to all
+    /// seven so a view that predates the key (an older supervised CLI)
+    /// describes the pre-existing every-day behavior.
+    #[serde(default = "all_days")]
+    pub peak_days: Vec<String>,
     /// Whether this target may serve. Defaulted to `true` so a view that
     /// predates the key describes every target as serving, which is what the
     /// gateway did before the key existed.
@@ -71,6 +76,14 @@ pub struct TargetView {
 
 fn default_enabled() -> bool {
     true
+}
+
+/// All seven weekdays, Monday-first — the default for [`TargetView::peak_days`].
+fn all_days() -> Vec<String> {
+    ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

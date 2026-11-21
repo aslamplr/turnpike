@@ -510,7 +510,8 @@ rules of equal specificity over one class is a coin toss on which stylesheet lan
   `set-target-enabled` and `set-peak-hours` all take it. The edge Move buttons
   are disabled, Remove is disabled at one target (a route needs one), and the
   peak-hours editor is a per-row form whose Save sends the comma-separated
-  windows, blank clearing them. The strategy select **disables** the non-`static`
+  windows (blank clearing them) and seven weekday checkboxes (Mon..Sun, all
+  checked by default; an unchecked day has no peak pricing for that target). The strategy select **disables** the non-`static`
   options below two *enabled* targets, so the window cannot ask for the state
   `set_strategy` refuses. The model field offers the provider's own advertised
   ids through a `datalist` (fetched once per provider via `turnpike models

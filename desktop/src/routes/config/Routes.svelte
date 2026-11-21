@@ -55,7 +55,12 @@
     onAddTarget: (id: string, args: Record<string, unknown>) => Promise<boolean>;
     onRemoveTarget: (id: string, index: number) => Promise<boolean>;
     onMoveTarget: (id: string, from: number, to: number) => Promise<boolean>;
-    onPeakHours: (id: string, index: number, windows: string[]) => Promise<boolean>;
+    onPeakHours: (
+    id: string,
+    index: number,
+    windows: string[],
+    days: string[],
+  ) => Promise<boolean>;
     /// Take one chain entry in or out of service. `false` is a refusal, and the
     /// row re-asserts its checkbox from that answer.
     onSetTargetEnabled: (id: string, index: number, enabled: boolean) => Promise<boolean>;
@@ -71,6 +76,19 @@
 
   const STRATEGIES = ["static", "load-balance", "failover", "peak-hours"] as const;
 
+  /// The seven weekdays, matching the config's `mon`..`sun` spelling, with a
+  /// display label. Checked = peak pricing active that day.
+  const DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
+  const DAY_LABEL: Record<string, string> = {
+    mon: "Mon",
+    tue: "Tue",
+    wed: "Wed",
+    thu: "Thu",
+    fri: "Fri",
+    sat: "Sat",
+    sun: "Sun",
+  };
+
   let adding = $state(false);
   let newId = $state("");
   let newProvider = $state("");
@@ -81,10 +99,13 @@
   let tProvider = $state("");
   let tModel = $state("");
   let tPeak = $state("");
+  let tDays = $state<string[]>([...DAYS]);
 
-  /// Which target's peak-hours editor is open, and its draft text.
+  /// Which target's peak-hours editor is open, its draft text, and its draft
+  /// active weekdays (checked = peak pricing active that day).
   let peakFor = $state<{ id: string; index: number } | null>(null);
   let peakText = $state("");
+  let peakDays = $state<string[]>([]);
 
   /// Advertised model ids per provider, plus the note a failed fetch leaves.
   ///
@@ -188,6 +209,7 @@
     tProvider = providers[0]?.id ?? "";
     tModel = "";
     tPeak = "";
+    tDays = [...DAYS];
     void ensureModels(tProvider);
   }
 
@@ -195,26 +217,45 @@
     if (!tProvider || !tModel.trim()) return;
     const args: Record<string, unknown> = { provider: tProvider, model: tModel.trim() };
     const windows = peakWindows(tPeak);
-    if (windows.length > 0) args.peak_hours = windows;
+    if (windows.length > 0) {
+      args.peak_hours = windows;
+      // Days are a sub-config of the windows: only send them alongside them,
+      // and omit the all-seven default (the CLI omits it too).
+      if (tDays.length !== DAYS.length) args.peak_days = [...tDays];
+    }
     if (!(await onAddTarget(id, args))) return;
     tModel = "";
     tPeak = "";
+    tDays = [...DAYS];
     targetFor = null;
   }
 
-  function openPeak(id: string, index: number, current: string[]) {
+  /// Toggle one day in a draft list, returning a fresh array so Svelte's
+  /// reactivity fires.
+  function toggleDay(list: string[], day: string): string[] {
+    return list.includes(day) ? list.filter((d) => d !== day) : [...list, day];
+  }
+
+  function openPeak(id: string, index: number, current: string[], days: string[]) {
     peakFor = { id, index };
     peakText = current.join(", ");
+    peakDays = [...days];
   }
 
   function closePeak() {
     peakFor = null;
     peakText = "";
+    peakDays = [];
   }
 
   async function submitPeak() {
     if (!peakFor) return;
-    const ok = await onPeakHours(peakFor.id, peakFor.index, peakWindows(peakText));
+    const ok = await onPeakHours(
+      peakFor.id,
+      peakFor.index,
+      peakWindows(peakText),
+      [...peakDays],
+    );
     if (!ok) return;
     closePeak();
   }
@@ -371,7 +412,7 @@
                 </button>
                 <button
                   class="ghost tiny"
-                  onclick={() => openPeak(r.id, i, t.peak_hours)}
+                  onclick={() => openPeak(r.id, i, t.peak_hours, t.peak_days ?? [...DAYS])}
                   disabled={busy}
                   title="Edit this target's peak hours"
                 >
@@ -403,7 +444,23 @@
                   Comma-separated HH:MM-HH:MM windows in which this target is
                   pricey; empty means always available. They apply when the
                   route is peak-aware — the peak-hours checkbox, or the
-                  `peak-hours` strategy.
+                  `peak-hours` strategy — and only on the checked days (UTC).
+                  Unchecked days are never peak, so this target stays free.
+                </div>
+                <div class="edit-fields">
+                  <span>active days (UTC)</span>
+                  {#each DAYS as d (d)}
+                    <label class="day">
+                      <input
+                        type="checkbox"
+                        checked={peakDays.includes(d)}
+                        disabled={busy}
+                        aria-label="Target {i} {DAY_LABEL[d]}"
+                        onchange={() => (peakDays = toggleDay(peakDays, d))}
+                      />
+                      {DAY_LABEL[d]}
+                    </label>
+                  {/each}
                 </div>
                 <div class="actions">
                   <button onclick={submitPeak} disabled={busy}>Save</button>
@@ -504,6 +561,19 @@
                 disabled={busy}
                 {...noAutofill}
               />
+              <span>active days (UTC)</span>
+              {#each DAYS as d (d)}
+                <label class="day">
+                  <input
+                    type="checkbox"
+                    checked={tDays.includes(d)}
+                    disabled={busy}
+                    aria-label="New target {DAY_LABEL[d]}"
+                    onchange={() => (tDays = toggleDay(tDays, d))}
+                  />
+                  {DAY_LABEL[d]}
+                </label>
+              {/each}
             </div>
             {#if modelFetching[tProvider]}
               <div class="sub">loading models from {tProvider}…</div>
